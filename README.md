@@ -64,8 +64,9 @@ src/                 the XarQ application (Qt6 Widgets, C++17, CMake)
 
 ## Heritage & licence
 
-XarQ is licensed under the **GNU General Public License, version 2** — see
-[`LICENSE`](LICENSE) for the notice and [`COPYING`](COPYING) for the full text.
+XarQ is licensed under the **GNU General Public License, version 2**; the full
+text is in [`COPYING`](COPYING). See [`NOTICE`](NOTICE) for the Xara heritage
+notice and its additional linking permission.
 
 It descends from **Xara Xtreme / Xara LX**, the GPL open-source release of Xara
 (© 1993–2006 Xara Group Ltd), whose format documentation and reference output

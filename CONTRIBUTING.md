@@ -38,4 +38,4 @@ unchanged.
 ## Licence
 
 By contributing you agree that your contributions are licensed under the
-project's **GPL-2.0** licence (see [`LICENSE`](LICENSE)).
+project's **GPL-2.0** licence (see [`COPYING`](COPYING)).
