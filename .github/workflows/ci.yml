@@ -17,7 +17,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake g++ pkg-config \
             qt6-base-dev qt6-svg-dev qt6-base-dev-tools \
-            zlib1g-dev libharfbuzz-dev libgl1-mesa-dev
+            zlib1g-dev libharfbuzz-dev libgl1-mesa-dev \
+            fonts-dejavu-core fonts-liberation
+          # The self-test lays out text in named fonts (DejaVu Sans, Liberation);
+          # without them Qt substitutes a metric-less fallback and layout tests fail.
 
       - name: Configure & build
         working-directory: src
