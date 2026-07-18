@@ -1,0 +1,22 @@
+# XarQ repository root. The app tree also has src/.gitignore for build artifacts.
+
+# ---- build output ----
+build/
+AppDir/
+*.AppImage
+*.o
+*.a
+
+# ---- editor / OS cruft ----
+.DS_Store
+*~
+*.swp
+.idea/
+.vscode/
+
+# ---- local scratch render / export outputs ----
+/*.png
+/*.svg
+
+# ---- optional local .xar sample corpus (render checks; not shipped) ----
+Designs/

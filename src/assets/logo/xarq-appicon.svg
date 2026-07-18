@@ -1,0 +1,24 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Xarq app icon">
+  <title>Xarq app icon</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#20242C"></stop>
+      <stop offset="1" stop-color="#0C0D10"></stop>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#2D6FF7" stop-opacity="0.45"></stop>
+      <stop offset="1" stop-color="#2D6FF7" stop-opacity="0"></stop>
+    </radialGradient>
+  </defs>
+  
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg)"></rect>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#glow)"></rect>
+  
+  <rect x="33.5" y="33.5" width="957" height="957" rx="222.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="3"></rect>
+  
+  <g transform="translate(232 232) scale(5.6)">
+    <path d="M72 28 L28 72" stroke="#8B6BFF" stroke-width="15" stroke-linecap="round"></path>
+    <path d="M28 28 L84 84" stroke="#4C86FF" stroke-width="15" stroke-linecap="round"></path>
+    <rect x="66.7" y="22.7" width="10.6" height="10.6" rx="2.2" fill="#0C0D10" stroke="#8B6BFF" stroke-width="3.4"></rect>
+  </g>
+</svg>

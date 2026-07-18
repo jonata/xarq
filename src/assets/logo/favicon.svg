@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Xarq">
+  <title>Xarq favicon</title>
+  <rect width="64" height="64" rx="15" fill="#0C0D10"></rect>
+  <g transform="translate(6 6) scale(0.52)">
+    <path d="M72 28 L28 72" stroke="#7C5CFF" stroke-width="16" stroke-linecap="round"></path>
+    <path d="M28 28 L84 84" stroke="#2D6FF7" stroke-width="16" stroke-linecap="round"></path>
+  </g>
+</svg>

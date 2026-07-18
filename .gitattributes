@@ -1,0 +1,14 @@
+# Normalise line endings for text files
+* text=auto eol=lf
+
+# Binary assets
+*.ttf binary
+*.png binary
+*.jpg binary
+*.gif binary
+
+# Bundled fonts and icons: exclude from GitHub language statistics
+src/assets/** linguist-vendored
+
+# Canvas partials are C++ (they are #included by canvas.cpp)
+*.inc linguist-language=C++

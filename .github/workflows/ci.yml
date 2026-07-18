@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake g++ pkg-config \
+            qt6-base-dev qt6-svg-dev qt6-base-dev-tools \
+            zlib1g-dev libharfbuzz-dev libgl1-mesa-dev
+
+      - name: Configure & build
+        working-directory: src
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Self-test
+        working-directory: src
+        run: QT_QPA_PLATFORM=offscreen QT_HASH_SEED=0 ./build/xarq --selftest

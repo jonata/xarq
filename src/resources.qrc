@@ -1,0 +1,17 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/xarq">
+    <file>assets/fonts/Montserrat-Regular.ttf</file>
+    <file>assets/fonts/Montserrat-Medium.ttf</file>
+    <file>assets/fonts/Montserrat-SemiBold.ttf</file>
+    <file>assets/fonts/Montserrat-Bold.ttf</file>
+    <file>assets/fonts/Montserrat-ExtraBold.ttf</file>
+    <file>assets/fonts/Manrope.ttf</file>
+    <file>assets/fonts/UbuntuMono.ttf</file>
+    <file>assets/logo/xarq-appicon.svg</file>
+    <file>assets/logo/xarq-mark.svg</file>
+    <file>assets/logo/xarq-mark-mono.svg</file>
+    <file>assets/logo/favicon.svg</file>
+    <file>assets/logo/tabclose.svg</file>
+  </qresource>
+</RCC>

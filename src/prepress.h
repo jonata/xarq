@@ -1,0 +1,55 @@
+// prepress.h — print/interop importers & exporters (Module 3): EPS/AI + PDF vector
+// import, PSD flattened import, CMYK colour separations, crop/registration marks.
+#pragma once
+#include "model.h"
+#include <QByteArray>
+#include <QImage>
+
+namespace xara {
+
+// EPS / classic-AI (PostScript vector subset) → a Document of Path shapes.
+// Handles moveto/lineto/curveto/closepath, fill/stroke, rgb/gray/hsb/cmyk colour,
+// gsave/grestore, translate/scale/rotate/concat, and %%BoundingBox. Text/images skipped.
+Document importEps(const QByteArray& data);
+
+// PDF (single page, content-stream vectors) → a Document of Path shapes. Parses the object
+// table, FlateDecode streams, and the content operators (m l c re f S rg g k cm q Q).
+Document importPdf(const QByteArray& data);
+
+// AI: modern Adobe Illustrator files are PDF-compatible → route to importPdf when a %PDF header
+// is present, else fall back to the classic PostScript path (importEps).
+Document importAi(const QByteArray& data);
+
+// AutoCAD DXF (ASCII): parse the ENTITIES section (LINE / LWPOLYLINE / POLYLINE / CIRCLE / ARC)
+// into stroked Path shapes.
+Document importDxf(const QByteArray& data);
+
+// Windows Metafile (WMF): placeable/standard header + the common vector records
+// (rect / ellipse / polygon / polyline / moveto-lineto, pen & brush objects) → editable Path shapes.
+Document importWmf(const QByteArray& data);
+
+// Enhanced Metafile (EMF): 32-bit records — polygon(16)/polyline(16)/rect/ellipse/moveto/lineto
+// with CREATEPEN/CREATEBRUSHINDIRECT/SELECTOBJECT (incl. stock objects) → editable Path shapes.
+Document importEmf(const QByteArray& data);
+
+// PSD (Photoshop) flattened composite → QImage (the merged preview: RAW or PackBits RLE).
+QImage importPsd(const QByteArray& data);
+
+// PSD → a Document: each Photoshop layer becomes a positioned bitmap shape (opacity + blend mode)
+// so layered files import editable. Falls back to a single flattened-composite shape if there are
+// no layers (or they can't be parsed).
+Document importPsdDocument(const QByteArray& data);
+
+// Convert an sRGB colour to naive CMYK (0..1 each). Shared by import (setcmykcolor) + separations.
+void rgbToCmyk(const QColor& c, double& C, double& M, double& Y, double& K);
+QByteArray deflateZlib(const QByteArray& src);   // zlib deflate → PDF /FlateDecode-compatible bytes
+
+// Approximate CMYK soft-proof (no ICC): how a colour/image would look printed on coated offset stock —
+// our own separation + dot gain + cream paper + gamut compression. View-only; see prepress.cpp.
+QColor softProofCmyk(const QColor& in);
+void   softProofImage(QImage& im);   // apply the proof to every opaque pixel, in place
+void   gamutWarnImage(QImage& im);   // paint every out-of-CMYK-gamut pixel a flat warning grey (view-only)
+int    totalAreaCoverage(const QColor& c);   // total ink coverage 0..400 (%) = round((C+M+Y+K)*100)
+void   tacWarnImage(QImage& im, int limitPct);   // paint pixels whose ink coverage exceeds limitPct a warning colour
+
+} // namespace xara

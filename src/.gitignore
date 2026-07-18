@@ -1,0 +1,11 @@
+# Build output / artifacts — source only in git
+build/
+AppDir/
+*.o
+*.obj
+*.moc
+moc_*.cpp
+qrc_*.cpp
+*.AppImage
+coexist_test
+.audit/
