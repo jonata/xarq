@@ -10661,6 +10661,21 @@ if(xara::pdfVectorAvailable()){
       check(qAbs(sub.width()-50)<1 && sub.left()<1, "Affinity compounds: subtract cuts the later operand away");
       check(qAbs(isect.width()-50)<1 && qAbs(isect.left()-50)<1, "Affinity compounds: intersect keeps the overlap"); }
 
+    { // Compounds nested deep with every level referencing the same next level twice: 2^n visits if unbounded.
+      QByteArray k; quint32 id=5000;
+      auto open=[&](QByteArray& b){ u8v(b,1); u32v(b,id++); u8v(b,1); tag(b,"Comp"); fld(b,0xb1,"Chld"); u32v(b,2); };
+      QByteArray inner; cls(inner,"ShpN"); rectBody(inner); u8v(inner,0);
+      QByteArray inner2; cls(inner2,"ShpN"); rectBody(inner2); u8v(inner2,0);
+      QByteArray chain=inner; chain+=inner2;
+      for(int lvl=0;lvl<30;++lvl){ QByteArray w; open(w); const quint32 me=id; w+=chain; u8v(w,0);
+        QByteArray ref; u8v(ref,2); u32v(ref,me-1); chain=w+ref; }
+      QByteArray top; open(top); top+=chain; fld(top,0xb1,"BFFl"); u32v(top,1); solid(top,1,0); u8v(top,0);
+      QElapsedTimer t; t.start();
+      xara::AffinityStats st;
+      const QStringList pg=xara::affinityToSvgPages(doc(top,1,0),&st);
+      check(st.exactParse && pg.size()==1 && pg[0].contains("<path"), "Affinity compounds: the shared nesting fixture really parses");
+      check(t.elapsed()<20000, "Affinity compounds: shared nesting stays bounded"); }
+
     { // A fill layer paints its bitmap's area.
       QByteArray k; cls(k,"FRst"); fld(k,0x31,"Bitm"); cls(k,"DyBm"); fld(k,0x07,"BmpW"); u32v(k,120); fld(k,0x07,"BmpH"); u32v(k,90); u8v(k,0);
       fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,0,1); u8v(k,0);

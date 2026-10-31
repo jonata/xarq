@@ -1053,6 +1053,7 @@ private:
     void fillLayerNode(const AffNode& n);
     QPainterPath compoundOutline(const AffNode& n, int depth);
     QHash<int, int> m_flowLines;       // linked text frames: lines of a story already placed
+    int m_compoundVisits = 0;          // across the document: nodes are shareable, so depth alone doesn't bound this
     QString pixelMaskAttrs(const AffNode& n);
     QString maskGeometry(const AffNode& n);
     void spreadBox(const AffNode& sp, const AffNode& doc, double& px, double& py, double& pw, double& ph) const;
@@ -3125,10 +3126,10 @@ QPainterPath Converter::compoundOutline(const AffNode& n, int depth){
     const AffField* ch = fieldOf(n, TG('C','h','l','d'));
     if(!ch || depth > 32) return out;
     bool first = true;
-    int visited = 0;
     for(int k : ch->kids){
         const AffNode* m = node(k);
-        if(!m || m->types.isEmpty() || ++visited > 4096) continue;
+        if(!m || m->types.isEmpty()) continue;
+        if(++m_compoundVisits > 20000) return out;
         const u32 c = m->types[0];
         QPainterPath geo;
         if(c == TG('C','o','m','p')) geo = compoundOutline(*m, depth + 1);
