@@ -3,6 +3,7 @@
 // has no live equivalent for is baked: masks and clipping into alpha, adjustments into the layers beneath
 // them, layer effects into bitmaps of their own stacked around the layer.
 #include "prepress.h"
+#include "icc.h"
 #include "render.h"
 #include "svgimport.h"
 
@@ -280,7 +281,28 @@ QRgb labToRgb(int L8, int a8, int b8){
     return qRgb(e(r), e(gr), e(b));
 }
 
-struct ColorInfo { int mode = 3; QByteArray table; };
+struct ColorInfo { int mode = 3; QByteArray table; std::shared_ptr<IccToSrgb> icc; };
+
+// The profile an image declares, unless it is already sRGB, where a conversion could only add rounding.
+std::shared_ptr<IccToSrgb> documentProfile(const Rd& r, qint64 resStart, qint64 resEnd, int mode){
+    const int comps = (mode == 1) ? 1 : mode == 3 ? 3 : mode == 4 ? 4 : 0;
+    if(!comps) return {};
+    qint64 p = resStart;
+    while(p + 12 <= resEnd && r.d.mid(p, 4) == "8BIM"){
+        const int id = r.u16(p + 4), nl = r.u8(p + 6);
+        qint64 q = p + 6 + ((nl + 2) / 2) * 2;
+        const qint64 sz = r.u32(q); q += 4;
+        if(sz < 0 || sz > resEnd - q) return {};
+        if(id == 1039){
+            const QByteArray pr = r.d.mid(q, sz);
+            if(pr.contains("sRGB") || pr.contains(QByteArray::fromHex("0073005200470042"))) return {};
+            auto xf = std::make_shared<IccToSrgb>(pr, comps);
+            return xf->ok() ? xf : nullptr;
+        }
+        p = q + sz + (sz & 1);
+    }
+    return {};
+}
 
 // Stored channels to pixels. CMYK and multichannel samples are stored inverted (0 = full ink).
 QImage planesToImage(const ColorInfo& ci, int w, int h, const QHash<int, QByteArray>& pl, const QByteArray* alpha){
@@ -305,6 +327,23 @@ QImage planesToImage(const ColorInfo& ci, int w, int h, const QHash<int, QByteAr
             }
             const int a = alpha && alpha->size() >= n ? quint8((*alpha)[i]) : 255;
             row[x] = (c & 0xffffffu) | (uint(a) << 24);
+        }
+    }
+    if(ci.icc && !pl.isEmpty()){
+        const int comps = ci.mode == 1 ? 1 : ci.mode == 3 ? 3 : 4;
+        QByteArray in(qint64(w) * comps, 0), out(qint64(w) * 3, 0);
+        for(int y = 0; y < h; ++y){
+            uchar* q = reinterpret_cast<uchar*>(in.data());
+            const qint64 base = qint64(y) * w;
+            for(int x = 0; x < w; ++x){
+                if(comps == 1) q[x] = uchar(at(p0, base + x));
+                else if(comps == 3){ q[x*3] = uchar(at(p0, base + x)); q[x*3+1] = uchar(at(p1, base + x)); q[x*3+2] = uchar(at(p2, base + x)); }
+                else { q[x*4] = uchar(255 - at(p0, base + x)); q[x*4+1] = uchar(255 - at(p1, base + x)); q[x*4+2] = uchar(255 - at(p2, base + x)); q[x*4+3] = uchar(p3.isEmpty() ? 0 : 255 - at(p3, base + x)); }
+            }
+            ci.icc->convert(q, reinterpret_cast<uchar*>(out.data()), w);
+            QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            const uchar* o = reinterpret_cast<const uchar*>(out.constData());
+            for(int x = 0; x < w; ++x) row[x] = (row[x] & 0xff000000u) | (uint(o[x*3]) << 16) | (uint(o[x*3+1]) << 8) | o[x*3+2];
         }
     }
     return img;
@@ -442,6 +481,16 @@ bool readLayerInfo(const Rd& r, qint64 o, qint64 end, bool psb, int depth, const
             o = chEnd;
         }
         if(drawable && !planes.isEmpty()) L.pix = planesToImage(ci, lw, lh, planes, alpha.isEmpty() ? nullptr : &alpha);
+        // Adjustments work on the document's own values; only what's shown goes through its profile.
+        if(drawable && ci.icc && ci.mode != 4 && !L.pix.isNull() && planes.size() >= (ci.mode == 3 ? 3 : 1)){
+            L.native = QImage(lw, lh, QImage::Format_ARGB32);
+            const qint64 n = qint64(lw) * lh;
+            const QByteArray& p0 = planes[0]; const QByteArray& p1 = ci.mode == 3 ? planes[1] : planes[0]; const QByteArray& p2 = ci.mode == 3 ? planes[2] : planes[0];
+            if(!L.native.isNull() && p0.size() >= n && p1.size() >= n && p2.size() >= n)
+                for(int y = 0; y < lh; ++y){ QRgb* q = reinterpret_cast<QRgb*>(L.native.scanLine(y));
+                    for(int x = 0; x < lw; ++x){ const qint64 i = qint64(y) * lw + x; q[x] = qRgb(quint8(p0[i]), quint8(p1[i]), quint8(p2[i])); } }
+            else L.native = QImage();
+        }
         if(drawable && ci.mode == 4 && planes.size() >= 4 && !L.pix.isNull()){
             L.native = QImage(lw, lh, QImage::Format_ARGB32);
             const qint64 n = qint64(lw) * lh;
@@ -459,10 +508,24 @@ bool readLayerInfo(const Rd& r, qint64 o, qint64 end, bool psb, int depth, const
 // ---------------------------------------------------------------- colours and gradients in descriptors
 // A 32-bit document stores its colours in linear light, like its pixels.
 bool g_linearDoc = false;
+const ColorInfo* g_docColor = nullptr;      // the document being read, for its profile and mode
 QColor colorRaw(const Val* c);
 QColor colorOf(const Val* c){
     QColor v = colorRaw(c);
-    return g_linearDoc ? QColor::fromRgbF(linToSrgb(v.redF()), linToSrgb(v.greenF()), linToSrgb(v.blueF())) : v;
+    if(g_linearDoc) return QColor::fromRgbF(linToSrgb(v.redF()), linToSrgb(v.greenF()), linToSrgb(v.blueF()));
+    // A colour in the document's own space means what the profile says it means.
+    if(c && g_docColor && g_docColor->icc){
+        const int m = g_docColor->mode;
+        uchar in[4], out[3];
+        auto b = [](double x){ return uchar(qBound(0, int(x * 255.0 + 0.5), 255)); };
+        if(m == 3 && c->cls == "RGBC"){ in[0] = uchar(v.red()); in[1] = uchar(v.green()); in[2] = uchar(v.blue()); }
+        else if(m == 1 && c->cls == "Grsc") in[0] = uchar(v.red());
+        else if(m == 4 && c->cls == "CMYC"){ in[0] = b(c->n("Cyn") / 100.0); in[1] = b(c->n("Mgnt") / 100.0); in[2] = b(c->n("Ylw") / 100.0); in[3] = b(c->n("Blck") / 100.0); }
+        else return v;
+        g_docColor->icc->convert(in, out, 1);
+        return QColor(out[0], out[1], out[2]);
+    }
+    return v;
 }
 QColor colorRaw(const Val* c){
     if(!c) return Qt::black;
@@ -1133,7 +1196,7 @@ void adjustShapes(QVector<Shape>& list, const Adjustment& adj, const QImage* mas
         }
         if(isPixelShape(s)){
             QImage img = s.fill.image.convertToFormat(QImage::Format_ARGB32);
-            // A CMYK layer still carries its stored channels; work there, so K survives.
+            // A layer that keeps its stored channels is adjusted there: K survives, and a profile applies after.
             QImage native = (s.fill.origImage.format() == QImage::Format_ARGB32 && s.fill.origImage.size() == img.size() && s.fill.origImage.cacheKey() != s.fill.image.cacheKey()) ? s.fill.origImage : QImage();
             const int ox = int(s.transform.dx()), oy = int(s.transform.dy());
             for(int y = 0; y < img.height(); ++y){
@@ -1150,7 +1213,7 @@ void adjustShapes(QVector<Shape>& list, const Adjustment& adj, const QImage* mas
                         int v[4] = { qRed(n), qGreen(n), qBlue(n), qAlpha(n) };
                         if(adj.cmyk) adj.cmyk(v);
                         else {
-                            // Through RGB: the result is held as pure C, M, Y.
+                            // Through RGB: in a CMYK document the result is held as pure C, M, Y.
                             const QRgb q = fn(qRgb(v[0]*v[3]/255, v[1]*v[3]/255, v[2]*v[3]/255));
                             v[0] = qRed(q); v[1] = qGreen(q); v[2] = qBlue(q); v[3] = 255;
                         }
@@ -1160,6 +1223,23 @@ void adjustShapes(QVector<Shape>& list, const Adjustment& adj, const QImage* mas
                         nat[x] = qRgba(c0, c1, c2, c3);
                         row[x] = qRgba(c0*c3/255, c1*c3/255, c2*c3/255, qAlpha(row[x]));
                     } else if(qAlpha(row[x]) != 0) row[x] = lerpTo(row[x], fn(row[x]), mv);
+                }
+            }
+            if(!native.isNull() && g_docColor && g_docColor->icc){
+                const int mode = g_docColor->mode, comps = mode == 1 ? 1 : mode == 3 ? 3 : 4, w = img.width();
+                QByteArray in(qint64(w) * comps, 0), out(qint64(w) * 3, 0);
+                for(int y = 0; y < img.height(); ++y){
+                    const QRgb* n = reinterpret_cast<const QRgb*>(native.constScanLine(y));
+                    uchar* q = reinterpret_cast<uchar*>(in.data());
+                    for(int x = 0; x < w; ++x){
+                        if(comps == 1) q[x] = uchar(qRed(n[x]));
+                        else if(comps == 3){ q[x*3] = uchar(qRed(n[x])); q[x*3+1] = uchar(qGreen(n[x])); q[x*3+2] = uchar(qBlue(n[x])); }
+                        else { q[x*4] = uchar(255 - qRed(n[x])); q[x*4+1] = uchar(255 - qGreen(n[x])); q[x*4+2] = uchar(255 - qBlue(n[x])); q[x*4+3] = uchar(255 - qAlpha(n[x])); }
+                    }
+                    g_docColor->icc->convert(q, reinterpret_cast<uchar*>(out.data()), w);
+                    QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+                    const uchar* o = reinterpret_cast<const uchar*>(out.constData());
+                    for(int x = 0; x < w; ++x) row[x] = (row[x] & 0xff000000u) | (uint(o[x*3]) << 16) | (uint(o[x*3+1]) << 8) | o[x*3+2];
                 }
             }
             s.fill.image = img;
@@ -1632,9 +1712,16 @@ struct Builder {
 
     // A gradient spanning `box`, as SVG, with an id; Photoshop measures its length along the angle.
     QString gradientDef(const Val& g, const QRectF& box, const QString& id) const {
-        const QVector<GradStop> st = gradStops(g.get("Grad"), g.n("Rvrs") != 0);
+        QVector<GradStop> st = gradStops(g.get("Grad"), g.n("Rvrs") != 0);
         if(st.isEmpty()) return {};
         const QString type = g.s("Type");
+        // Reflected: the ramp runs out from the centre both ways. Written out in full, so no spread method is needed.
+        if(type == "Rflc"){
+            QVector<GradStop> both;
+            for(int i = st.size() - 1; i > 0; --i) both.push_back({ 0.5 - st[i].pos / 2.0, st[i].col });
+            for(const GradStop& q : st) both.push_back({ 0.5 + q.pos / 2.0, q.col });
+            st = both;
+        }
         const double a = g.n("Angl", 90.0) * M_PI / 180.0, sc = qBound(0.1, g.n("Scl", 100.0) / 100.0, 1.5);
         QPointF off;
         if(const Val* of = g.get("Ofst")) off = QPointF(of->n("Hrzn") / 100.0 * box.width(), of->n("Vrtc") / 100.0 * box.height());
@@ -1644,9 +1731,9 @@ struct Builder {
         for(const GradStop& s : st) stops += QStringLiteral("<stop offset=\"%1\" stop-color=\"%2\"%3/>").arg(fn(s.pos), hx(s.col), s.col.alphaF() < 0.999 ? QStringLiteral(" stop-opacity=\"%1\"").arg(fn(s.col.alphaF())) : QString());
         if(type == "Rdl" || type == "Dmnd")
             return QStringLiteral("<radialGradient id=\"%1\" gradientUnits=\"userSpaceOnUse\" cx=\"%2\" cy=\"%3\" r=\"%4\">%5</radialGradient>").arg(id, fn(c.x()), fn(c.y()), fn(qMax(1.0, 0.5 * sc * std::hypot(box.width(), box.height()))), stops);
-        const QPointF p0 = type == "Rflc" ? c : c - QPointF(dx, dy) * half, p1 = c + QPointF(dx, dy) * half;
+        const QPointF p0 = c - QPointF(dx, dy) * half, p1 = c + QPointF(dx, dy) * half;
         return QStringLiteral("<linearGradient id=\"%1\" gradientUnits=\"userSpaceOnUse\" x1=\"%2\" y1=\"%3\" x2=\"%4\" y2=\"%5\"%6>%7</linearGradient>")
-            .arg(id, fn(p0.x()), fn(p0.y()), fn(p1.x()), fn(p1.y()), type == "Rflc" ? QStringLiteral(" spreadMethod=\"reflect\"") : QString(), stops);
+            .arg(id, fn(p0.x()), fn(p0.y()), fn(p1.x()), fn(p1.y()), QString(), stops);
     }
 
     // What fills a shape or fill layer. A stroked shape keeps it in vscg, tagged with the fill kind.
@@ -1900,7 +1987,7 @@ QImage importPsd(const QByteArray& d){
     ColorInfo ci; ci.mode = mode;
     qint64 o = 26;
     { const qint64 l = r.u32(o); if(l < 0 || l > r.N - o - 4) return {}; ci.table = d.mid(o + 4, l); o += 4 + l; }
-    { const qint64 l = r.u32(o); if(l < 0 || l > r.N - o - 4) return {}; o += 4 + l; }
+    { const qint64 l = r.u32(o); if(l < 0 || l > r.N - o - 4) return {}; if(depth != 32) ci.icc = documentProfile(r, o + 4, o + 4 + l, mode); o += 4 + l; }
     int rawCount = 0;
     { const int sz = psb ? 8 : 4; const qint64 l = psb ? r.u64(o) : r.u32(o); if(l < 0 || l > r.N - o - sz) return {};
       if(l > sz){ const qint64 li = psb ? r.u64(o + sz) : r.u32(o + sz); if(li > 0) rawCount = qint16(r.u16(o + sz + sz)); }
@@ -1969,6 +2056,7 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
     { const qint64 l = r.u32(o); if(l < 0 || l > r.N - o - 4) return doc; ci.table = d.mid(o + 4, l); o += 4 + l; }
     double globalAngle = 120.0;
     { const qint64 l = r.u32(o); if(l < 0 || l > r.N - o - 4) return doc;
+      if(depth != 32) ci.icc = documentProfile(r, o + 4, o + 4 + l, ci.mode);
       qint64 p = o + 4; const qint64 end = p + l;
       while(p + 12 <= end && d.mid(p, 4) == "8BIM"){
           const int id = r.u16(p + 4);
@@ -1989,6 +2077,7 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
       o += 4 + l; }
 
     g_linearDoc = depth == 32;
+    g_docColor = &ci;
     PatternMap patterns;
     QVector<Lay> lays;
     int rawCount = 0;
@@ -2030,7 +2119,7 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
         if(isPixelShape(s)){
             QImage img = s.fill.image.convertToFormat(QImage::Format_ARGB32);
             multiplyAlpha(img, int(s.transform.dx()), int(s.transform.dy()), cov, area);
-            const bool native = s.fill.origImage.size() == img.size() && ci.mode == 4;
+            const bool native = s.fill.origImage.size() == img.size() && s.fill.origImage.cacheKey() != s.fill.image.cacheKey();
             s.fill.image = img; if(!native) s.fill.origImage = img;
         } else {
             QImage gray(W, H, QImage::Format_ARGB32);
@@ -2182,7 +2271,8 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
     // A file with an unclosed divider still shows its contents.
     while(stack.size() > 1){ Scope sc = stack.takeLast(); stack.last().shapes += sc.shapes; }
     doc.shapes = stack[0].shapes;
-    if(ci.mode == 4) dropNative(doc.shapes);
+    dropNative(doc.shapes);
+    g_docColor = nullptr;
 
     if(doc.shapes.isEmpty()){
         const QImage comp = importPsd(d);

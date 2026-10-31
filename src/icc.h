@@ -10,6 +10,19 @@
 
 namespace xara {
 
+// A document's embedded profile to sRGB, with Photoshop's default rendering: relative colorimetric with black
+// point compensation. ok() is false without lcms2, for a profile it can't read, or one of another colour space.
+class IccToSrgb {
+public:
+    IccToSrgb(const QByteArray& profile, int components);    // 1 grey, 3 RGB, 4 CMYK (ink, 255 = full)
+    ~IccToSrgb();
+    IccToSrgb(const IccToSrgb&) = delete; IccToSrgb& operator=(const IccToSrgb&) = delete;
+    bool ok() const { return m_xf != nullptr; }
+    void convert(const uchar* in, uchar* rgb, int pixels) const;
+private:
+    void* m_xf = nullptr;
+};
+
 class Icc {
 public:
     static Icc& instance();

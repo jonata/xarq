@@ -84,6 +84,48 @@ static QStringList scanCmykProfiles(){
     out.removeDuplicates(); return out;
 }
 
+namespace {
+struct LcmsMem {
+    typedef void* (*OpenMem)(const void*, cmsU32);
+    typedef void* (*Srgb)();
+    typedef void* (*Create)(void*, cmsU32, void*, cmsU32, cmsU32, cmsU32);
+    typedef void (*Do)(void*, const void*, void*, cmsU32);
+    typedef int (*Close)(void*);
+    typedef void (*Del)(void*);
+    OpenMem open = nullptr; Srgb srgb = nullptr; Create create = nullptr; Do run = nullptr; Close close = nullptr; Del del = nullptr;
+    LcmsMem(){
+        void* lib = dlopen("liblcms2.so.2", RTLD_NOW|RTLD_LOCAL);
+        if(!lib) lib = dlopen("liblcms2.so", RTLD_NOW|RTLD_LOCAL);
+        if(!lib) return;
+        open = (OpenMem)dlsym(lib, "cmsOpenProfileFromMem"); srgb = (Srgb)dlsym(lib, "cmsCreate_sRGBProfile");
+        create = (Create)dlsym(lib, "cmsCreateTransform"); run = (Do)dlsym(lib, "cmsDoTransform");
+        close = (Close)dlsym(lib, "cmsCloseProfile"); del = (Del)dlsym(lib, "cmsDeleteTransform");
+    }
+    bool ok() const { return open && srgb && create && run && close && del; }
+};
+const LcmsMem& lcmsMem(){ static const LcmsMem l; return l; }
+}
+
+IccToSrgb::IccToSrgb(const QByteArray& profile, int components){
+    const LcmsMem& l = lcmsMem();
+    if(!l.ok() || profile.size() < 132 || profile.size() > (64 << 20)) return;
+    // The profile's colour space, at byte 16, has to be the document's.
+    const QByteArray space = profile.mid(16, 4);
+    cmsU32 fmt = 0;
+    if(components == 1 && space == "GRAY") fmt = (3u<<16)|(1u<<3)|1u;
+    else if(components == 3 && space == "RGB ") fmt = TYPE_RGB_8;
+    else if(components == 4 && space == "CMYK") fmt = TYPE_CMYK_8;
+    if(!fmt) return;
+    void* in = l.open(profile.constData(), cmsU32(profile.size()));
+    if(!in) return;
+    void* out = l.srgb();
+    if(out) m_xf = l.create(in, fmt, out, TYPE_RGB_8, 1u /*relative colorimetric*/, 0x2000u /*black point compensation*/);
+    l.close(in);
+    if(out) l.close(out);
+}
+IccToSrgb::~IccToSrgb(){ if(m_xf) lcmsMem().del(m_xf); }
+void IccToSrgb::convert(const uchar* in, uchar* rgb, int pixels) const { if(m_xf && pixels > 0) lcmsMem().run(m_xf, in, rgb, cmsU32(pixels)); }
+
 Icc::Icc() : d(new Impl) {
     d->lib = dlopen("liblcms2.so.2", RTLD_NOW|RTLD_LOCAL);
     if(!d->lib) d->lib = dlopen("liblcms2.so", RTLD_NOW|RTLD_LOCAL);
