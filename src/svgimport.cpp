@@ -146,7 +146,7 @@ struct Ctx { QTransform xf; QColor fill=Qt::black; bool fillOn=true; QColor stro
     // XarQ-native appearance that SVG has no words for, written by our own importers under the xarq:
     // namespace. Per-element: never inherited.
     QString xqTransp, xqBitmap, xqBitmapXf; bool xqBitmapTiled = false;
-    QString xqPath; double xqPathStart = 0.0;
+    QString xqPath; double xqPathStart = 0.0, letterSpacing = 0.0;
     QString xqShadow, xqPressure; double xqBlur = 0.0, xqBlurGain = 1.0;
     QImage xqMask; QTransform xqMaskXf;     // pixel mask, inherited: image pixels to document
     int xqBlendType = 0;      // inherited, like the composition mode it stands in for
@@ -573,6 +573,7 @@ QVector<Shape> parseSvg(const QByteArray& xml, QString* error, const QString& ba
             else if(a.hasAttribute("inkscape:label"))  c.label = a.value("inkscape:label").toString();
             else if(a.hasAttribute("data-name"))       c.label = a.value("data-name").toString();
             c.xqTransp = a.value("xarq:transp").toString();
+            if(a.hasAttribute("letter-spacing")){ const QString ls = a.value("letter-spacing").toString().trimmed(); if(ls != QLatin1String("normal") && ls != QLatin1String("inherit")) c.letterSpacing = qBound(-1000.0, num(ls), 1000.0); }
             c.xqPath = a.value("xarq:path").toString();
             if(a.hasAttribute("xarq:pmask")){
                 const QByteArray b = a.value("xarq:pmask").toString().toLatin1();
@@ -683,6 +684,7 @@ QVector<Shape> parseSvg(const QByteArray& xml, QString* error, const QString& ba
                         s.opacity=qBound(0.0,rn.opacity,1.0);
                         s.transform = QTransform::fromTranslate(px, chunkY-QFontMetricsF(rn.font).ascent()) * c.xf;   // baseline at chunkY
                         s.name=c.label.isEmpty()?QStringLiteral("text"):c.label;
+                        if(c.letterSpacing!=0.0) s.tracking=c.letterSpacing;
                         if(!c.xqPath.isEmpty()){ s.textPath=parsePath(c.xqPath); s.textPathOffset=c.xqPathStart*s.textPath.length(); }
                         emitShape(s); recClip(c); recBlur(c);
                     } else {
@@ -705,6 +707,7 @@ QVector<Shape> parseSvg(const QByteArray& xml, QString* error, const QString& ba
                         s.opacity=qBound(0.0,chunk[0].opacity,1.0);
                         s.transform = QTransform::fromTranslate(px, chunkY-maxAsc) * c.xf;   // shared baseline at chunkY
                         s.name=c.label.isEmpty()?QStringLiteral("text"):c.label;
+                        if(c.letterSpacing!=0.0) s.tracking=c.letterSpacing;
                         if(!c.xqPath.isEmpty()){ s.textPath=parsePath(c.xqPath); s.textPathOffset=c.xqPathStart*s.textPath.length(); }
                         emitShape(s); recClip(c); recBlur(c);
                     }

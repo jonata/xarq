@@ -831,13 +831,14 @@ struct Spline {   // natural cubic: Vals is x[n], y[n], y''[n]
 };
 struct Adjust {
     enum Kind { Levels, Curves, HSL, BC, BW, Invert, Recolour, Selective,
-                ColourBalance, Exposure, Vibrance, Posterize, Threshold, ShadowsHighlights, LensFilter, ChannelMixer, GradientMap } kind = Invert;
+                ColourBalance, Exposure, Vibrance, Posterize, Threshold, ShadowsHighlights, LensFilter, ChannelMixer, GradientMap, WhiteBalance, SplitToning, Lut3D } kind = Invert;
     double a = 0, b = 0, c = 0, d = 0, e = 0;
     double wt[6] = {1,1,1,1,1,1};
     double sel[36] = {0};
     bool relative = true;
     Spline master, chan[3];
     QVector<QRgb> map;             // GradientMap: 256 colours by luminance
+    QVector<float> cube; int dim = 0;   // Lut3D: dim^3 entries of three floats, red fastest
 };
 void rgb2hsl(double r, double g, double b, double& h, double& s, double& l){
     const double mx = qMax(r, qMax(g, b)), mn = qMin(r, qMin(g, b));
@@ -908,6 +909,27 @@ void applyAdjust(const Adjust& A, double& r, double& g, double& b){
         const double R = r, G = g, B = b;
         auto row = [&](int i){ const double* k = A.sel + i * w; return cl(k[0]*R + k[1]*G + k[2]*B + (w > 3 ? k[3] : 0.0)); };
         r = row(0); g = row(1); b = row(2); break; }
+    case Adjust::WhiteBalance: {
+        const double R = toLin(r) * (1.0 + 0.25 * A.a), G = toLin(g) * (1.0 - 0.25 * A.b), B = toLin(b) * (1.0 - 0.25 * A.a);
+        r = toGam(R); g = toGam(G); b = toGam(B); break; }
+    case Adjust::SplitToning: {
+        // sel: highlight RGB offset, shadow RGB offset (from each hue and saturation); a is the balance.
+        const double L = 0.2126*r + 0.7152*g + 0.0722*b;
+        const double hi = qBound(0.0, L + A.a * 0.5, 1.0), lo = 1.0 - hi;
+        r = cl(r + A.sel[0] * hi + A.sel[3] * lo); g = cl(g + A.sel[1] * hi + A.sel[4] * lo); b = cl(b + A.sel[2] * hi + A.sel[5] * lo); break; }
+    case Adjust::Lut3D: {
+        const int d = A.dim;
+        if(d < 2 || A.cube.size() != qsizetype(d) * d * d * 3) break;
+        const double u[3] = { cl(r) * (d - 1), cl(g) * (d - 1), cl(b) * (d - 1) };
+        const int i0 = qMin(int(u[0]), d - 2), i1 = qMin(int(u[1]), d - 2), i2 = qMin(int(u[2]), d - 2);
+        const double f0 = u[0] - i0, f1 = u[1] - i1, f2 = u[2] - i2;
+        double o[3] = { 0, 0, 0 };
+        for(int c = 0; c < 8; ++c){
+            const double w = (c & 1 ? f0 : 1 - f0) * (c & 2 ? f1 : 1 - f1) * (c & 4 ? f2 : 1 - f2);
+            const qsizetype at = 3 * (qsizetype(i0 + (c & 1)) + qsizetype(i1 + ((c >> 1) & 1)) * d + qsizetype(i2 + ((c >> 2) & 1)) * d * d);
+            for(int k = 0; k < 3; ++k) o[k] += w * A.cube[at + k];
+        }
+        r = cl(o[0]); g = cl(o[1]); b = cl(o[2]); break; }
     case Adjust::GradientMap: {
         if(A.map.size() != 256) break;
         const QRgb c = A.map[qBound(0, int((0.2126*r + 0.7152*g + 0.0722*b) * 255.0 + 0.5), 255)];
@@ -999,7 +1021,7 @@ struct LayerFx {
     double noise = 0;
 };
 
-struct TxStyle { double size = 12.0; QString family; int weight = 400; bool italic = false; QColor col = Qt::black; double track = 0.0; };
+struct TxStyle { double size = 12.0; QString family; int weight = 400; bool italic = false; QColor col = Qt::black; double track = 0.0, fixedLead = 0.0, hscale = 1.0; };
 
 struct Paint {
     enum Kind { None, Solid, Gradient, Bitmap } kind = None;
@@ -1457,6 +1479,7 @@ QString Converter::styleFor(const AffNode& n, int fillSlot, int strokeSlot){
         // No LSty means no outline at all: a shape can carry a stroke COLOUR (PFil) with the stroke
         // switched off, and the four quadrants of color.afdesign prove it renders unstroked.
         double w = 0.0; bool brush = false;
+        QVector<double> dashPattern;
         QString pressure;
         LineData ld;
         int ls = firstKid(n, TG('L','S','t','y'));
@@ -1470,6 +1493,12 @@ QString Converter::styleFor(const AffNode& n, int fillSlot, int strokeSlot){
         if(const AffNode* l = node(ls)){
             const AffField* wg = fieldOf(*l, TG('W','g','h','t'));
             if(wg && !wg->num.isEmpty()) w = finite(wg->num[0]) * m_ptScale;
+            // Patn is in multiples of the weight, padded with zero pairs.
+            if(const AffField* pn = fieldOf(*l, TG('P','a','t','n'))){
+                for(double v : pn->num) if(dashPattern.size() < 64) dashPattern.push_back(qMax(0.0, finite(v)));
+                while(dashPattern.size() >= 2 && dashPattern.last() == 0.0 && dashPattern[dashPattern.size() - 2] == 0.0) dashPattern.resize(dashPattern.size() - 2);
+                if(std::none_of(dashPattern.begin(), dashPattern.end(), [](double v){ return v > 0.0; })) dashPattern.clear();
+            }
             brush = firstKid(*l, TG('B','r','u','s')) >= 0;
             ld = lineData(*l);
         }
@@ -1493,7 +1522,11 @@ QString Converter::styleFor(const AffNode& n, int fillSlot, int strokeSlot){
             else if(jnId == 1) out += QStringLiteral(" stroke-linejoin=\"round\"");
             else if(jnId == 2) out += QStringLiteral(" stroke-linejoin=\"miter\"");
             if(ld.valid && ld.style == 2)
-                out += QStringLiteral(" stroke-dasharray=\"%1 %1\"").arg(fnum(w * 2.0));
+            {
+                QStringList ds;
+                for(double v : dashPattern) ds << fnum(v * w);
+                out += ds.isEmpty() ? QStringLiteral(" stroke-dasharray=\"%1 %1\"").arg(fnum(w * 2.0)) : QStringLiteral(" stroke-dasharray=\"%1\"").arg(ds.join(QLatin1Char(' ')));
+            }
         }
     }
     return out;
@@ -1770,7 +1803,9 @@ LayerFx Converter::readFx(const AffNode& n){
             const AffNode* f = node(firstKid(*m, TG('F','i','l','t')));
             if(f && !f->types.isEmpty() && f->types[0] == TG('R','G','B','C')) fx.blur = qMax(fx.blur, qBound(0.0, numOf(*f, TG('R','a','d','i'), 0.0), 1e4));
             if(f && !f->types.isEmpty() && f->types[0] == TG('R','A','N','C')) fx.noise = qBound(0.0, numOf(*f, TG('I','n','t','e'), 0.0), 1.0);
-            if(f && !f->types.isEmpty() && f->types[0] != TG('R','G','B','C') && f->types[0] != TG('R','A','N','C')) ++m_st.ignoredFilters;
+            if(f && !f->types.isEmpty() && f->types[0] == TG('R','L','b','C') && numOf(*f, TG('R','a','d','i'), 0.0) > 0.0)
+                fx.blur = qMax(fx.blur, qBound(0.0, numOf(*f, TG('R','a','d','i'), 0.0), 1e4));      // lens blur, as a Gaussian
+            else if(f && !f->types.isEmpty() && f->types[0] != TG('R','G','B','C') && f->types[0] != TG('R','A','N','C')) ++m_st.ignoredFilters;
         }
     return fx;
 }
@@ -2310,6 +2345,11 @@ TxStyle Converter::runStyle(const AffNode& item, const TxStyle& base){
     TxStyle st = base;
     if(const AffField* db = fieldOf(item, TG('D','o','u','b'))){
         if(!db->num.isEmpty()) st.size = qBound(0.01, finite(db->num[0]), 4000.0);
+        // Slots from the reference reader; no sample sets the first two. Tracking is taken as a fraction of the size.
+        st.track = db->num.size() > 4 ? qBound(-2.0, finite(db->num[4]), 10.0) * st.size : 0.0;
+        st.hscale = db->num.size() > 10 ? qBound(0.05, finite(db->num[10]), 20.0) : 1.0;
+        const AffField* iv = fieldOf(item, TG('I','n','t','s'));
+        st.fixedLead = (iv && iv->num.size() > 4 && iv->num[4] == 1.0 && db->num.size() > 13) ? qBound(0.0, finite(db->num[13]), 1e5) : 0.0;
     }
     if(const AffField* objs = fieldOf(item, TG('O','b','j','s'))){
         if(!objs->kids.isEmpty()){
@@ -2454,7 +2494,7 @@ void Converter::textNode(const AffNode& n, QString* outlines){
     struct Line { QVector<Piece> pieces; double size = 12.0, asc = 10.0, adv = 14.0, width = 0.0, x = 0.0, w = 0.0, y = 0.0; int align = 0; };
     QVector<Line> lines;
     const double wrapW = framed ? colW[0] : 0.0;
-    auto measure = [](const QString& t, const TxStyle& st){ return QFontMetricsF(txFont(st)).horizontalAdvance(t) * st.size / 100.0; };
+    auto measure = [](const QString& t, const TxStyle& st){ return (QFontMetricsF(txFont(st)).horizontalAdvance(t) * st.size / 100.0 + st.track * t.size()) * st.hscale; };
     // The outline's clear span at a line's baseline.
     double shapeY = fy;
     auto bandSpan = [&](double asc, double& l, double& w){
@@ -2519,7 +2559,7 @@ void Converter::textNode(const AffNode& n, QString* outlines){
             double spanX = fx, spanW = fr - fx;
             auto flush = [&](int i0, int i1){
                 Line ln; ln.align = align;
-                double mx = 0.0, asc = 0.0, adv = 0.0;
+                double mx = 0.0, asc = 0.0, adv = 0.0, fixedLead = 0.0;
                 for(int i = i0; i < i1; ){
                     const TxStyle& st = styleAt(start + i);
                     int j = i + 1;
@@ -2530,6 +2570,7 @@ void Converter::textNode(const AffNode& n, QString* outlines){
                     mx = qMax(mx, st.size);
                     asc = qMax(asc, fm.ascent() * st.size / 100.0);
                     adv = qMax(adv, fm.height() * st.size / 100.0);
+                    fixedLead = qMax(fixedLead, st.fixedLead);
                     i = j;
                 }
                 if(mx <= 0.0){
@@ -2537,7 +2578,7 @@ void Converter::textNode(const AffNode& n, QString* outlines){
                     const QFontMetricsF fm(txFont(st));
                     mx = st.size; asc = fm.ascent() * st.size / 100.0; adv = fm.height() * st.size / 100.0;
                 }
-                ln.size = mx; ln.asc = asc; ln.adv = leadOfSize ? mx * lead : adv * lead;
+                ln.size = mx; ln.asc = asc; ln.adv = fixedLead > 0.0 ? fixedLead : leadOfSize ? mx * lead : adv * lead;
                 if(!shapeGeo.isEmpty()){ ln.x = spanX; ln.w = spanW; ln.y = shapeY + asc; shapeY += ln.adv; }
                 lines.push_back(ln);
             };
@@ -2598,6 +2639,7 @@ void Converter::textNode(const AffNode& n, QString* outlines){
         if(!st.family.isEmpty()) a += QStringLiteral(" font-family=\"%1\"").arg(xmlEsc(st.family));
         if(st.weight != 400) a += QStringLiteral(" font-weight=\"%1\"").arg(st.weight);
         if(st.italic) a += QStringLiteral(" font-style=\"italic\"");
+        if(st.track != 0.0) a += QStringLiteral(" letter-spacing=\"%1\"").arg(fnum(st.track));
         if(st.col.alphaF() < 0.999) a += QStringLiteral(" fill-opacity=\"%1\"").arg(fnum(st.col.alphaF()));
         return a;
     };
@@ -2612,6 +2654,8 @@ void Converter::textNode(const AffNode& n, QString* outlines){
             else if(ln.align == 2){ ax = lx + lw; anchor = "end"; }
         }
         QString e = QStringLiteral("<text x=\"%1\" y=\"%2\"").arg(fnum(ax), fnum(y));
+        const double hs = ln.pieces.isEmpty() ? 1.0 : ln.pieces[0].st.hscale;
+        if(qAbs(hs - 1.0) > 1e-3 && pathD.isEmpty()) e += QStringLiteral(" transform=\"matrix(%1 0 0 1 %2 0)\"").arg(fnum(hs), fnum(ax * (1.0 - hs)));
         if(anchor) e += QStringLiteral(" text-anchor=\"%1\"").arg(QLatin1String(anchor));
         e += fxShapeAttrs();
         if(m_fx.blur > 0.0) e += QStringLiteral(" xarq:blur=\"%1\"").arg(fnum(fxBlur(m_fx.blur)));
@@ -2784,7 +2828,7 @@ static QByteArray bitmapPlane(const AffArchive& ar, const AffTree& tr, const Aff
     int next = 0;
     for(qint64 cell = 0; cell < qint64(tx) * ty; ++cell){
         const double st = sta->num[qsizetype(cell)];
-        if(st != 2.0 && st != 4.0) continue;
+        if(st != 2.0 && st != 3.0 && st != 4.0) continue;
         const qint64 ox = (cell % tx) * kTile; const int oy = int(cell / tx) * kTile;
         const int cw = int(qMin<qint64>(kTile, rowBytes - ox)), chh = qMin(kTile, H - oy);
         QByteArray t;
@@ -2796,6 +2840,10 @@ static QByteArray bitmapPlane(const AffArchive& ar, const AffTree& tr, const Aff
         for(int r = 0; r < chh; ++r){
             char* dst = out.data() + (oy + r) * rowBytes + ox;
             if(st == 2.0) memset(dst, 0xFF, size_t(cw));
+            else if(st == 3.0){                              // the float 1.0, little-endian
+                static const char one[4] = { 0, 0, char(0x80), 0x3F };
+                for(int i = 0; i < cw; ++i) dst[i] = one[((ox + i) & 3)];
+            }
             else memcpy(dst, t.constData() + qsizetype(r) * kTile, size_t(cw));
         }
     }
@@ -2825,39 +2873,60 @@ static QImage bitmapGrey(const AffArchive& ar, const AffTree& tr, const AffNode&
     return img;
 }
 
-// 16-bit RGBA (Frmt 1, little-endian samples) and 8-bit CMYK + alpha (Frmt 4) pixel layers.
-static QImage rasterOtherFormat(const AffArchive& ar, const AffTree& tr, const AffNode& dybm, int fmt, i64& pixelBudget){
+// Layers that aren't 8-bit RGBA. Format: 1 RGBA16, 2 grey8+A, 3 grey16+A, 4 CMYK8+A, 5 Lab16+A, 9 RGBA float.
+// Samples are little-endian. No available document holds one of these, so this follows the format table only.
+static QImage rasterOtherFormat(const AffArchive& ar, const AffTree& tr, const AffNode& dybm, int fmt, i64& pixelBudget, QPoint* originOut){
     const double dw = numOf(dybm, TG('B','m','p','W'), 0.0), dh = numOf(dybm, TG('B','m','p','H'), 0.0);
     if(!(dw >= 1.0) || !(dh >= 1.0) || dw > 1e6 || dh > 1e6) return {};
     const int W = int(dw), H = int(dh);
     const i64 px = i64(W) * H;
     if(px > kMaxRasterPx || px > pixelBudget) return {};
     pixelBudget -= px;
-    const int nch = fmt == 4 ? 5 : 4, bps = fmt == 1 ? 2 : 1;
+    const int nch = fmt == 4 ? 5 : (fmt == 2 || fmt == 3) ? 2 : 4;
+    const int bps = fmt == 9 ? 4 : (fmt == 1 || fmt == 3 || fmt == 5) ? 2 : 1;
+    if(i64(px) * nch * bps > (i64(kMaxRasterPx) << 3)) return {};
     QByteArray pl[5];
     for(int c = 0; c < nch; ++c) pl[c] = bitmapPlane(ar, tr, dybm, c, W, H, bps);
     for(int c = 0; c < nch - 1; ++c) if(pl[c].isEmpty()) return {};
     QImage img(W, H, QImage::Format_RGBA8888);
     if(img.isNull()) return {};
+    auto gam = [](double v){ v = qBound(0.0, v, 1.0); return v <= 0.0031308 ? 12.92 * v : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055; };
+    auto b8 = [](double v){ return u8(qBound(0, int(v * 255.0 + 0.5), 255)); };
     for(int y = 0; y < H; ++y){
         u8* d = img.scanLine(y);
         for(int x = 0; x < W; ++x, d += 4){
-            const qint64 i = (qint64(y) * W + x) * bps + (bps - 1);       // the high byte
-            auto v = [&](int c){ return pl[c].isEmpty() ? 255 : int(u8(pl[c][i])); };
-            if(fmt == 4){ const int k = 255 - v(3); d[0] = u8((255 - v(0)) * k / 255); d[1] = u8((255 - v(1)) * k / 255); d[2] = u8((255 - v(2)) * k / 255); d[3] = u8(v(4)); }
-            else { d[0] = u8(v(0)); d[1] = u8(v(1)); d[2] = u8(v(2)); d[3] = u8(v(3)); }
+            const qint64 i = (qint64(y) * W + x) * bps;
+            auto v = [&](int c)->double {
+                if(pl[c].isEmpty()) return 1.0;
+                const u8* q = reinterpret_cast<const u8*>(pl[c].constData()) + i;
+                if(bps == 1) return q[0] / 255.0;
+                if(bps == 2) return (q[0] | (q[1] << 8)) / 65535.0;
+                float f; memcpy(&f, q, 4);
+                return std::isfinite(f) ? double(f) : 1.0;
+            };
+            if(fmt == 4){ const double k = 1.0 - v(3); d[0] = b8((1.0 - v(0)) * k); d[1] = b8((1.0 - v(1)) * k); d[2] = b8((1.0 - v(2)) * k); d[3] = b8(v(4)); }
+            else if(fmt == 2 || fmt == 3){ d[0] = d[1] = d[2] = b8(v(0)); d[3] = b8(v(1)); }
+            else if(fmt == 5){ const QRgb c = labToRgbQ(100.0 * v(0), 255.0 * v(1) - 128.0, 255.0 * v(2) - 128.0); d[0] = u8(qRed(c)); d[1] = u8(qGreen(c)); d[2] = u8(qBlue(c)); d[3] = b8(v(3)); }
+            else if(fmt == 9){ d[0] = b8(gam(v(0))); d[1] = b8(gam(v(1))); d[2] = b8(gam(v(2))); d[3] = b8(v(3)); }
+            else { d[0] = b8(v(0)); d[1] = b8(v(1)); d[2] = b8(v(2)); d[3] = b8(v(3)); }
         }
     }
-    return img;
+    // Same trim as an 8-bit layer: the grid spans the canvas even when the paint covers a corner.
+    int x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for(int y = 0; y < H; ++y){
+        const u8* row = img.constScanLine(y) + 3;
+        for(int x = 0; x < W; ++x) if(row[qsizetype(x) * 4]){ if(x < x0) x0 = x; if(x > x1) x1 = x; if(y < y0) y0 = y; y1 = y; }
+    }
+    if(x1 < x0) return {};
+    if(originOut) *originOut = QPoint(x0, y0);
+    return (x0 == 0 && y0 == 0 && x1 == W-1 && y1 == H-1) ? img : img.copy(QRect(x0, y0, x1 - x0 + 1, y1 - y0 + 1));
 }
 
 QImage rasterImage(const AffArchive& ar, const AffTree& tr, const AffNode& dybm,
                    i64& pixelBudget, QPoint* originOut){
     const double rasterFmt = numOf(dybm, TG('F','r','m','t'), -1.0);
-    if(rasterFmt == 1.0 || rasterFmt == 4.0){
-        if(originOut) *originOut = QPoint(0, 0);
-        return rasterOtherFormat(ar, tr, dybm, int(rasterFmt), pixelBudget);
-    }
+    if(rasterFmt == 1.0 || rasterFmt == 2.0 || rasterFmt == 3.0 || rasterFmt == 4.0 || rasterFmt == 5.0 || rasterFmt == 9.0)
+        return rasterOtherFormat(ar, tr, dybm, int(rasterFmt), pixelBudget, originOut);
     if(rasterFmt != 0.0) return {};
     const double dw = numOf(dybm, TG('B','m','p','W'), 0.0);
     const double dh = numOf(dybm, TG('B','m','p','H'), 0.0);
@@ -3304,6 +3373,43 @@ bool Converter::readAdjust(const AffNode& n, Adjust& A) const {
         A.relative = nv("PeLu", 1) != 0.0;
         return true;
     }
+    if(c == TG('W','B','R','A')){
+        if(!p) return false; A.kind = Adjust::WhiteBalance;
+        // Both read as -100..100 when larger than one, else -1..1.
+        const double t = nv("WhBa", 0), ti = nv("WBTi", 0);
+        A.a = qBound(-1.0, qAbs(t) > 1.0 ? t / 100.0 : t, 1.0); A.b = qBound(-1.0, qAbs(ti) > 1.0 ? ti / 100.0 : ti, 1.0);
+        return true;
+    }
+    if(c == TG('S','p','T','A')){
+        if(!p) return false; A.kind = Adjust::SplitToning;
+        auto tone = [&](const char* hk, const char* sk, double* out){
+            double h = nv(hk, 0); if(qAbs(h) > 1.0) h /= 360.0; h -= std::floor(h);
+            const double sa = qBound(0.0, nv(sk, 0), 1.0);
+            const QColor col = QColor::fromHslF(float(h), 1.f, 0.5f);
+            out[0] = (col.redF() - 0.5) * sa * 0.5; out[1] = (col.greenF() - 0.5) * sa * 0.5; out[2] = (col.blueF() - 0.5) * sa * 0.5;
+        };
+        tone("HlHu", "HlSa", A.sel); tone("ShHu", "ShSa", A.sel + 3);
+        A.a = qBound(-1.0, nv("Bala", 0), 1.0);
+        return true;
+    }
+    if(c == TG('3','D','L','A')){
+        const AffNode* cu = p ? node(firstKid(*p, TG('C','u','b','e'))) : nullptr;
+        if(!cu) return false;
+        const int d = int(qBound(0.0, numOf(*cu, TG('D','i','m','e'), 0.0), 129.0));
+        const AffField* px = fieldOf(*cu, TG('P','x','l','s'));
+        if(d < 2 || !px) return false;
+        const qsizetype n = qsizetype(d) * d * d;
+        QVector<float> vals;
+        if(px->num.size() >= n * 3) for(double v : px->num) vals.push_back(float(finite(v)));
+        else if(px->bytes.size() >= n * 3 * qsizetype(sizeof(float))){ vals.resize(px->bytes.size() / qsizetype(sizeof(float))); memcpy(vals.data(), px->bytes.constData(), size_t(vals.size()) * sizeof(float)); }
+        // Three or four components per entry.
+        const int comps = vals.size() == n * 4 ? 4 : vals.size() == n * 3 ? 3 : 0;
+        if(!comps) return false;
+        A.cube.resize(n * 3);
+        for(qsizetype i = 0; i < n; ++i) for(int k = 0; k < 3; ++k){ const float v = vals[i * comps + k]; A.cube[i * 3 + k] = std::isfinite(v) ? v : 0.f; }
+        A.kind = Adjust::Lut3D; A.dim = d;
+        return true;
+    }
     if(c == TG('E','x','R','A')){ if(!p) return false; A.kind = Adjust::Exposure; A.a = nv("Expo", 0); return true; }
     if(c == TG('V','b','R','A')){ if(!p) return false; A.kind = Adjust::Vibrance; A.a = qBound(-1.0, nv("Satu", 0), 1.0); A.b = qBound(-1.0, nv("Vibr", 0), 1.0); return true; }
     if(c == TG('P','o','R','A')){ if(!p) return false; A.kind = Adjust::Posterize; A.a = nv("Post", 8); return true; }
@@ -3370,6 +3476,7 @@ bool isIgnoredAdjustment(const AffNode& n){
     if(n.types.isEmpty()) return false;
     const u32 c = n.types[0];
     if(c == TG('S','P','R','A')) return false;
+    if(c == TG('O','C','R','N') || c == TG('S','p','T','A')) return true;
     return (c & 0xffffu) == (u32('R') | (u32('A') << 8)) || (c & 0xffffu) == (u32('R') << 8 | u32('A')) || c == TG('3','D','L','A');
 }
 
