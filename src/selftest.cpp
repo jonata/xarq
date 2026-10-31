@@ -15,6 +15,7 @@
 #include <QPainter>
 #include <QRadialGradient>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QFile>
 #include <QProcess>
 #include <QRegularExpression>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include "mainwindow.h"
 #include "canvas.h"
+#include "cdrvector.h"
 #include "galleries.h"
 #include "pathedit.h"
 #include "panels.h"
@@ -29,19 +31,39 @@
 #include <QCheckBox>
 #include <QElapsedTimer>
 #include <QTreeWidget>
+#include <QComboBox>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QListWidget>
 #include "spell.h"
 #include "qr.h"
 #include "exif.h"
 #include "photoops.h"
 #include "trace.h"
 #include "hyphen.h"
+#include "vecextra.h"
+#include "affvector.h"
+#include "pdfvector.h"
+#include "gisvector.h"
+#include <zlib.h>
+#include <cstring>
+#include <cstdint>
 #include "svgimport.h"
 #include "svgexport.h"
 #include "pathedit.h"
 #include "render.h"
 #include "prepress.h"
+#include "dwgvector.h"
 #include "icc.h"
 #include "raw.h"
+#include "rasterextra.h"
+#include "extcodecs.h"
+#include "extvector.h"
+#include "jxr.h"
+#include "dicom.h"
+#include "wmf.h"
+#include "slide.h"
 #include "otshape.h"
 #include "xar.h"
 
@@ -1113,6 +1135,29 @@ int runSelfTest() {
 
     // --- Semantic responsive website publish (Batch W2) ---
     std::printf("[web] responsive website publish\n");
+    // Export Bitmap page selector: a 2-page doc (red page 1, blue page 2) → exportRaster(area=Page,
+    // pageIndex=N) renders page N's content, not always page 1 (the pre-fix behaviour).
+    { Canvas ec; Document d; d.pageSize=QSizeF(200,150); d.pageGap=20; d.pageCount=2;
+      const double adv=d.pageSize.height()+d.pageGap;
+      Shape r0; r0.type=ShapeType::Rect; r0.rect=QRectF(0,0,200,150); r0.stroke.enabled=false;
+      r0.fill.type=FillType::Solid; r0.fill.color=QColor(220,20,20);                                       // page 1 = red
+      Shape r1; r1.type=ShapeType::Rect; r1.rect=QRectF(0,0,200,150); r1.stroke.enabled=false;
+      r1.fill.type=FillType::Solid; r1.fill.color=QColor(20,20,220); r1.transform=QTransform::fromTranslate(0,adv);  // page 2 = blue
+      d.shapes={r0,r1}; ec.setDocument(d);
+      const QString a=QDir::tempPath()+"/xq_exp_p1.png", b=QDir::tempPath()+"/xq_exp_p2.png";
+      bool e1=ec.exportRaster(a,0,1.0,-1,false,false,false,0), e2=ec.exportRaster(b,0,1.0,-1,false,false,false,1);
+      QImage i1(a), i2(b);
+      const QColor c1= i1.isNull()? QColor() : i1.pixelColor(i1.width()/2,i1.height()/2);
+      const QColor c2= i2.isNull()? QColor() : i2.pixelColor(i2.width()/2,i2.height()/2);
+      check(e1 && c1.red()>180 && c1.blue()<80,  "Export Bitmap: page 1 exports page 1 (red)");
+      check(e2 && c2.blue()>180 && c2.red()<80,  "Export Bitmap: page selector exports page 2 (blue), not page 1");
+      // exportRasterImage (the live-preview engine behind the new dialog): area rect + maxDim cap.
+      const QRectF ar0=ec.exportAreaRect(0,0);
+      check(qAbs(ar0.width()-200)<1 && qAbs(ar0.height()-150)<1, "exportAreaRect(Page) returns the page rect");
+      QImage full=ec.exportRasterImage(0,2.0,false,0,0), capped=ec.exportRasterImage(0,2.0,false,0,120);
+      check(full.width()==400 && full.height()==300, "exportRasterImage renders at the real scale (2× of 200×150)");
+      check(qMax(capped.width(),capped.height())<=120 && !capped.isNull(), "exportRasterImage maxDim caps the preview render"); }
+
     { Document d; d.pageSize=QSizeF(800,600); d.breakpoints={480}; d.pageCount=2;
       // a heading (real text), a linked stretchy banner text, and a vector rect
       Shape head; head.type=ShapeType::Text; head.text="Welcome"; head.font=QFont("DejaVu Sans",40); head.fill.type=FillType::Solid; head.fill.color=QColor(20,20,20);
@@ -1618,6 +1663,29 @@ int runSelfTest() {
       { const Shape& sh=c->doc().shapes[0]; QPointF docPt=sh.transform.map(sh.textCaretLocal(3));
         c->setCaretAtDocPoint(docPt, false); check(c->textCaret()==3, "clicking positions the caret at that character"); }
       c->endTextEdit();                      check(!c->editingText(), "endTextEdit leaves edit mode"); }
+    // Inkscape-style per-selection character formatting: while editing, the InfoBar/palette format ONLY the
+    // selected character range (via formatEditSelection) instead of the whole text object.
+    std::printf("[text-edit] per-selection character formatting (colour + size)\n");
+    { Document d; Shape s; s.type=ShapeType::Text; s.text="RedBlue"; s.font=QFont("DejaVu Sans",36);
+      s.fill.type=FillType::Solid; s.fill.color=QColor(10,10,10); d.shapes={s}; c->setDocument(d); c->select({0});
+      c->beginTextEdit(0,-1);
+      check(!c->formatEditSelection([](QFont&,QColor& cc){ cc=QColor(1,2,3); },"noop"), "formatEditSelection is a no-op with no active selection");
+      c->textMoveCaret(-2,false);                                   // Home → caret at 0
+      c->textMoveCaret(+1,true); c->textMoveCaret(+1,true); c->textMoveCaret(+1,true);   // select [0,3) = "Red"
+      check(c->textHasSelection() && c->textCaret()==3, "shift-arrow selects the first three characters");
+      check(c->formatEditSelection([](QFont&,QColor& cc){ cc=QColor(200,0,0); },"Text colour"), "formatEditSelection colours the selected range");
+      { const Shape& t=c->doc().shapes[0]; check(t.textRuns.size()>=2, "colouring part of the text splits it into runs");
+        check(t.textRuns[0].len==3 && t.textRuns[0].color==QColor(200,0,0), "the selected run [0,3) is red");
+        check(t.textRuns.back().color==QColor(10,10,10), "the unselected tail keeps the base colour"); }
+      // now select [3,7) = "Blue" and shrink its size — only that run changes
+      c->textMoveCaret(+2,false);                                   // End → caret at 7 (clears selection)
+      c->textMoveCaret(-1,true); c->textMoveCaret(-1,true); c->textMoveCaret(-1,true); c->textMoveCaret(-1,true);  // select back to 3
+      check(c->formatEditSelection([](QFont& g,QColor&){ g.setPointSize(12); },"Size"), "formatEditSelection resizes the selected range");
+      { const Shape& t=c->doc().shapes[0]; const TextRun& last=t.textRuns.back();
+        check(last.start==3 && last.font.pointSize()==12, "the second run [3,7) is 12pt while the first stays 36pt");
+        check(t.textRuns.front().font.pointSize()==36, "the first run's size is unchanged"); }
+      c->undo(); check(c->doc().shapes[0].textRuns.back().font.pointSize()==36, "undo reverts the per-selection size change");
+      c->endTextEdit(); }
     // a freshly-created empty text object is discarded when editing ends with no text
     { Document d; c->setDocument(d);
       Shape s; s.type=ShapeType::Text; s.text=QString(); s.font=QFont("DejaVu Sans",36); s.transform=QTransform::fromTranslate(50,50);
@@ -1942,6 +2010,38 @@ int runSelfTest() {
         check(!so.isAccepted(), "Delete ShortcutOverride is NOT stolen when not editing"); }
       { QKeyEvent so(QEvent::ShortcutOverride, Qt::Key_T, Qt::NoModifier, "T"); so.ignore(); QApplication::sendEvent(c,&so);
         check(!so.isAccepted(), "plain 'T' is NOT stolen when not editing (Text-tool shortcut still works)"); } }
+    // App-level ShortcutGuard (main.cpp): a single-key tool shortcut must never steal a keystroke from a
+    // focused *UI* input. Qt already lets an editable QLineEdit swallow the ShortcutOverride, but a
+    // non-editable QComboBox / list does NOT — so pressing "T" in a dropdown fired the Text tool. The guard
+    // (installed on qApp before --selftest runs) claims the override for any input control on a bare printable
+    // key, while leaving Ctrl/Alt/Meta combos and non-input widgets (buttons) alone.
+    { auto* host=new QWidget; auto* v=new QVBoxLayout(host);
+      auto* combo=new QComboBox; combo->addItems({"Alpha","Tango","Zulu"}); v->addWidget(combo);   // NON-editable
+      auto* edit =new QLineEdit; v->addWidget(edit);
+      auto* btn  =new QPushButton("Go"); v->addWidget(btn);
+      auto* list =new QListWidget; list->addItems({"Layer 1","Layer 2"}); v->addWidget(list);      // gallery/list
+      host->show(); host->activateWindow(); QApplication::processEvents();
+      auto claimed=[&](QWidget* w, int key, Qt::KeyboardModifiers mods, const QString& txt)->bool{
+          w->setFocus(); QApplication::processEvents();
+          QKeyEvent so(QEvent::ShortcutOverride, key, mods, txt); so.ignore();
+          QApplication::sendEvent(w,&so);       // app event filters (incl. ShortcutGuard) run on sendEvent
+          return so.isAccepted(); };
+      check(claimed(combo, Qt::Key_T, Qt::NoModifier, "t"),
+            "bare 'T' is claimed for a focused non-editable combo (dropdown keeps the key; tool shortcut suppressed)");
+      check(claimed(edit,  Qt::Key_G, Qt::NoModifier, "g"),
+            "bare 'G' is claimed for a focused line edit (typing beats the Fill-tool shortcut)");
+      check(!claimed(btn,  Qt::Key_T, Qt::NoModifier, "t"),
+            "bare 'T' is NOT claimed for a focused push button (single-key tool shortcut still works)");
+      check(!claimed(list, Qt::Key_T, Qt::NoModifier, "t"),
+            "bare 'T' is NOT claimed for a focused list/gallery (tool shortcuts still work while a panel row has focus)");
+      // A modifier combo bypasses the guard even for an input control (the guard only claims bare keys),
+      // so it reaches its global shortcut — tested on the non-editable combo, which unlike a line edit does
+      // not itself consume Ctrl+Z for in-field undo.
+      check(!claimed(combo, Qt::Key_Z, Qt::ControlModifier, QString()),
+            "Ctrl+Z is NOT claimed for a focused non-editable combo (modifier combos bypass the guard → global undo fires)");
+      check(!claimed(edit, Qt::Key_Return, Qt::NoModifier, QString("\r")),
+            "bare Return is NOT claimed in a line edit (non-printable keys fall through: dialogs/defaults keep working)");
+      host->close(); delete host; }
     // Undo while editing must clamp the caret into the (possibly shorter) restored text — no OOB.
     { Document d; Shape s; s.type=ShapeType::Text; s.text="Hello"; s.font=QFont("DejaVu Sans",36);
       s.fill.type=FillType::Solid; d.shapes={s}; c->setDocument(d); c->select({0}); c->beginTextEdit(0,-1);
@@ -2181,6 +2281,110 @@ int runSelfTest() {
       check(line.fill.type==FillType::None && line.stroke.enabled && line.stroke.color==QColor(0,0,255) && line.stroke.width>1.5, "second path is a blue open stroke, width≈2");
       check(pathHasCurve(d.shapes[2].path), "third path contains a bezier curve (curveto)"); }
 
+    // Plain-PostScript routing: a .ps / .epsi file must reach the EPS path parser via
+    // Canvas::dropImportByExtension (File▸Open + drag-drop both funnel through it).
+    { const char* ps = "%!PS-Adobe-3.0\n%%BoundingBox: 0 0 200 100\n"
+                       "10 10 moveto 190 10 lineto 190 90 lineto 10 90 lineto closepath 0 0 1 setrgbcolor fill\n"
+                       "20 20 moveto 180 80 lineto 4 setlinewidth stroke\nshowpage\n";
+      // FictionBook .fb2: a single XML file -> one editable text frame carrying the body prose.
+      { const QByteArray fb2 =
+          "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+          "<FictionBook xmlns:l=\"http://www.w3.org/1999/xlink\">"
+          "<description><title-info><book-title>The Test Book</book-title></title-info></description>"
+          "<body><section><title><p>Chapter One</p></title>"
+          "<p>First <emphasis>paragraph</emphasis> here.</p><p>Second paragraph.</p>"
+          "</section></body>"
+          "<binary id=\"cover.jpg\" content-type=\"image/jpeg\">QUJD</binary></FictionBook>";
+        const QString p=QDir::tempPath()+"/xq_test.fb2";
+        { QFile wf(p); wf.open(QIODevice::WriteOnly); wf.write(fb2); wf.close(); }
+        Canvas tc; tc.newDocument();
+        const bool ok=tc.importFb2(p);
+        const bool haveShape = ok && !tc.doc().shapes.isEmpty();
+        const QString t = haveShape? tc.doc().shapes.back().text : QString();
+        check(haveShape && tc.doc().shapes.back().type==ShapeType::Text, "FB2 imports as an editable text frame");
+        check(t.contains("The Test Book") && t.contains("Chapter One") && t.contains("Second paragraph"),
+              "FB2 carries the title and the body paragraphs");
+        check(t.contains("First paragraph here."), "FB2 keeps inline markup spacing (no glued words)");
+        check(!t.contains("QUJD"), "FB2 skips <binary> base64 payloads"); }
+      check(!Canvas().importFb2(QDir::tempPath()+"/xq_definitely_missing.fb2"), "FB2 fails safe on a missing file");
+
+      // DOS/binary EPS wrapper (also the .ept container): a 30-byte header with u32-LE offset+length
+      // for the PostScript section. importVectorFile must unwrap it before the EPS parser sees it.
+      { QByteArray body(ps); QByteArray w(30,'\0');
+        w[0]=char(0xC5); w[1]=char(0xD0); w[2]=char(0xD3); w[3]=char(0xC6);
+        auto le32=[&](int o,quint32 v){ w[o]=char(v&0xFF); w[o+1]=char((v>>8)&0xFF); w[o+2]=char((v>>16)&0xFF); w[o+3]=char((v>>24)&0xFF); };
+        le32(4,30); le32(8,quint32(body.size()));
+        const QByteArray wrapped = w + body;
+        for(const char* ext : {".ept", ".eps"}){
+          Canvas tc; tc.newDocument();
+          QTemporaryFile pf(QDir::tempPath()+"/xarqdosepsXXXXXX"+QString(ext));
+          if(pf.open()){ pf.write(wrapped); pf.flush();
+            const int before=tc.doc().shapes.size();
+            const bool ok=tc.dropImportByExtension(pf.fileName());
+            check(ok && (int)tc.doc().shapes.size()>before,
+                  QString("%1 DOS/binary-EPS wrapper unwraps to the PostScript section").arg(ext).toUtf8().constData()); } } }
+      // Raster-only PostScript written through ImageMagick's DisplayImage prologue: the pixels are a
+      // plain payload rather than drawing operators, so they decode without an interpreter. All three
+      // PostScript levels are covered — Level 1 ASCII hex, Level 2 binary RunLength, Level 3 Flate.
+      { auto psWrap=[](const QByteArray& params, const QByteArray& payload){
+            return QByteArray("%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 2 2\n%%EndProlog\n"
+                              "userdict begin\nDisplayImage\n") + params + payload; };
+        // Level 1: "x y / x y / pointsize / columns rows / class / compression" then hex RGB.
+        { const QByteArray ps=psWrap("0 0\n2 2\n12\n2 2\n0\n0\n",
+                                     "FF0000 00FF00 0000FF FFFFFF\n");
+          const QImage im=xara::psDisplayImageRaster(ps);
+          check(!im.isNull() && im.size()==QSize(2,2), "raster PostScript (Level 1 hex) decodes to 2x2");
+          check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(255,255,255),
+                "raster PostScript Level 1 carries the RGB triples"); }
+        // Level 2: an extra parameter line, then binary RGB through RunLengthDecode (n<128 = copy n+1).
+        { QByteArray payload; payload.append(char(11));          // copy the next 12 bytes literally
+          const unsigned char rgb[12]={255,0,0, 0,255,0, 0,0,255, 255,255,255};
+          payload.append(reinterpret_cast<const char*>(rgb),12);
+          payload.append(char(char(128)));                        // EOD
+          const QByteArray ps=psWrap("0 0\n2 2\n12\n2 2\n0\n0\n0\n", payload);
+          const QImage im=xara::psDisplayImageRaster(ps);
+          check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0)==QColor(255,0,0)
+                && im.pixelColor(1,0)==QColor(0,255,0), "raster PostScript (Level 2 RunLength) decodes"); }
+        // Level 3: `false` tokens among the parameters and a Flate-compressed payload.
+        { QByteArray raw; const unsigned char rgb[12]={255,0,0, 0,255,0, 0,0,255, 255,255,255};
+          raw.append(reinterpret_cast<const char*>(rgb),12);
+          QByteArray z=qCompress(raw,9).mid(4);                   // drop Qt's 4-byte length prefix -> plain zlib
+          const QByteArray ps=psWrap("0 0\n2 2\n12\nfalse\nfalse\n2 2\n0\nfalse\nfalse\n0\n5\n", z);
+          const QImage im=xara::psDisplayImageRaster(ps);
+          check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,1)==QColor(0,0,255),
+                "raster PostScript (Level 3 Flate) decodes past the `false` parameters"); }
+        check(xara::psDisplayImageRaster(QByteArray("%!PS\nnothing here\n")).isNull(),
+              "plain PostScript without a DisplayImage block is not mistaken for a raster"); }
+
+      // A raster-only EPS would need a full PostScript interpreter to rasterise; when the DOS wrapper
+      // carries a TIFF preview of the same artwork, place that instead of failing. Vector content must
+      // still win when it exists (checked above: the wrapped .ept yields its paths, not a preview).
+      { QImage px(6,4,QImage::Format_ARGB32); px.fill(QColor(20,140,220));
+        QByteArray tif; { QBuffer bf(&tif); bf.open(QIODevice::WriteOnly); px.save(&bf,"TIFF"); }
+        if(!tif.isEmpty()){
+          const QByteArray body("%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 6 4\n% raster only\nshowpage\n");
+          QByteArray w(30,'\0');
+          w[0]=char(0xC5); w[1]=char(0xD0); w[2]=char(0xD3); w[3]=char(0xC6);
+          auto le32=[&](int o,quint32 v){ w[o]=char(v&0xFF); w[o+1]=char((v>>8)&0xFF); w[o+2]=char((v>>16)&0xFF); w[o+3]=char((v>>24)&0xFF); };
+          le32(4,30); le32(8,quint32(body.size()));
+          le32(20,quint32(30+body.size())); le32(24,quint32(tif.size()));
+          Canvas tc; tc.newDocument();
+          QTemporaryFile pf(QDir::tempPath()+"/xarqepsprevXXXXXX.eps");
+          if(pf.open()){ pf.write(w+body+tif); pf.flush();
+            const bool ok=tc.dropImportByExtension(pf.fileName());
+            check(ok && !tc.doc().shapes.isEmpty(), "raster-only DOS EPS falls back to its TIFF preview");
+            check(ok && !tc.doc().shapes.isEmpty() && tc.doc().shapes.back().fill.type==FillType::Bitmap,
+                  "the EPS preview is placed as a bitmap fill"); } } }
+
+      for(const char* ext : {".ps", ".epsi"}){
+        Canvas tc; tc.newDocument();
+        QTemporaryFile pf(QDir::tempPath()+"/xarqpsXXXXXX"+QString(ext));
+        if(pf.open()){ pf.write(ps); pf.flush();
+          int before=tc.doc().shapes.size();
+          bool ok=tc.dropImportByExtension(pf.fileName());
+          check(ok && (int)tc.doc().shapes.size()>before,
+                QString("%1 plain PostScript routes through dropImportByExtension → EPS parser").arg(ext).toUtf8().constData()); } } }
+
     // --- PDF import (content-stream vectors, Batch P2) ---
     std::printf("[interop] PDF import\n");
     { QByteArray pdf=
@@ -2254,12 +2458,110 @@ int runSelfTest() {
       bool line=false,circle=false,poly=false; for(const Shape& s:d.shapes){ if(s.name=="LINE")line=true; if(s.name=="CIRCLE")circle=true; if(s.name=="LWPOLYLINE")poly=true; }
       check(line&&circle&&poly, "all three DXF entity types parsed");
       for(const Shape& s:d.shapes) check(s.fill.type==FillType::None && s.stroke.enabled, "DXF entities are stroked open paths");
+      // TEXT / MTEXT: real editable text, not outlines (previously dropped entirely by the reader).
+      { QByteArray t=
+          "0\nSECTION\n2\nENTITIES\n"
+          "0\nLINE\n10\n0.0\n20\n0.0\n11\n100.0\n21\n0.0\n"
+          "0\nTEXT\n10\n10.0\n20\n50.0\n40\n12.0\n50\n0.0\n1\nHello CAD\n"
+          "0\nMTEXT\n10\n10.0\n20\n80.0\n40\n8.0\n1\n{\\\\fArial|b1;Styled}\\\\Psecond\n"
+          "0\nENDSEC\n0\nEOF\n";
+        Document dt=importDxf(t);
+        int texts=0; QString got, gotm;
+        for(const Shape& s:dt.shapes) if(s.type==ShapeType::Text){ ++texts; if(s.name=="TEXT") got=s.text; if(s.name=="MTEXT") gotm=s.text; }
+        check(dt.shapes.size()==3 && texts==2, "DXF TEXT + MTEXT import as Text shapes alongside the geometry");
+        check(got=="Hello CAD", "DXF TEXT carries its string");
+        check(gotm.contains("Styled") && gotm.contains("second") && !gotm.contains("\\\\f"),
+              "DXF MTEXT strips inline formatting codes and expands \\\\P line breaks");
+        bool sized=false; for(const Shape& s:dt.shapes) if(s.type==ShapeType::Text && s.name=="TEXT") sized = s.font.pixelSize()==12;
+        check(sized, "DXF TEXT height (group 40) becomes the font size"); }
+      // Hostile group-40 values must be clamped in the double domain (an out-of-range int() cast is
+      // UB and the UBSan build traps). Also guards against a 0/negative point size reaching QFont.
+      { for(const char* h : {"1e300","-5.0","0.0","nan"}){
+          QByteArray t = QByteArray("0\nSECTION\n2\nENTITIES\n0\nTEXT\n10\n0.0\n20\n0.0\n40\n")
+                       + h + "\n1\nX\n0\nENDSEC\n0\nEOF\n";
+          Document dt=importDxf(t);
+          bool okSize=true;
+          for(const Shape& s2:dt.shapes) if(s2.type==ShapeType::Text)
+              okSize = okSize && s2.font.pixelSize()>=1 && s2.font.pixelSize()<=4000;
+          check(okSize, "DXF TEXT clamps a hostile group-40 height without an out-of-range cast"); } }
       // AI routing: a %PDF-headed .ai goes through the PDF path
       QByteArray ai="%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
         "3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R>>endobj\n"
         "4 0 obj<</Length 30>>\nstream\n1 0 0 rg\n5 5 40 40 re f\nendstream endobj\ntrailer<</Root 1 0 R>>\n";
       Document da=importAi(ai);
       check(da.shapes.size()>=1 && da.shapes[0].fill.color==QColor(255,0,0), "AI-as-PDF routes through importPdf (red rect)"); }
+
+    // --- DWG import via GNU LibreDWG (AutoCAD binary CAD) ---
+    std::printf("[interop] DWG import (LibreDWG)\n");
+    if(dwgAvailable()){
+      // A real AutoCAD R10 DWG (from the LibreDWG test-suite): 3 LINEs (triangle) + CIRCLE + LWPOLYLINE.
+      // Base64 so the binary fixture lives in-source and the test stays hermetic. Decoded to a temp file
+      // because LibreDWG reads by path.
+      static const char* kDwgB64 =
+        "QUMxMDA2AAAAAAAAAQMABQCeAAASBQAAiQkAAHMOAABNAgBAwBAAABEAAIAlAAMAAACJCQAAJQACAAAA+AkAAMIAAgAAAEIKAAC7AAEAAADGCwAAlQAAAAAA"
+        "gQwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA3t3d3d3dIkAAAAAAAAAkQAAAAAAAAPA/AAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAChAAAAAAAAAIkAhUnpkSeAcQAAAAAAAABJAAAAAAAAAAAADTDXH7OkkQAAAAAAAAAAA8D8AAAAAAADwPwAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAQAAAAIAAAAAAAAA8D+amZmZmZnJP5qZmZmZmck/AAAPAAAAAAAAAAAAAAAAAAAAwdkB43AX9j8CAAQA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAmpmZmZmZuT8AAAAAAAAAAAAAAAAAAAAAAQBhY2FkAAAAAAAAAAAAAAAAAAAAAADwPwrXo3A9Csc/AAAAAAAAsD9SuB6F61HY"
+        "PwrXo3A9Csc/AAAAAAAAAAAAAAAAAAAAAArXo3A9Csc/CtejcD0Ktz8AAAAAAAAAAAAAAQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABkAAAAAAEAATGIJQDsX+IDMYgl"
+        "AIjx+gMAAAAAnJEYAAAAAACckRgAAQABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmZmZmZmY5QAAAAAAAAPA/CAAAAAEAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAQBpAAAAAACBDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwPwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "APA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABJQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAYABgAGAAYABgD5AAIAAACBDAAAAAAGAAAA//8CBBgAAAAAAAAAAAAAAPA/AAAAAAAAAEABBCgAAAAAAAAAAAAAAABAAAAAAAAACEAAAAAA"
+        "AAAIQAAAAAAAABBACAAwAAAAAAAAAAAAAAAUQAAAAAAAABRAAAAAAAAA8D/SITN/fNkSQAAAAAAAAAAAAwAgAAAAAAAAAAAAAAAIQAAAAAAAAPA/AAAAAAAA"
+        "8D8HADYAAABgAAAAAAAAAPA/AAAAAAAAEEAAAAAAAADoPwMARk9PAwAAAAAAAAhAAAAAAAAAEEAJAEgAAAAAAJ8TwPW8vO0/jP1HYWhIFEAx9h+FoSHxP3QC"
+        "uJ6XtxNAzwngel7e/j+M/UdhaEgYQBj7j8LQkABAdAK4npe3F0CBBCgAAAAAAAAAAAAAABhAAAAAAAAA8D8AAAAAAAAcQAAAAAAAAABADgA6AAAADwAAAAAA"
+        "AAAAABhAAAAAAAAA8D8AAAAAAADgPwAAAAAAAOA/ZXMtOFLB4D8AAAAAAADgPwQAKgAAAAMAAAAAAAAAGEAAAAAAAAAYQAAAAAAAAPA/g2VzLThSweA/AQsA"
+        "SAAAAAAAAAAAAAAAHEAAAAAAAADwPwAAAAAAACBAAAAAAAAAAEAAAAAAAAAcQAAAAAAAAAhAAAAAAAAAIEAAAAAAAAAQQA8AOwAAAAIAAAAAAAAAIkAAAAAA"
+        "AAAUQJqZmZmZmck/AQAzBgBQUk9NUFQFAEFUVFIxAGVzLThSwfA/jwA7AAAAAgAAAAAAAADwPwAAAAAAAABAmpmZmZmZyT8BADMGAFBST01QVAUAQVRUUjIA"
+        "ZXMtOFLB8D8OgDoAAAAPAAEAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAOA/AAAAAAAA4D9lcy04UsHgPwAAAAAAAOA/EAA7AAAABgAAAAAAAAAAQAAAAAAAAABA"
+        "m5mZmZmZuT8BADQFAEFUVFIyABctRFT7Ifk/////////7z8RAAwAAAAAAGoHAAATgAgAAAAAABQAGAAAAAAAAAAAAAAAFEAAAAAAAAAcQBQAGAAAAAAAAAAA"
+        "AAAAGEAAAAAAAAAgQBQAGAAAAAAAAAAAAAAAHEAAAAAAAAAcQBEADAAAAAAA6wcAABIACAAAAACAFAAYAAAAAAAAAAAAAAAWQAAAAAAAAB5AFAAYAAAAAAAA"
+        "AAAAAAAaQAAAAAAAACFAFAAYAAAAAAAAAAAAAAAeQAAAAAAAAB5AEQAMAAAAAABHCAAAFwBmAAAAHgACAP3//////x9A/f//////H0AAAAAAAAAAAP7/////"
+        "/x1A////////IEABAQAg/v//////F0D+//////8fQAAAAAAAAAAA/P//////G0D8//////8bQAAAAAAAAAAAFQA4AAAAAAAAAAAAAAAUQAAAAAAAACJAAAAA"
+        "AAAAAAAAAAAAAAAYQAAAAAAAACRAAAAAAAAA8D8WBEgAAAAAAAAAAAAAAAAAAAAAAAAAHEAAAAAAAAAQQAAAAAAAACBAAAAAAAAACEAAAAAAAAAiQAAAAAAA"
+        "AABAAAAAAAAAIEBAQkxPQ0sxAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQkJMT0NLMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASAAAQEEqRABD"
+        "SzIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKMAAEAAMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHAAAAQERFRlBPSU5UUwAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAA+f8AAABTVEFOREFSRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAACamZmZmZnJP3R4dAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADwPwAAAAAAAAAAAJqZ"
+        "mZmZmck/ZXMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQ09OVElOVU9VUwAAAAAAAAAAAAAAAAAAAAAAAAAAAABTb2xpZCBsaW5lAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgCpBQ1RJVkUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAPA/AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAANMNcfs6SRA"
+        "IVJ6ZEngHEAAAAAAAAASQMHZAeNwF/Y/AAAAAAAASUAAAAAAAAAAAAAAAAAAAAAAAABkAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAPA/AAAAAAAA8D8AAAAAAAAAAAAAAAAAAAAAACpBQ1RJVkUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPA/AAAA"
+        "AAAA8D8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8AAAAAAAAAAANMNcfs6SRAIVJ6ZEngHEAAAAAAAAASQMHZAeNw"
+        "F/Y/AAAAAAAASUAAAAAAAAAAAAAAAAAAAAAAAABkAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPA/AAAAAAAA8D8AAAAAAAAA"
+        "AAAAAAAAAAAADAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8D8AAAAAAADwPw0ACAAAAAAADAAYAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAADwA7AAAAAgAAAAAAAAAAAAAAAAAAAAAAmpmZmZmZyT8BADMGAFBST01QVAUAQVRUUjIAZXMtOFLB8D8NAAgAAAAAAAwAGAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAEHKgAAAAAAAP91/sw8QS0YQDp/Zp6gFiBAkvvne1WCHEDJ/fO9KkEiQAEHKgAAAAAAAP90/sw8QS0cQHT+zDxBLRxAyf3zvSpB"
+        "IEDJ/fO9KkEgQAEHKgAAAAAAAP+T++d7VYIcQDQCDELVviFAubw2CZZPHUCgoWT7NFghQAEHKgAAAAAAAP9nBBiEqn0fQMn9870qQSBAQUPJ9mmwHkBcXpsE"
+        "y6cgQAsDSgAAAAAAAP9P/OuRnGwcQJECDs34syFA1/rjZQ6YHEDVAQq3sckhQP3//////xtA/v//////IUD9//////8bQP7//////yFACwNKAAAAAAAA/yMF"
+        "HJrxZx9AKP71SE42IECrAxRuY5MfQGv98TIHTCBA/f//////H0D9//////8fQP3//////x9A/f//////H0ACBxoAAQAAAAD//v//////F0D+//////8fQAIH"
+        "GgABAAAAAP/8//////8bQPz//////xtAAgcaAAEAAAAA//3//////x9A/f//////H0ANAAgAAAAAABOACQAAAAEAARIACABPCAAA"
+        ;
+      const QByteArray dwg = QByteArray::fromBase64(QByteArray(kDwgB64));
+      QTemporaryFile tf(QDir::tempPath()+"/xarq_selftest_XXXXXX.dwg");
+      const bool okw = tf.open() && tf.write(dwg)==dwg.size(); tf.flush();
+      Document d = dwgToDocument(tf.fileName());
+      check(okw && d.shapes.size()>=4, "DWG (LibreDWG) → model-space entities import as shapes");
+      // Geometry arrives as stroked open paths; TEXT/MTEXT (new) arrives as filled Text shapes.
+      bool allStroked = !d.shapes.isEmpty();
+      for(const Shape& s : d.shapes){
+          if(s.type==ShapeType::Text) continue;
+          if(!(s.fill.type==FillType::None && s.stroke.enabled)) allStroked=false; }
+      check(allStroked, "DWG geometry imports as stroked open paths");
+      check(dwgToDocument("/nonexistent/none.dwg").shapes.isEmpty(), "DWG import of a missing file fails cleanly");
+    } else {
+      check(dwgToDocument("/nonexistent/none.dwg").shapes.isEmpty(), "DWG stub returns empty when LibreDWG absent");
+    }
 
     // --- WMF (Windows Metafile) import ---
     std::printf("[interop] WMF import\n");
@@ -2383,7 +2685,35 @@ int runSelfTest() {
       check(pd.shapes[1].fill.image.width()==4 && QColor(pd.shapes[1].fill.image.pixel(1,1)).blue()>200, "layer 1 → 4×4 blue bitmap");
       // a PSD with NO layer section still yields the flattened composite as one shape
       Document pf=importPsdDocument(psd);   // the raw 2×2 RGB PSD from above (no layers)
-      check(pf.shapes.size()==1 && pf.shapes[0].fill.type==FillType::Bitmap, "layerless PSD → single flattened bitmap shape"); }
+      check(pf.shapes.size()==1 && pf.shapes[0].fill.type==FillType::Bitmap, "layerless PSD → single flattened bitmap shape");
+      // --- PSB (8BPS version 2, "Large Document Format"): identical structure, 64-bit length fields ---
+      auto be64=[](QByteArray&a,quint64 v){ for(int i=7;i>=0;--i) a.append(char((v>>(i*8))&0xff)); };
+      // composite: a layerless v2 file exercises version-2 acceptance + the 8-byte Layer&Mask length skip.
+      QByteArray psbc; psbc.append("8BPS",4); be16(psbc,2); psbc.append(QByteArray(6,0)); be16(psbc,3); be32(psbc,2); be32(psbc,2); be16(psbc,8); be16(psbc,3);
+      be32(psbc,0); be32(psbc,0); be64(psbc,0); be16(psbc,0);      // colourmode(4)=0, resources(4)=0, layer&mask(8)=0, compression=0
+      psbc.append(R,4); psbc.append(G,4); psbc.append(B,4);
+      QImage pci=importPsd(psbc);
+      check(!pci.isNull() && pci.width()==2 && QColor(pci.pixel(0,0))==QColor(255,0,0) && QColor(pci.pixel(0,1))==QColor(0,0,255),
+            "PSB (v2 composite, 8-byte layer&mask skip) decodes");
+      // layered: 2 raw RGB layers with 8-byte channel-data lengths → 2 positioned bitmap shapes.
+      QByteArray psbl; psbl.append("8BPS",4); be16(psbl,2); psbl.append(QByteArray(6,0)); be16(psbl,3); be32(psbl,3); be32(psbl,3); be16(psbl,8); be16(psbl,3);
+      be32(psbl,0); be32(psbl,0);   // colour-mode + resources empty (still 4-byte in PSB)
+      auto psbLayerRec=[&](int t,int l,int b,int r,quint64 dataLen){ QByteArray rec;
+        be32(rec,t); be32(rec,l); be32(rec,b); be32(rec,r); be16(rec,3);
+        for(int id=0;id<3;++id){ be16(rec,id); be64(rec,dataLen); }    // 8-byte channel-data length in PSB
+        rec.append("8BIM",4); rec.append("norm",4);
+        rec.append(char(255)); rec.append(char(0)); rec.append(char(0)); rec.append(char(0)); be32(rec,0); return rec; };
+      QByteArray bli; be16(bli,2);                                     // 2 layers
+      bli.append(psbLayerRec(0,0,2,2,6));                              // layer 0: 2×2, each channel 2+4 bytes
+      bli.append(psbLayerRec(0,0,3,3,11));                             // layer 1: 3×3, each channel 2+9 bytes
+      rawChan(bli, QByteArray(4,(char)255)); rawChan(bli, QByteArray(4,0)); rawChan(bli, QByteArray(4,0));            // L0 = red
+      rawChan(bli, QByteArray(9,0));         rawChan(bli, QByteArray(9,(char)255)); rawChan(bli, QByteArray(9,0));    // L1 = green
+      QByteArray blm; be64(blm, quint64(bli.size())); blm.append(bli); // Layer Info length is 8-byte in PSB
+      be64(psbl, quint64(blm.size())); psbl.append(blm);              // Layer & Mask section length is 8-byte in PSB
+      Document pb=importPsdDocument(psbl);
+      check(pb.shapes.size()==2, "layered PSB (v2, 64-bit lengths) imports 2 layers");
+      check(pb.shapes.size()==2 && pb.shapes[0].fill.image.width()==2 && QColor(pb.shapes[0].fill.image.pixel(0,0)).red()>200, "PSB layer 0 → 2×2 red bitmap");
+      check(pb.shapes.size()==2 && pb.shapes[1].fill.image.width()==3 && QColor(pb.shapes[1].fill.image.pixel(1,1)).green()>200, "PSB layer 1 → 3×3 green bitmap"); }
 
     // --- CMYK colour separations (Batch P4) ---
     std::printf("[interop] CMYK separations\n");
@@ -2594,6 +2924,58 @@ int runSelfTest() {
       // PSD claiming huge channels → bounded, no giant alloc (finding #3)
       QByteArray big; big.append("8BPS",4); be16(big,1); big.append(QByteArray(6,0)); be16(big,60000); be32(big,10000); be32(big,10000); be16(big,8); be16(big,3);
       check(importPsd(big).isNull(), "PSD with absurd channel count is rejected (no 8GB alloc)");
+
+    // ===== Importer robustness sweep (adversarial audit wf_766b8afe): every fix below prevents a
+    // malformed file from crashing / hanging / OOM-ing the app. Reaching each check proves no hang. =====
+      // PSD megapixel cap: 20000x20000 (4e8 px) exceeds the 30 MP product cap even though each dim ≤ 30000.
+      { QByteArray p; p.append("8BPS",4); be16(p,1); p.append(QByteArray(6,0)); be16(p,3); be32(p,20000); be32(p,20000); be16(p,8); be16(p,3);
+        check(importPsd(p).isNull() && importPsdDocument(p).shapes.isEmpty(),
+              "20000x20000 PSD rejected by the total-pixel cap (no multi-GB QImage/plane alloc)"); }
+      // EPS: a stray top-level '}' used to spin the token scanner forever (100% CPU).
+      check(importEps("%!PS-Adobe-3.0\n0 0 moveto 1 1 lineto } fill").pageSize.width()>0,
+            "EPS with an unbalanced '}' terminates (no infinite loop)");
+      // EPS: 'nan'/'inf' coordinate operands must not enter the model as non-finite path points.
+      { Document d=importEps("%!PS\n0 0 moveto nan inf lineto 5 5 lineto fill");
+        bool allFinite=true; for(const Shape& s:d.shapes) for(int i=0;i<s.path.elementCount();++i){ auto e=s.path.elementAt(i); if(!qIsFinite(e.x)||!qIsFinite(e.y)) allFinite=false; }
+        check(allFinite, "EPS drops paths with non-finite (nan/inf) coordinates"); }
+      // DXF: an ARC with an extreme start angle used to hang in `while(span<=0) span+=360` (360 < ULP near 1e300).
+      check(importDxf("0\nSECTION\n2\nENTITIES\n0\nARC\n10\n0\n20\n0\n40\n10\n50\n1e300\n51\n0\n0\nENDSEC\n0\nEOF\n").shapes.size()==1,
+            "DXF ARC with an extreme start angle imports without hanging");
+      // PDF: a content stream of hundreds of thousands of 're f' must be capped (no unbounded Shape emit → OOM).
+      { QByteArray body; body.reserve(520000*12); for(int i=0;i<520000;++i) body+="0 0 1 1 re f\n";
+        QByteArray pdf="%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 100 100]>>endobj\n"
+                       "3 0 obj<</Type/Page/Contents 4 0 R>>endobj\n4 0 obj<</Length "+QByteArray::number(body.size())+">>\nstream\n"+body+"\nendstream endobj\ntrailer<</Root 1 0 R>>\n";
+        check(importPdf(pdf).shapes.size()<=500000, "PDF content stream cannot emit an unbounded number of shapes"); }
+      // PDF: many 'N 0 obj' headers with NO 'endobj' must not deep-copy tail-to-EOF per object (O(N^2) memory bomb).
+      { QByteArray x="%PDF-1.4\n"; x.reserve(100000*10); for(int i=1;i<=100000;++i){ x+=QByteArray::number(i); x+=" 0 obj "; }
+        check(importPdf(x).shapes.size()>=0, "PDF with 100k headers and no 'endobj' builds a bounded object table (no OOM)"); }
+      // SVG: acyclic nested <use> fan-out (8-way across 12 levels) — the by-value cycle guard doesn't stop it.
+      { QByteArray svg="<svg xmlns='http://www.w3.org/2000/svg'><defs>";
+        for(int lvl=0;lvl<12;++lvl){ svg+="<g id='g"+QByteArray::number(lvl)+"'>";
+          for(int k=0;k<8;++k) svg+="<use href='#g"+QByteArray::number(lvl+1)+"'/>"; svg+="</g>"; }
+        svg+="<g id='g12'><rect width='1' height='1'/></g></defs><use href='#g0'/></svg>";
+        check(parseSvg(svg,nullptr,QString()).size()<200000, "nested <use> fan-out stays bounded (no CPU hang / OOM)"); }
+      // SVG <image>: an absolute path OR a '../' escape outside baseDir must NOT read an arbitrary local file.
+      { const QString ft=QDir::tempPath()+"/xarq_fuzz"; QDir().mkpath(ft+"/base"); QDir().mkpath(ft+"/secret");
+        QImage sp(4,4,QImage::Format_ARGB32); sp.fill(Qt::red); sp.save(ft+"/secret/s.png");
+        auto leaks=[&](const QByteArray& href)->bool{ QByteArray s="<svg xmlns='http://www.w3.org/2000/svg'><image x='0' y='0' width='4' height='4' href='"+href+"'/></svg>";
+            for(const Shape& sh:parseSvg(s,nullptr,ft+"/base")) if(sh.fill.type==FillType::Bitmap && !sh.fill.image.isNull()) return true; return false; };
+        check(!leaks((ft+"/secret/s.png").toUtf8()), "SVG <image> absolute path outside baseDir is refused (no arbitrary file read)");
+        check(!leaks("../secret/s.png"), "SVG <image> '../' traversal outside baseDir is refused");
+        // regression: a legit image INSIDE baseDir still loads
+        sp.save(ft+"/base/ok.png");
+        check(leaks("ok.png"), "SVG <image> relative path inside baseDir still loads (fix didn't over-block)"); }
+      // CDR: a deeply-nested RIFF/LIST chain used to overflow the stack (SIGSEGV) — both in our cdrRiffChunk
+      // preview walker AND inside libcdr's own parser (which accepts a 'CDRX'-form RIFF). The riffDepthOk
+      // pre-check + the depth-capped walker must make importCdr terminate on this crafted file, not crash.
+      { auto le32=[](QByteArray&a,quint32 v){ for(int i=0;i<4;++i) a.append(char((v>>(8*i))&0xff)); };
+        const int Nlv=100000; const qint64 total=12+12*Nlv;
+        QByteArray cdr; cdr.reserve(total); cdr.append("RIFF",4); le32(cdr,(quint32)(total-8)); cdr.append("CDRX",4);
+        for(int k=0;k<Nlv;++k){ cdr.append("LIST",4); le32(cdr,(quint32)(total-(12+12*k+8))); cdr.append("aaaa",4); }
+        const QString cp=QDir::tempPath()+"/xarq_deep.cdr"; { QFile f(cp); f.open(QIODevice::WriteOnly); f.write(cdr); f.close(); }
+        c->newDocument(); c->importCdr(cp);   // must return (depth-capped + libcdr pre-check), not crash
+        check(true, "deeply-nested RIFF LIST chain in a .cdr terminates (no stack overflow in walker or libcdr)");
+        QFile::remove(cp); }
       // Link sanitisation: a javascript: URL must not survive into published HTML (finding #8)
       Document d; Shape t; t.type=ShapeType::Text; t.text="Click"; t.font=QFont("DejaVu Sans",20); t.fill.type=FillType::Solid;
       t.url="javascript:alert(1)"; d.shapes.push_back(t); c->setDocument(d);
@@ -2866,6 +3248,24 @@ int runSelfTest() {
       const QString corpus="../../Designs/SimpleSphere.xar";
       if(QFile::exists(corpus)){ Document od; check(xara::loadXar(od, corpus), "a real Xara file (no sidecar) still loads via the standard parse"); }
       else std::printf("  [skip] real Xara-file parse — sample corpus not present (not shipped)\n"); }
+
+    // --- Image bitmap fill: the writer reuses the ORIGINAL encoded bytes (imageSrc) verbatim instead of a slow PNG
+    //     re-encode; the round-trip must preserve the pixels + carry imageSrc so a re-save stays fast (the fix that
+    //     un-froze opening/saving image-heavy SVGs). Covers both encoded formats: JPEG and PNG source bytes. ---
+    std::printf("[xar] bitmap fill reuses original encoded bytes (imageSrc) on save\n");
+    { QImage im(24,16,QImage::Format_ARGB32); for(int y=0;y<16;++y)for(int x=0;x<24;++x) im.setPixel(x,y,qRgb((x*10)%255,(y*15)%255,90));
+      for(const char* fmt : {"JPEG","PNG"}){
+        QByteArray src; { QBuffer b(&src); b.open(QIODevice::WriteOnly); im.save(&b,fmt); }
+        Document d; Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,24,16);
+        s.fill.type=FillType::Bitmap; s.fill.image=QImage(); s.fill.image.loadFromData(src); s.fill.imageSrc=src;
+        s.fill.p0=QPointF(0,16); s.fill.p1=QPointF(24,16); s.fill.p2=QPointF(0,0); d.shapes.push_back(s);
+        const QString p="/tmp/selftest_imgsrc.xar";
+        check(xara::saveXar(d,p), QString("saveXar with a %1 bitmap succeeds").arg(fmt).toUtf8().constData());
+        Document rt; check(xara::loadXar(rt,p), QString("loadXar reads back the %1 bitmap").arg(fmt).toUtf8().constData());
+        check(!rt.shapes.isEmpty() && !rt.shapes[0].fill.image.isNull()
+              && rt.shapes[0].fill.image.size()==QSize(24,16), QString("%1 bitmap pixels survive the round-trip").arg(fmt).toUtf8().constData());
+        check(!rt.shapes.isEmpty() && rt.shapes[0].fill.imageSrc==src, QString("%1 imageSrc is carried through (re-save stays fast, no re-encode)").arg(fmt).toUtf8().constData());
+        QFile::remove(p); } }
 
     // --- Typography: line spacing + tracking (Gap 5) ---
     std::printf("[text] line spacing + tracking\n");
@@ -3737,6 +4137,53 @@ int runSelfTest() {
       check(c->importCdr(cp), "importCdr extracts an embedded preview");
       const int ci=c->selection().isEmpty()?-1:c->selection().first();
       check(ci>=0 && c->doc().shapes[ci].fill.type==FillType::Bitmap && c->doc().shapes[ci].fill.image.width()==40, "CDR preview imported as a 40px-wide bitmap"); }
+    // CDR RIFF (v7–X5) preview: the thumbnail is a headerless CF_DIB inside the DISP chunk (no PNG/JPEG at all).
+    { auto le32=[](QByteArray& a,quint32 v){ char b[4]={char(v&0xff),char((v>>8)&0xff),char((v>>16)&0xff),char((v>>24)&0xff)}; a.append(b,4); };
+      const int W=6,H=5; QByteArray dib; le32(dib,40); le32(dib,W); le32(dib,H); { char pl[2]={1,0}; dib.append(pl,2); char bp[2]={24,0}; dib.append(bp,2); }
+      le32(dib,0); le32(dib,0); le32(dib,0); le32(dib,0); le32(dib,0); le32(dib,0);        // comp,imgsize,ppmx,ppmy,clrUsed,clrImp
+      const int stride=((W*3+3)&~3); for(int y=0;y<H;++y) for(int x=0;x<stride;++x) dib.append(char((x<W*3)?(x*7+y*13):0));
+      QByteArray disp; le32(disp,8); disp+=dib;                                            // CF_DIB clipboard tag + the DIB
+      QByteArray body="CDRB"; body.append("DISP",4); le32(body,disp.size()); body+=disp;
+      QByteArray cdr="RIFF"; le32(cdr,body.size()); cdr+=body;
+      const QString cp=QDir::tempPath()+"/xq_disp.cdr"; { QFile f(cp); f.open(QIODevice::WriteOnly); f.write(cdr); f.close(); }
+      c->newDocument();
+      check(c->importCdr(cp), "importCdr extracts a RIFF DISP-chunk DIB preview (CorelDRAW 11-style, no PNG/JPEG)");
+      const int ci=c->selection().isEmpty()?-1:c->selection().first();
+      check(ci>=0 && c->doc().shapes[ci].fill.type==FillType::Bitmap
+            && c->doc().shapes[ci].fill.image.width()==W && c->doc().shapes[ci].fill.image.height()==H,
+            "DISP DIB decoded to the right 6x5 bitmap"); }
+    // libcdr editable-vector import path (compile-time optional). When the library is present, a
+    // valid .cdr parses to standard SVG (fed to parseSvg → editable Shapes); when absent the helper
+    // reports unavailable and importCdr silently falls back to the DISP-chunk preview above. Garbage
+    // input must never yield pages either way — that's the portable invariant we can assert here.
+    check(xara::cdrToSvgPages(QByteArray("not a cdr file")).isEmpty(),
+          "cdrToSvgPages rejects non-CDR data (no spurious pages)");
+    if(!xara::cdrVectorAvailable())
+        check(!xara::cdrToSvgPages(QByteArray("RIFF....CDRxjunk")).size(),
+              "cdrToSvgPages returns nothing when libcdr is not compiled in");
+    // The librevenge sibling importers (WPG/Visio/FreeHand/Publisher) share the same bridge: whatever the
+    // build config, non-format garbage must never yield spurious pages, and a compiled-out library must
+    // report unavailable AND return nothing. (Real-file fidelity is validated out-of-tree against the DLP
+    // regression corpora; here we assert the portable safety invariants.)
+    check(xara::wpgToSvgPages(QByteArray("not a wpg")).isEmpty()
+       && xara::visioToSvgPages(QByteArray("not a visio")).isEmpty()
+       && xara::freehandToSvgPages(QByteArray("not freehand")).isEmpty()
+       && xara::mspubToSvgPages(QByteArray("not a pub")).isEmpty(),
+          "DLP vector importers reject non-format data (no spurious pages)");
+    check((xara::wpgVectorAvailable()      || xara::wpgToSvgPages(QByteArray()).isEmpty())
+       && (xara::visioVectorAvailable()    || xara::visioToSvgPages(QByteArray()).isEmpty())
+       && (xara::freehandVectorAvailable() || xara::freehandToSvgPages(QByteArray()).isEmpty())
+       && (xara::mspubVectorAvailable()    || xara::mspubToSvgPages(QByteArray()).isEmpty()),
+          "DLP vector importers return nothing when their library is not compiled in");
+    // A huge synthetic vector import (well past the auto-select cap) must add + return fast, not freeze on
+    // the per-selection UI refresh (regression guard for the 9k-object .cdr import hang).
+    { c->newDocument(); QVector<Shape> many; many.reserve(6000);
+      for(int i=0;i<6000;++i){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,4,4); s.fill.type=FillType::Solid; s.fill.color=Qt::gray;
+          s.transform=QTransform::fromTranslate((i%80)*5, (i/80)*5); many.push_back(s); }
+      QElapsedTimer et; et.start(); c->addShapes(many, "bulk");
+      check(c->doc().shapes.size()==6000, "6000-shape bulk import adds every shape");
+      check(c->selection().isEmpty(), "a huge bulk import does NOT auto-select (keeps the selectionChanged UI cheap)");
+      check(et.elapsed()<5000, "6000-shape bulk import completes quickly (no per-selection freeze)"); }
     // Mail / data merge (H-D): a {{Field}} template + a 3-row CSV → 3 substituted pages.
     { c->newDocument();
       Shape t; t.type=ShapeType::Text; t.text="Dear {{Name}}, you are {{Age}}."; t.font=QFont("DejaVu Sans",16); t.fill.type=FillType::Solid; t.fill.color=Qt::black; t.transform=QTransform::fromTranslate(20,20);
@@ -4324,6 +4771,10 @@ int runSelfTest() {
 
     // --- Batch PP: SVG import ---
     std::printf("[svg] SVG import parses shapes, paths, transforms, styles\n");
+    // <g> now imports as a real Group; these leaf-oriented checks flatten groups to leaves (same order as the old
+    // flattened import) so they keep validating per-leaf geometry/style/clip/blur regardless of the grouping.
+    std::function<QVector<Shape>(const QVector<Shape>&)> svgLeaves = [&](const QVector<Shape>& v){
+        QVector<Shape> o; for(const Shape& s:v){ if(s.type==ShapeType::Group) o+=svgLeaves(s.children); else o.push_back(s); } return o; };
     { QByteArray svg =
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"200\">"
         "<rect x=\"10\" y=\"10\" width=\"50\" height=\"40\" fill=\"#ff0000\"/>"
@@ -4333,7 +4784,7 @@ int runSelfTest() {
         "</g>"
         "<polygon points=\"150,10 190,10 170,50\" fill=\"none\" stroke=\"blue\"/>"
         "</svg>";
-      QVector<Shape> sh = parseSvg(svg);
+      QVector<Shape> sh = svgLeaves(parseSvg(svg));   // <g> is now a real Group; flatten to leaves for these per-leaf checks
       check(sh.size()==4, "parsed 4 shapes (rect, circle, path, polygon)");
       check(sh[0].type==ShapeType::Rect && sh[0].fill.color==QColor(255,0,0), "rect: #hex fill");
       check(sh[1].type==ShapeType::Ellipse && sh[1].fill.color==QColor(0,128,255), "circle: rgb() fill");
@@ -4352,8 +4803,166 @@ int runSelfTest() {
       QVector<Shape> mal = parseSvg("<svg><path d=\"M0 0 L @@ 5 L10 10 zzz\"/></svg>");
       check(true, "malformed path data does not hang the parser (reached here)");
       check(!mal.isEmpty() && mal[0].path.elementCount()>0, "malformed path still yields best-effort geometry");
-      QVector<Shape> sc = parseSvg("<svg><g transform=\"scale()\"><rect width=\"10\" height=\"10\"/></g></svg>");
+      QVector<Shape> sc = svgLeaves(parseSvg("<svg><g transform=\"scale()\"><rect width=\"10\" height=\"10\"/></g></svg>"));
       check(!sc.isEmpty() && qAbs(sc[0].transform.m11()-1.0)<0.01, "scale() with no args is identity, not 0-scale"); }
+
+    // --- SVG clip-path import: a shape/group referencing a <clipPath> is clipped via Shape::regionPath ---
+    std::printf("[svg] clip-path (<clipPath> / clip-path=url) → Shape::regionPath\n");
+    { // a 100x100 rect clipped to a 40x40 rect at (0,0): the clip region (local space) must cover (10,10) but not (60,60)
+      QVector<Shape> cs = parseSvg(
+        "<svg><defs><clipPath id=\"c\"><rect x=\"0\" y=\"0\" width=\"40\" height=\"40\"/></clipPath></defs>"
+        "<rect x=\"0\" y=\"0\" width=\"100\" height=\"100\" clip-path=\"url(#c)\"/></svg>");
+      check(cs.size()==1, "clipped rect imported as one shape");
+      check(!cs.isEmpty() && !cs[0].regionPath.isEmpty(), "clip-path=url(#c) sets the shape's region (clip) path");
+      if(!cs.isEmpty()){ const QPainterPath rp=cs[0].regionPath;   // regionPath is in the shape's LOCAL space
+        check(rp.contains(QPointF(10,10)) && !rp.contains(QPointF(60,60)), "the region matches the 40x40 clip rect (keeps 10,10; drops 60,60)"); } }
+    { // clip on a GROUP reaches the flattened child; the clipPath's own transform is honoured
+      QVector<Shape> cs = svgLeaves(parseSvg(
+        "<svg><clipPath id=\"c2\"><circle cx=\"50\" cy=\"50\" r=\"30\"/></clipPath>"
+        "<g clip-path=\"url(#c2)\"><rect x=\"0\" y=\"0\" width=\"100\" height=\"100\"/></g></svg>"));
+      check(!cs.isEmpty() && !cs[0].regionPath.isEmpty(), "a clip on a <g> propagates to its child (now grouped)");
+      if(!cs.isEmpty()) check(cs[0].regionPath.contains(QPointF(50,50)) && !cs[0].regionPath.contains(QPointF(5,5)),
+        "group clip region is the circle (keeps centre 50,50; drops corner 5,5)"); }
+    { // a shape WITHOUT clip-path is unaffected (no spurious region → import stays byte-identical for clip-free SVG)
+      QVector<Shape> cs = parseSvg("<svg><rect width=\"10\" height=\"10\"/></svg>");
+      check(!cs.isEmpty() && cs[0].regionPath.isEmpty(), "an unclipped shape has no region path"); }
+
+    // --- SVG <text> with multiple <tspan> lines: each positioned tspan is its own line/shape (not one run-on
+    //     line). Regression for "text different / line break wrong" on CorelDRAW/Illustrator/Inkscape exports. ---
+    std::printf("[svg] multi-line <tspan> text imports as separate positioned lines (not one run-on line)\n");
+    { QVector<Shape> ts = parseSvg(
+        "<svg><text x=\"20\" y=\"40\" font-size=\"22\">"
+        "<tspan x=\"20\" y=\"40\">Line one</tspan>"
+        "<tspan x=\"20\" y=\"70\">Line two</tspan>"
+        "<tspan x=\"20\" y=\"100\">Line three</tspan></text></svg>");
+      int nText=0; QStringList got; for(const Shape& s: ts) if(s.type==ShapeType::Text){ nText++; got<<s.text; }
+      check(nText==3, "three <tspan> lines → three separate text shapes (was one flattened line)");
+      check(got.contains("Line one") && got.contains("Line two") && got.contains("Line three"), "each line keeps its own text, not concatenated");
+      // the lines are stacked vertically (distinct baselines), not overlapping on one line
+      QVector<double> ys; for(const Shape& s: ts) if(s.type==ShapeType::Text) ys<<s.transform.dy();
+      std::sort(ys.begin(),ys.end());
+      check(ys.size()==3 && ys[1]-ys[0]>10 && ys[2]-ys[1]>10, "the lines sit at distinct vertical positions (line breaks preserved)"); }
+    { // a per-tspan font-size override is honoured (not forced to the <text> size)
+      QVector<Shape> ts = parseSvg("<svg><text x=\"0\" y=\"20\" font-size=\"10\"><tspan x=\"0\" y=\"20\">a</tspan><tspan x=\"0\" y=\"60\" font-size=\"40\">B</tspan></text></svg>");
+      double big=0, small=0; for(const Shape& s: ts) if(s.type==ShapeType::Text){ if(s.text=="B") big=s.font.pixelSize(); if(s.text=="a") small=s.font.pixelSize(); }
+      check(big>small && big>=30, "a <tspan font-size> override is applied per line"); }
+    { // plain <text> with no tspans still imports as one line
+      QVector<Shape> ts = parseSvg("<svg><text x=\"5\" y=\"15\">Hello</text></svg>");
+      int nText=0; for(const Shape& s: ts) if(s.type==ShapeType::Text) nText++;
+      check(nText==1, "plain text (no tspans) is a single line as before"); }
+    { // per-run styling within a chunk (documento-2.svg's green title): a NESTED coloured run keeps its own fill
+      //   while inheriting its PARENT tspan's upright/Arson style. Runs on ONE baseline now consolidate into a SINGLE
+      //   Text shape carrying textRuns (one selectable object like Inkscape), not N fragments; distinct-y lines stay separate.
+      QVector<Shape> ts = parseSvg(
+        "<svg><text x=\"50\" y=\"40\" text-anchor=\"middle\" style=\"font-style:italic;font-family:Serif\">"
+        "<tspan x=\"50\" y=\"40\" style=\"font-style:normal;font-family:Sans;fill:#ffffff\">Opus <tspan style=\"fill:#00ff00\">•</tspan> IA</tspan>"
+        "<tspan x=\"50\" y=\"90\" style=\"font-style:normal;fill:#ffffff\">Line2</tspan></text></svg>");
+      int nText=0; QSet<int> baselines; const Shape* line1=nullptr;
+      for(const Shape& s: ts) if(s.type==ShapeType::Text){ nText++; baselines.insert(qRound(s.transform.dy()));
+        if(s.text.contains(QChar(0x2022))) line1=&s; }
+      check(nText==2 && baselines.size()==2, "the two baselines each import as ONE text shape (not per-run fragments)");
+      // The "Opus • IA" line is one shape whose per-run textRuns keep the green bullet green and stay upright.
+      const TextRun* bulletRun=nullptr; bool anyItalicRun=false;
+      if(line1) for(const TextRun& r: line1->textRuns){ if(line1->text.mid(r.start,r.len)==QString(QChar(0x2022))) bulletRun=&r; if(r.font.italic()) anyItalicRun=true; }
+      check(line1 && !line1->textRuns.isEmpty(), "a multi-colour line consolidates into a single Text shape with runs");
+      check(bulletRun && bulletRun->color==QColor(0,255,0), "the per-run fill is kept (the green bullet stays green, not white)");
+      check(bulletRun && !bulletRun->font.italic() && !anyItalicRun, "runs inherit their parent tspan's normal style, not the <text>'s italic"); }
+    { // Missing-font notice: a family Qt can't resolve is reported; an installed one is not. This is what tells
+      //   the user an SVG's font (e.g. Aptos/Arson Pro) isn't available in THIS session (installed after launch).
+      QVector<Shape> v;
+      { Shape s; s.type=ShapeType::Text; s.text="ok";      s.font=QFont("DejaVu Sans", 20);              v.push_back(s); }
+      { Shape s; s.type=ShapeType::Text; s.text="missing"; s.font=QFont("No Such Font ZZQ 98765", 20);   v.push_back(s); }
+      const QStringList sub = Canvas::substitutedFontFamilies(v);
+      check(sub.contains("No Such Font ZZQ 98765") && !sub.contains("DejaVu Sans"),
+            "substitutedFontFamilies flags an unresolved family, not an installed one"); }
+    { // font-weight carries the FULL CSS weight — 900 (Heavy/Black) is DISTINCT from bold (700). Regression for
+      //   documento-2.svg's 'Arson Pro' title (font-weight:900 / -inkscape-font-specification:'Arson Pro Heavy'),
+      //   which XarQ used to collapse to plain bold. Different weights ⇒ different runs (not merged).
+      QVector<Shape> ts = parseSvg("<svg><text x=\"0\" y=\"40\">"
+        "<tspan style=\"font-weight:900\">Heavy</tspan><tspan style=\"font-weight:bold\">Bold</tspan>"
+        "<tspan style=\"font-weight:normal\">Reg</tspan></text></svg>");
+      // One line of three differently-weighted runs → ONE shape whose textRuns keep each weight distinct.
+      int wHeavy=0,wBold=0,wReg=0; int nText=0;
+      for(const Shape& s: ts) if(s.type==ShapeType::Text){ nText++;
+        for(const TextRun& r: s.textRuns){ const QString t=s.text.mid(r.start,r.len);
+          if(t=="Heavy") wHeavy=r.font.weight(); else if(t=="Bold") wBold=r.font.weight(); else if(t=="Reg") wReg=r.font.weight(); } }
+      check(nText==1, "three same-line weighted runs consolidate into a single text shape");
+      check(wHeavy==900 && wBold==700 && wReg==400, "font-weight 900 (Heavy) is kept distinct per-run from bold (700) and normal (400)"); }
+
+    // --- SVG feGaussianBlur filter → Shape::blur (whole-object soft focus). Regression for "check the blur/
+    //     feather effect on svg and reproduce it on xarq". ---
+    std::printf("[svg] filter=url(#feGaussianBlur) → Shape::blur (scaled to doc units)\n");
+    { QVector<Shape> bs = parseSvg(
+        "<svg><defs><filter id=\"b\"><feGaussianBlur stdDeviation=\"6\"/></filter></defs>"
+        "<circle cx=\"50\" cy=\"50\" r=\"20\" filter=\"url(#b)\"/></svg>");
+      check(!bs.isEmpty() && bs[0].blur>0.4, "a shape with a feGaussianBlur filter gets a live blur");
+      // Shape::blur = stdDeviation × 1.8: paintBlurred renders an effective gaussian sigma of blur/2, so the ×1.8
+      // makes the on-canvas spread match SVG/Inkscape's true gaussian of sigma=stdDeviation (measured within a few %).
+      if(!bs.isEmpty()) check(qAbs(bs[0].blur-10.8)<0.6, "blur radius = stdDeviation × 1.8 (matches Inkscape spread) at 1:1 scale"); }
+    { // the blur scales with the element's transform (stdDeviation is in local user units, Shape::blur in doc units)
+      QVector<Shape> bs = svgLeaves(parseSvg(
+        "<svg><defs><filter id=\"b\"><feGaussianBlur stdDeviation=\"5\"/></filter></defs>"
+        "<g transform=\"scale(3)\"><rect width=\"10\" height=\"10\" filter=\"url(#b)\"/></g></svg>"));
+      check(!bs.isEmpty() && qAbs(bs[0].blur-27.0)<1.5, "blur scales with the CTM (5 local × scale 3 × 1.8 = 27 doc units)"); }
+    { // filter:none / no filter → no blur; a feColorMatrix-only filter is not treated as blur
+      QVector<Shape> bs = parseSvg(
+        "<svg><defs><filter id=\"cm\"><feColorMatrix type=\"saturate\" values=\"0.5\"/></filter></defs>"
+        "<rect width=\"10\" height=\"10\" filter=\"url(#cm)\"/><rect x=\"20\" width=\"10\" height=\"10\"/></svg>");
+      for(const Shape& s: bs) check(s.blur<=0.4, "a non-blur (feColorMatrix) filter and an unfiltered shape leave blur unset"); }
+
+    // --- SVG mix-blend-mode → Shape::blend (QPainter composition mode). Regression for "the bottom rectangle
+    //     has a different mix" — a green bar with mix-blend-mode:overlay imported flat (Normal). ---
+    std::printf("[svg] mix-blend-mode → Shape::blend (overlay/multiply/…)\n");
+    { QVector<Shape> ms = parseSvg(
+        "<svg><rect width=\"20\" height=\"20\" fill=\"green\" style=\"mix-blend-mode:overlay\"/>"
+        "<rect x=\"30\" width=\"20\" height=\"20\" fill=\"green\" style=\"mix-blend-mode:multiply\"/>"
+        "<rect x=\"60\" width=\"20\" height=\"20\" fill=\"green\"/></svg>");
+      check(ms.size()==3, "three blend-mode rects imported");
+      check(ms[0].blend==QPainter::CompositionMode_Overlay, "mix-blend-mode:overlay → Overlay composition mode");
+      check(ms[1].blend==QPainter::CompositionMode_Multiply, "mix-blend-mode:multiply → Multiply");
+      check(ms[2].blend==QPainter::CompositionMode_SourceOver, "no blend mode → Normal (SourceOver)"); }
+    { // a child's mix-blend-mode:normal resets an inherited group blend; unsupported keywords fall back to normal
+      QVector<Shape> ms = svgLeaves(parseSvg(
+        "<svg><g style=\"mix-blend-mode:screen\"><rect width=\"10\" height=\"10\" fill=\"red\"/>"
+        "<rect x=\"20\" width=\"10\" height=\"10\" fill=\"red\" style=\"mix-blend-mode:normal\"/></g>"
+        "<rect x=\"40\" width=\"10\" height=\"10\" fill=\"red\" style=\"mix-blend-mode:hue\"/></svg>"));
+      check(ms.size()==3, "group + reset + unsupported rects imported");
+      check(ms[0].blend==QPainter::CompositionMode_Screen, "a group's mix-blend-mode reaches its child (now grouped)");
+      check(ms[1].blend==QPainter::CompositionMode_SourceOver, "a child's mix-blend-mode:normal resets the inherited blend");
+      check(ms[2].blend==QPainter::CompositionMode_SourceOver, "an unsupported blend keyword (hue) falls back to Normal"); }
+
+    std::printf("[svg] Inkscape 1.2+ multi-page → XarQ pages\n");
+    { QByteArray msvg =
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:inkscape=\"http://www.inkscape.org/namespaces/inkscape\" "
+        "xmlns:sodipodi=\"http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd\" width=\"5780\" height=\"1080\" viewBox=\"0 0 5780 1080\">"
+        "<sodipodi:namedview>"
+        "<inkscape:page x=\"0\" y=\"0\" width=\"1920\" height=\"1080\"/>"
+        "<inkscape:page x=\"1930\" y=\"0\" width=\"1920\" height=\"1080\"/>"
+        "<inkscape:page x=\"3860\" y=\"0\" width=\"1920\" height=\"1080\"/>"
+        "</sodipodi:namedview>"
+        "<rect x=\"100\" y=\"100\" width=\"400\" height=\"300\" fill=\"red\"/>"        // page 0
+        "<rect x=\"2030\" y=\"200\" width=\"400\" height=\"300\" fill=\"green\"/>"     // page 1 (x-1930 = 100)
+        "<rect x=\"3960\" y=\"150\" width=\"400\" height=\"300\" fill=\"blue\"/>"      // page 2 (x-3860 = 100)
+        "</svg>";
+      QVector<QRectF> pgs; QVector<Shape> ms=parseSvg(msvg,nullptr,QString(),&pgs);
+      check(pgs.size()==3, "parseSvg captured 3 <inkscape:page> rects");
+      check(qAbs(pgs[1].left()-1930)<1 && qAbs(pgs[1].width()-1920)<1, "page rect in document coords (page 2 at x=1930, 1920 wide)");
+      check(ms.size()==3, "3 rects parsed alongside the pages");
+      QTemporaryDir td; const QString mp=td.path()+"/multi.svg";
+      { QFile wf(mp); wf.open(QIODevice::WriteOnly); wf.write(msvg); }
+      c->newDocument();
+      const bool mok=c->importSvgFile(mp);
+      check(mok, "multi-page SVG imported");
+      check(c->doc().pageCount==3, "3 Inkscape pages → 3 stacked XarQ pages");
+      check(qAbs(c->doc().pageSize.width()-1920)<1 && qAbs(c->doc().pageSize.height()-1080)<1, "XarQ page size = source page (1920×1080)");
+      check(c->doc().shapes.size()==3, "all 3 objects imported");
+      { const double adv=1080+c->doc().pageGap;
+        const QRectF homes[3]={QRectF(0,0,1920,1080),QRectF(0,adv,1920,1080),QRectF(0,2*adv,1920,1080)};
+        bool placed = c->doc().shapes.size()==3;
+        for(int i=0;i<3 && i<c->doc().shapes.size();++i){ const QRectF b=c->doc().shapes[i].docBounds();
+            if(!homes[i].contains(b.center())) placed=false;         // moved into its stacked page
+            if(qAbs(b.left()-100)>2) placed=false; }                 // …at the right local x (100 on every page)
+        check(placed, "each object moved into its stacked page at the correct local position"); } }
     std::printf("[svg] root viewBox → viewport scaling\n");
     { QVector<Shape> sh = parseSvg("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 10 10\"><rect x=\"2\" y=\"2\" width=\"6\" height=\"6\"/></svg>");
       check(sh.size()==1, "viewBox svg parses the rect");
@@ -4432,7 +5041,7 @@ int runSelfTest() {
         "<text x=\"100\" y=\"40\" font-size=\"20\" font-weight=\"bold\" text-anchor=\"middle\">Mid<tspan> span</tspan></text>"
         "<g font-size=\"18\" fill=\"blue\"><text x=\"0\" y=\"80\">Inherited</text></g>"
         "</svg>";
-      QVector<Shape> sh = parseSvg(svg);
+      QVector<Shape> sh = svgLeaves(parseSvg(svg));   // the third line lives in a <g> (now a Group) — flatten to leaves
       check(sh.size()==3, "text SVG parses 3 text shapes");
       check(sh[0].type==ShapeType::Text && sh[0].text=="Hello", "text content read");
       check(sh[0].font.pixelSize()==32 && sh[0].fill.color==QColor(255,0,0), "text font-size (px) + fill");
@@ -4522,15 +5131,30 @@ int runSelfTest() {
       check(rt[1].fill.stops.first().color==QColor(0,255,0) && rt[1].fill.stops.last().color==QColor(0,0,255), "gradient stop colours (green→blue) round-trip");
       check(rt[2].type==ShapeType::Path && pathHasCurve(rt[2].path) && rt[2].fill.type==FillType::None && rt[2].stroke.enabled, "bezier path + stroke (no fill) round-trips");
       check(rt[3].type==ShapeType::Text && rt[3].text=="Hi", "text content round-trips");
-      // nested group: export preserves grouping structure as <g>, importer flattens to leaves with composed transforms
-      { QVector<Shape> g; Shape grp; grp.type=ShapeType::Group; grp.transform=QTransform::fromScale(2,2);
+      // nested group: export preserves grouping as <g>, and the importer now RE-IMPORTS it as a real Group whose
+      // (identity) transform holds the leaf child with the group's scale(2) composed into the child transform.
+      // A loose top-level sibling keeps the <g> a genuine sub-group: an outermost <g> that encloses the ENTIRE
+      // document is a layer/wrapper (Illustrator & Inkscape both emit one) and is flattened, not folded (asserted below).
+      { QVector<Shape> g;
+        Shape loose; loose.type=ShapeType::Rect; loose.rect=QRectF(60,60,8,8); loose.fill.type=FillType::Solid; loose.fill.color=QColor(9,9,9); loose.stroke.enabled=false; g.push_back(loose);
+        Shape grp; grp.type=ShapeType::Group; grp.transform=QTransform::fromScale(2,2);
         Shape c; c.type=ShapeType::Rect; c.rect=QRectF(0,0,10,10); c.fill.type=FillType::Solid; c.fill.color=QColor(1,2,3); c.stroke.enabled=false;
         grp.children.push_back(c); g.push_back(grp);
         QByteArray gs = writeSvg(g, QRectF(0,0,100,100));
         check(gs.contains("<g"), "group exports as <g>");
-        QVector<Shape> gr = parseSvg(gs);
-        check(gr.size()==1 && gr[0].fill.color==QColor(1,2,3), "group child round-trips (flattened by importer)");
-        QPointF o=gr[0].transform.map(QPointF(10,10)); check(qAbs(o.x()-20)<0.5, "group scale(2) baked into child on round-trip (10→20)"); } }
+        QVector<Shape> top = parseSvg(gs);
+        int gi=-1; for(int i=0;i<top.size();++i) if(top[i].type==ShapeType::Group) gi=i;
+        check(top.size()==2 && gi>=0, "an exported <g> (sub-group beside a loose shape) re-imports as a real Group (not flattened)");
+        QVector<Shape> gr = (gi>=0)? svgLeaves(QVector<Shape>{ top[gi] }) : QVector<Shape>{};
+        check(gr.size()==1 && gr[0].fill.color==QColor(1,2,3), "the group's child round-trips (colour kept)");
+        QPointF o=gr[0].transform.map(QPointF(10,10)); check(qAbs(o.x()-20)<0.5, "group scale(2) composed into the child on round-trip (10→20)"); }
+      // an outermost <g> wrapping the WHOLE document (no loose sibling) is a layer → flattened so a click grabs the
+      // individual object, not the entire artwork.
+      { QVector<Shape> g; Shape grp; grp.type=ShapeType::Group; grp.transform=QTransform::fromScale(2,2);
+        Shape c; c.type=ShapeType::Rect; c.rect=QRectF(0,0,10,10); c.fill.type=FillType::Solid; c.fill.color=QColor(4,5,6); c.stroke.enabled=false;
+        grp.children.push_back(c); g.push_back(grp);
+        QVector<Shape> top = parseSvg(writeSvg(g, QRectF(0,0,100,100)));
+        check(top.size()==1 && top[0].type==ShapeType::Rect, "a sole whole-document <g> wrapper is flattened (treated as a layer, not a grabbable group)"); } }
 
     std::printf("[svg] SVG EXPORT: live effects → SVG <filter>\n");
     { Shape s; s.type=ShapeType::Rect; s.rect=QRectF(20,20,60,40); s.fill.type=FillType::Solid; s.fill.color=QColor(200,60,60); s.stroke.enabled=false;
@@ -4557,7 +5181,10 @@ int runSelfTest() {
       check(im.size()==1 && im[0].type==ShapeType::Rect && im[0].fill.type==FillType::Bitmap, "<image> data-URI → a Bitmap-filled Rect");
       check(!im.isEmpty() && im[0].fill.image.width()==6 && im[0].fill.image.height()==4, "embedded PNG decoded to the right pixel size (6x4)");
       check(!im.isEmpty() && qAbs(im[0].rect.x()-10)<0.5 && qAbs(im[0].rect.width()-60)<0.5, "<image> x/y/width placed the box (10,20,60x40)");
-      check(!im.isEmpty() && qAbs(im[0].fill.p1.x()-70)<0.5 && qAbs(im[0].fill.p2.y()-60)<0.5, "bitmap fill parallelogram spans the box (p1.x=70, p2.y=60)");
+      // Bitmap-fill convention (render.cpp bitmapTexXf): image top-left(0,0)->p2, bottom-left(0,H)->p0. SVG is
+      // y-down (image top at the rect top y=20), so p2=top-left(10,20), p0=bottom-left(10,60), p1=bottom-right(70,60).
+      check(!im.isEmpty() && qAbs(im[0].fill.p1.x()-70)<0.5 && qAbs(im[0].fill.p2.y()-20)<0.5, "bitmap fill parallelogram spans the box (p1.x=70, p2.y=20 = image top)");
+      check(!im.isEmpty() && im[0].fill.p2.y() < im[0].fill.p0.y(), "<image> is upright: p2 (image top) sits above p0 (image bottom), not flipped");
       // full round-trip: a Bitmap-filled Rect → writeSvg (<image>) → parseSvg → Bitmap survives
       { Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,6,4); s.fill.type=FillType::Bitmap; s.fill.image=src;
         s.fill.p0=QPointF(0,0); s.fill.p1=QPointF(6,0); s.fill.p2=QPointF(0,4); s.stroke.enabled=false;
@@ -4733,14 +5360,15 @@ int runSelfTest() {
       check(c->canUndo() && c->doc().shapes.size()==2, "tab B's undo stack survived the tab round-trip");
       c->undo();
       check(c->doc().shapes.size()==1, "undo in tab B reverts only B (back to the ellipse)");
-      // Closing tabs (mechanism, no confirm dialog): count drops, never reaches zero
+      // Closing tabs (mechanism, no confirm dialog): count drops as tabs close
       const int cntBefore=w.tabCount();
       w.closeTab(tabB);
       check(w.tabCount()==cntBefore-1, "closeTab removes a tab");
       while(w.tabCount()>1) w.closeTab(w.activeTab());
-      check(w.tabCount()==1, "at least one document tab always remains");
-      w.closeTab(0);
-      check(w.tabCount()==1 && c->doc().shapes.isEmpty(), "closing the sole tab resets it to a blank document (never zero tabs)");
+      check(w.tabCount()==1, "closing tabs down to the last one leaves exactly one");
+      w.closeTab(0);   // closing the ONLY document returns to the welcome/start screen, not a fresh blank Untitled
+      check(w.tabCount()==0 && w.activeTab()==-1, "closing the sole tab returns to the welcome screen (no blank document behind it)");
+      w.newDocumentTab();   // reopen a document (leaves the empty state) for the tests that follow
       // Ruler guides are per-tab and must not leak across documents (review fix B)
       c->newDocument(); c->clearGuides(); c->addGuide(true, 123.0);
       const int gtab=w.activeTab();
@@ -4770,6 +5398,18 @@ int runSelfTest() {
       check(dup==1, "recent files are de-duplicated");
       const QString rp2="/tmp/ds4_recent2.xar"; { Document d; c->setDocument(d); c->save(rp2); } w.addRecentFile(rp2);
       check(!w.recentFiles().isEmpty() && w.recentFiles().first()==rp2, "most-recently-added file is first");
+      // Recent Files holds ANY opened file type, not just .xar — an imported SVG / PNG recorded via addRecentFile
+      // shows up (recentFiles() only filters out paths that no longer exist on disk).
+      { const QString sp="/tmp/ds4_recent.svg"; { QFile f(sp); f.open(QIODevice::WriteOnly); f.write("<svg xmlns='http://www.w3.org/2000/svg'/>"); }
+        w.addRecentFile(sp); check(w.recentFiles().contains(sp) && w.recentFiles().first()==sp, "a non-.xar file (SVG) appears in Recent Files");
+        const QString pp="/tmp/ds4_recent.png"; QImage(4,4,QImage::Format_ARGB32).save(pp);
+        w.addRecentFile(pp); check(w.recentFiles().contains(pp), "an imported image (PNG) appears in Recent Files");
+        QFile::remove(sp); QFile::remove(pp); }
+      // The Open dialog filter covers native + vector + raster formats, with default "All supported" + escape hatch.
+      { const QString flt=MainWindow::supportedOpenFilter();
+        check(flt.startsWith("All supported files (") && flt.contains("*.xar") && flt.contains("*.svg")
+              && flt.contains("*.cdr") && flt.contains("*.pdf") && flt.contains("*.png")
+              && flt.contains("All files (*)"), "supportedOpenFilter() offers native + vector + raster + All files"); }
       // new-from-template opens a document in a new tab (Blank=0 empty, content templates populate)
       const int before=w.tabCount();
       w.newFromTemplate(0);
@@ -4781,6 +5421,33 @@ int runSelfTest() {
       w.openPath(rp);
       check(c->filePath()==rp, "openPath loads a recent file");
       QFile::remove(rp); QFile::remove(rp2); }
+
+    // --- Crash recovery is surfaced on the welcome screen, never a yes/no modal (user request) ---
+    std::printf("[recovery] recover / discard through the welcome-screen API (no modal)\n");
+    { // Isolate to a throwaway recovery dir so the test never touches the user's LIVE crash-recovery store.
+      const bool hadRecEnv=qEnvironmentVariableIsSet("XARA_RECOVERY_DIR");
+      const QByteArray prevRecEnv=qgetenv("XARA_RECOVERY_DIR");
+      const QString testRecDir=QDir::tempPath()+"/xarq_selftest_recovery";
+      QDir(testRecDir).removeRecursively(); QDir().mkpath(testRecDir);
+      qputenv("XARA_RECOVERY_DIR", testRecDir.toUtf8());
+      w.clearRecovery();
+      check(w.recoveryEntries().isEmpty(), "recoveryEntries is empty after clearRecovery");
+      // Simulate a previous session's autosave: a snapshot file + one manifest line "<snapshot>\t<origPath>".
+      c->newDocument();
+      { Document d; Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,30,20); d.shapes.push_back(s); c->setDocument(d); }
+      const QString snap=w.recoveryDir()+"/recovery-0.xar";
+      check(c->saveSnapshot(snap), "wrote a simulated previous-session snapshot");
+      { QFile f(w.recoveryManifest()); if(f.open(QIODevice::WriteOnly|QIODevice::Text)){ f.write((snap+"\t/tmp/prev_session.xar").toUtf8()); f.close(); } }
+      const auto ents=w.recoveryEntries();
+      check(ents.size()==1 && ents[0].second=="/tmp/prev_session.xar", "recoveryEntries parses the manifest (<snapshot>\\t<origPath>)");
+      c->newDocument();                                    // clear the canvas, as if freshly relaunched
+      w.recoverAll();
+      check(c->doc().shapes.size()==1 && c->doc().shapes[0].type==ShapeType::Rect,
+            "recoverAll restores the snapshot into the workspace (no modal)");
+      w.discardRecovery();
+      check(w.recoveryEntries().isEmpty(), "discardRecovery removes the recovery snapshots + manifest");
+      QDir(testRecDir).removeRecursively();
+      if(hadRecEnv) qputenv("XARA_RECOVERY_DIR", prevRecEnv); else qunsetenv("XARA_RECOVERY_DIR"); }
 
     // --- Tables T-1: model + create tool + render + JSON round-trip ---
     std::printf("[table] table tool: create / grid / round-trip\n");
@@ -5055,6 +5722,5367 @@ int runSelfTest() {
       { QFile f(sp); f.open(QIODevice::WriteOnly); f.write("<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100'><rect x='10' y='10' width='50' height='50' fill='red'/></svg>"); }
       check(c->dropImportByExtension(sp), "dropping an .svg routes to the SVG importer");
       check(!c->doc().shapes.isEmpty(), "the dropped SVG produced shapes"); }
+
+    // --- Native raster decoders (rasterextra): synthesize a minimal valid file per format and
+    //     verify dimensions + a known sample pixel through xara::RasterExtra::decodeData. ---
+    { using namespace xara;
+      auto ap8=[](QByteArray& b,std::initializer_list<int> v){ for(int x:v) b.append(char(x&0xFF)); };
+      auto be16=[](QByteArray& b,int v){ b.append(char((v>>8)&0xFF)); b.append(char(v&0xFF)); };
+      auto be32=[](QByteArray& b,quint32 v){ b.append(char((v>>24)&0xFF)); b.append(char((v>>16)&0xFF)); b.append(char((v>>8)&0xFF)); b.append(char(v&0xFF)); };
+      auto le16=[](QByteArray& b,int v){ b.append(char(v&0xFF)); b.append(char((v>>8)&0xFF)); };
+      auto le32=[](QByteArray& b,quint32 v){ b.append(char(v&0xFF)); b.append(char((v>>8)&0xFF)); b.append(char((v>>16)&0xFF)); b.append(char((v>>24)&0xFF)); };
+
+      // QOI: 2x2, four explicit RGBA ops.
+      { QByteArray b("qoif"); be32(b,2); be32(b,2); ap8(b,{4,0});
+        auto px=[&](int r,int g,int bl,int a){ ap8(b,{0xFF,r,g,bl,a}); };
+        px(255,0,0,255); px(0,255,0,255); px(0,0,255,255); px(255,255,0,128);
+        ap8(b,{0,0,0,0,0,0,0,1});
+        QImage im=RasterExtra::decodeData(b,"qoi");
+        check(!im.isNull() && im.width()==2 && im.height()==2, "QOI decodes to 2x2");
+        check(im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1).alpha()==128, "QOI pixel colour + alpha correct"); }
+
+      // Netpbm PAM (P7), DEPTH 3.
+      { QByteArray b("P7\nWIDTH 2\nHEIGHT 1\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n");
+        ap8(b,{10,20,30, 40,50,60});
+        QImage im=RasterExtra::decodeData(b,"pam");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(10,20,30), "PAM P7 depth-3 decodes"); }
+
+      // PFM colour (little-endian scale<0); first stored (bottom) row → white, second → black.
+      { QByteArray b("PF\n2 1\n-1.0\n");
+        float one=1.0f, zero=0.0f;
+        for(int k=0;k<3;k++) b.append(reinterpret_cast<const char*>(&one),4);
+        for(int k=0;k<3;k++) b.append(reinterpret_cast<const char*>(&zero),4);
+        QImage im=RasterExtra::decodeData(b,"pfm");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(255,255,255), "PFM float map decodes + tonemaps"); }
+
+      // Radiance HDR flat scanline (w<8 → old path); just verify geometry + non-null.
+      { QByteArray b("#?RADIANCE\n\n-Y 1 +X 2\n"); ap8(b,{100,150,200,140, 50,60,70,130});
+        QImage im=RasterExtra::decodeData(b,"hdr");
+        check(!im.isNull() && im.size()==QSize(2,1), "Radiance HDR (RGBE) decodes to raster"); }
+
+      // PCX 8bpp/1-plane 2x2 with a trailing 256-colour VGA palette.
+      { QByteArray b; ap8(b,{0x0A,5,1,8}); le16(b,0); le16(b,0); le16(b,1); le16(b,1);
+        le16(b,72); le16(b,72); for(int k=0;k<48;k++) b.append(char(0)); b.append(char(0));
+        b.append(char(1)); le16(b,2); le16(b,1); le16(b,0); le16(b,0);
+        while(b.size()<128) b.append(char(0));
+        ap8(b,{0,1, 2,3});                                   // 2 rows × 2 literal indices
+        b.append(char(0x0C)); QByteArray pal(768,char(0));
+        pal[0]=char(255); pal[4]=char(255); pal[8]=char(255); pal[9]=char(255); pal[10]=char(255); // idx0 red, idx1 green, idx2 blue, idx3 yellow
+        b.append(pal);
+        QImage im=RasterExtra::decodeData(b,"pcx");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(255,255,0), "PCX 8bpp+VGA palette decodes"); }
+
+      // PCX security regression: BytesPerLine < width must be rejected (not a heap over-read).
+      { QByteArray b; ap8(b,{0x0A,5,1,8}); le16(b,0); le16(b,0); le16(b,65534); le16(b,0); // w=65535,h=1
+        le16(b,72); le16(b,72); for(int k=0;k<48;k++) b.append(char(0)); b.append(char(0));
+        b.append(char(1)); le16(b,1); le16(b,0); le16(b,0); le16(b,0);   // planes=1, BytesPerLine=1 (< width!)
+        while(b.size()<128) b.append(char(0)); b.append(char(0));
+        check(RasterExtra::decodeData(b,"pcx").isNull(), "PCX with BytesPerLine < width is rejected (no over-read)"); }
+
+      // SGI/RGB 2x2 verbatim, 3 channels (planar, bottom-to-top).
+      { QByteArray b; be16(b,474); ap8(b,{0,1}); be16(b,3); be16(b,2); be16(b,2); be16(b,3);
+        while(b.size()<512) b.append(char(0));
+        ap8(b,{10,20,30,40});    // R plane (y0:10,20  y1:30,40)
+        ap8(b,{50,60,70,80});    // G plane
+        ap8(b,{90,100,110,120}); // B plane
+        QImage im=RasterExtra::decodeData(b,"sgi");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,1)==QColor(10,50,90), "SGI RGB verbatim decodes (bottom-to-top)"); }
+
+      // DDS DXT1 single 4x4 block, all texels = colour0 (red).
+      { QByteArray b("DDS "); le32(b,124);
+        while(b.size()<12) b.append(char(0));
+        le32(b,4); le32(b,4);                                // height,width at 12,16
+        while(b.size()<80) b.append(char(0));
+        le32(b,0x4); b.append("DXT1");                       // pfFlags=FOURCC at 80, fourcc at 84
+        while(b.size()<128) b.append(char(0));
+        le16(b,0xF800); le16(b,0x001F);                      // c0=red(565), c1=blue → 4-colour block
+        le32(b,0);                                           // all indices → colour0
+        QImage im=RasterExtra::decodeData(b,"dds");
+        check(!im.isNull() && im.size()==QSize(4,4) && im.pixelColor(0,0)==QColor(255,0,0), "DDS DXT1 block decodes"); }
+
+      // Sun Raster: 2x2 24-bit BGR, uncompressed (type 1).
+      { QByteArray b; be32(b,0x59A66A95); be32(b,2); be32(b,2); be32(b,24); be32(b,0); be32(b,1); be32(b,0); be32(b,0);
+        ap8(b,{0,0,255, 0,255,0}); ap8(b,{255,0,0, 255,255,255});    // BGR rows: red,green / blue,white
+        QImage im=RasterExtra::decodeData(b,"sun");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(255,255,255), "Sun Raster 24-bit decodes"); }
+      check(RasterExtra::extensions().contains("ras") && RasterExtra::extensions().contains("fits") && RasterExtra::extensions().contains("dpx"),
+            "Sun/FITS/DPX extensions are advertised");
+      check(RasterExtra::decodeData(QByteArray("SDPX")+QByteArray(20,'\0'),"dpx").isNull(), "DPX with a too-short header is rejected");
+      check(RasterExtra::decodeData(QByteArray("SIMPLE  = junk"),"fits").isNull(), "malformed FITS is rejected safely");
+
+      // Khoros VIFF: 1024-byte header (big-endian/IEEE) + one grayscale byte plane.
+      { QByteArray b(1024,'\0'); b[0]=char(0xAB); b[1]=0x01; b[4]=0x02;   // id, file_type, machine_dep=IEEE (big-endian)
+        auto setbe=[&](int o,quint32 v){ b[o]=char(v>>24); b[o+1]=char(v>>16); b[o+2]=char(v>>8); b[o+3]=char(v); };
+        setbe(520,2); setbe(524,2); setbe(560,1); setbe(564,1);          // width=2, height=2, bands=1 (gray), storage=byte
+        ap8(b,{10,20,30,40});
+        QImage im=RasterExtra::decodeData(b,"viff");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0).red()==10 && im.pixelColor(1,1).red()==40, "Khoros VIFF grayscale decodes"); }
+      check(RasterExtra::extensions().contains("xwd") && RasterExtra::extensions().contains("viff"),
+            "XWD/VIFF extensions are advertised");
+
+      // farbfeld: "farbfeld" magic + u32-BE w,h + 16-bit-BE RGBA; we keep the high byte of each channel.
+      { QByteArray b("farbfeld",8);
+        auto be32=[&](quint32 v){ b.append(char(v>>24)); b.append(char(v>>16)); b.append(char(v>>8)); b.append(char(v)); };
+        auto be16=[&](quint16 v){ b.append(char(v>>8)); b.append(char(v)); };
+        be32(1); be32(1); be16(0xAABB); be16(0xCCDD); be16(0xEEFF); be16(0x1122);
+        QImage im=RasterExtra::decodeData(b,"ff");
+        check(!im.isNull() && im.size()==QSize(1,1) && im.pixelColor(0,0).red()==0xAA && im.pixelColor(0,0).alpha()==0x11,
+              "farbfeld 16-bit RGBA decodes (high byte)"); }
+      // MTV ray-tracer: ASCII "W H\n" then packed RGB.
+      { QByteArray b("2 1\n"); b.append(QByteArray::fromHex("ff000000ff00"));   // red, green
+        QImage im=RasterExtra::decodeData(b,"mtv");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0),
+              "MTV ascii-header RGB decodes"); }
+      // Nokia OTB: [info,w,h,depth] + 1-bpp rows (1=black). 8x5, each row 0xF0 = left half black, right half white.
+      { QByteArray b; b.append(char(0)); b.append(char(8)); b.append(char(5)); b.append(char(1));
+        for(int i=0;i<5;i++) b.append(char(0xF0));
+        QImage im=RasterExtra::decodeData(b,"otb");
+        check(!im.isNull() && im.size()==QSize(8,5) && im.pixelColor(0,0)==QColor(0,0,0) && im.pixelColor(7,0)==QColor(255,255,255),
+              "Nokia OTB 1-bpp bitmap decodes"); }
+      check(RasterExtra::extensions().contains("ff") && RasterExtra::extensions().contains("mtv") && RasterExtra::extensions().contains("otb"),
+            "farbfeld/MTV/OTB extensions are advertised");
+
+      // Native GIMP XCF: build a minimal v0 (32-bit pointer) 2x2 RGBA image, uncompressed single tile,
+      // with the pointer chain (image→layer→hierarchy→level→tile) back-patched as GIMP writes it.
+      { QByteArray b;
+        auto be32=[&](quint32 v){ b.append(char(v>>24)); b.append(char(v>>16)); b.append(char(v>>8)); b.append(char(v)); };
+        auto patch32=[&](int off, quint32 v){ b[off]=char(v>>24); b[off+1]=char(v>>16); b[off+2]=char(v>>8); b[off+3]=char(v); };
+        b.append("gimp xcf file",13); b.append('\0');       // magic + version 0
+        be32(2); be32(2); be32(0);                          // width, height, base type = RGB
+        be32(17); be32(1); b.append('\0');                  // PROP_COMPRESSION len1 = 0 (uncompressed)
+        be32(0); be32(0);                                   // PROP_END (type 0, len 0)
+        int layerPtrOff=b.size(); be32(0); be32(0);         // layer offset (patched) + list terminator
+        patch32(layerPtrOff, b.size());
+        be32(2); be32(2); be32(1);                          // layer lw, lh, type=RGBA
+        be32(2); b.append('L'); b.append('\0');             // name len=2, "L\0"
+        be32(0); be32(0);                                   // layer PROP_END
+        int hierPtrOff=b.size(); be32(0); be32(0);          // hierarchy ptr (patched) + mask ptr = none
+        patch32(hierPtrOff, b.size());
+        be32(2); be32(2); be32(4);                          // hierarchy hw, hh, bpp=4
+        int lvlPtrOff=b.size(); be32(0); be32(0);           // level0 ptr (patched) + list terminator
+        patch32(lvlPtrOff, b.size());
+        be32(2); be32(2);                                   // level w, h
+        int tilePtrOff=b.size(); be32(0); be32(0);          // tile ptr (patched) + list terminator
+        patch32(tilePtrOff, b.size());
+        auto px=[&](int r,int g,int bl,int a){ b.append(char(r)); b.append(char(g)); b.append(char(bl)); b.append(char(a)); };
+        px(255,0,0,255); px(0,255,0,255); px(0,0,255,128); px(255,255,255,255);   // row0: red,green  row1: blue(a=128),white
+        QImage im=RasterExtra::decodeData(b,"xcf");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0)
+              && im.pixelColor(0,1).blue()==255 && im.pixelColor(0,1).alpha()==128,
+              "native GIMP XCF (v0, uncompressed RGBA) decodes with alpha");
+        check(RasterExtra::decodeData(b,QString()).size()==QSize(2,2), "XCF magic-byte dispatch works (no extension hint)"); }
+      check(RasterExtra::extensions().contains("xcf"), "xcf extension is advertised");
+      // XCF robustness: truncated / bogus inputs must return null, never crash.
+      check(RasterExtra::decodeData(QByteArray("gimp xcf file")+QByteArray(6,'\0'),"xcf").isNull(),
+            "truncated XCF header is rejected safely");
+      check(RasterExtra::decodeData(QByteArray("gimp xcf v999")+QByteArray(1,'\0')+QByteArray(60,'\0'),"xcf").isNull(),
+            "XCF with zero dimensions / no valid layers is rejected safely");
+
+      // ===== Fleet-1: retro/legacy native raster decoders (ILBM/MacPaint/CUT/PIX/DEGAS/Koala/SCR/XV) =====
+      { auto ap8=[](QByteArray&a,std::initializer_list<int> vs){ for(int v:vs) a.append(char(v)); };
+        auto be16=[](QByteArray&a,int v){ a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+        auto be32=[](QByteArray&a,quint32 v){ a.append(char((v>>24)&0xff)); a.append(char((v>>16)&0xff)); a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+        auto le16=[](QByteArray&a,int v){ a.append(char(v&0xff)); a.append(char((v>>8)&0xff)); };
+        (void)ap8;(void)be16;(void)be32;(void)le16;
+      // ILBM: Amiga IFF ILBM / PBM (InterLeaved 
+      // Amiga IFF ILBM: 2x2, 1 bit-plane, uncompressed BODY, 2-colour CMAP (idx0 red, idx1 green).
+      // planeRowBytes = ((2+15)/16)*2 = 2. row0 byte0=0x80 -> x0=idx1(green), x1=idx0(red);
+      // row1 byte0=0x40 -> x0=idx0(red), x1=idx1(green). Second byte of each row is padding.
+      { QByteArray b("FORM"); be32(b,58); b.append("ILBM");
+        b.append("BMHD"); be32(b,20);
+        be16(b,2); be16(b,2); be16(b,0); be16(b,0);            // w=2,h=2,x=0,y=0
+        ap8(b,{1,0,0,0});                                      // nPlanes=1, masking=0, compression=0, pad=0
+        be16(b,0); ap8(b,{0,0}); be16(b,0); be16(b,0);         // transparentColor, xAspect,yAspect, pageW, pageH
+        b.append("CMAP"); be32(b,6); ap8(b,{255,0,0, 0,255,0});// idx0 red, idx1 green
+        b.append("BODY"); be32(b,4); ap8(b,{0x80,0x00, 0x40,0x00});
+        QImage im=RasterExtra::decodeData(b,"iff");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && im.pixelColor(0,0)==QColor(0,255,0) && im.pixelColor(1,0)==QColor(255,0,0)
+              && im.pixelColor(0,1)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(0,255,0),
+              "Amiga IFF ILBM (1-plane, uncompressed, CMAP) decodes");
+        check(RasterExtra::decodeData(b,QString()).size()==QSize(2,2), "ILBM magic-byte (FORM/ILBM) dispatch works with no extension hint"); }
+      check(RasterExtra::extensions().contains("iff") && RasterExtra::extensions().contains("ilbm")
+            && RasterExtra::extensions().contains("lbm") && RasterExtra::extensions().contains("bbm"),
+            "ILBM iff/ilbm/lbm/bbm extensions are advertised");
+      // Amiga IFF ILBM HAM6 (CAMG bit 0x0800): 2x1, 6 planes. pixel0 ctrl=0/v=1 -> CMAP[1]=(100,150,200);
+      // pixel1 ctrl=2/v=15 -> modify Red to 15*17=255, holding G,B -> (255,150,200).
+      { QByteArray b("FORM"); be32(b,66); b.append("ILBM");
+        b.append("BMHD"); be32(b,20);
+        be16(b,2); be16(b,1); be16(b,0); be16(b,0);           // w=2,h=1,x,y
+        ap8(b,{6,0,0,0});                                     // nPlanes=6, masking=0, compression=0, pad
+        be16(b,0); ap8(b,{0,0}); be16(b,0); be16(b,0);        // transparent, aspect, pageW/H
+        b.append("CAMG"); be32(b,4); be32(b,0x00000800);      // HAM viewport mode
+        b.append("CMAP"); be32(b,6); ap8(b,{0,0,0, 100,150,200});  // colour 0 black, colour 1 = (100,150,200)
+        b.append("BODY"); be32(b,12);                         // 6 planes x 2 bytes, uncompressed
+        ap8(b,{0xC0,0, 0x40,0, 0x40,0, 0x40,0, 0x00,0, 0x40,0});   // idx: px0=1 (bit7), px1=47 (bit6 of planes 0,1,2,3,5)
+        QImage im=RasterExtra::decodeData(b,"iff");
+        check(!im.isNull() && im.size()==QSize(2,1)
+              && im.pixelColor(0,0)==QColor(100,150,200) && im.pixelColor(1,0)==QColor(255,150,200),
+              "Amiga IFF ILBM HAM6 hold-and-modify decodes (was rendering as garbage)"); }
+      // MacPaint (Apple PNTG)
+      // MacPaint (Apple PNTG): 512-byte header, then PackBits for a fixed 576x720 1-bpp bitmap
+      // (bit set = BLACK). We build a raw (no MacBinary) file whose decompressed data is one
+      // 0xFF byte (x0..x7 black) followed by 51839 white (0x00) bytes.
+      { QByteArray b(512, '\0');                             // 512-byte header, all zero
+        b.append(char(0)); b.append(char(0xFF));            // literal run length 1: 0xFF (8 black px)
+        qint64 remaining = qint64(720)*72 - 1;                    // 51839 white bytes to fill
+        while(remaining > 0){ int run = int(qMin<qint64>(128, remaining));
+            b.append(char(257-run));                        // repeat-run control (count = 257-c)
+            b.append(char(0)); remaining -= run; }
+        QImage im=RasterExtra::decodeData(b,"mac");
+        check(!im.isNull() && im.size()==QSize(576,720)
+              && im.pixelColor(0,0)==QColor(0,0,0)          // bit set -> black
+              && im.pixelColor(8,0)==QColor(255,255,255),   // next byte 0x00 -> white
+              "MacPaint PackBits 1-bpp bitmap decodes (bit=black)"); }
+      check(RasterExtra::extensions().contains("mac") && RasterExtra::extensions().contains("pntg"),
+            "MacPaint extensions are advertised");
+      // DrHaloCUT (Dr. Halo / Dr. Genius .CUT pa
+      // Dr. Halo CUT: width/height u16le + per-row [rowByteCount u16le][RLE]. Palette lives in a
+      // separate .PAL, absent here, so each index becomes an 8-bit grayscale value. 4x1 image whose
+      // single row is a literal run of 4 bytes 0,255,0,255 followed by the 0 end-of-row marker.
+      { QByteArray b;
+        auto le16=[&](quint16 v){ b.append(char(v&0xFF)); b.append(char((v>>8)&0xFF)); };
+        le16(4); le16(1);                                   // width=4, height=1
+        le16(6);                                            // rowByteCount = 1 control + 4 literal + 1 terminator
+        b.append(char(0x04));                               // literal, count 4 (bit7 clear)
+        b.append(char(0x00)); b.append(char(0xFF)); b.append(char(0x00)); b.append(char(0xFF));
+        b.append(char(0x00));                               // end-of-row
+        QImage im=RasterExtra::decodeData(b,"cut");
+        check(!im.isNull() && im.size()==QSize(4,1)
+              && im.pixelColor(0,0)==QColor(0,0,0)   && im.pixelColor(1,0)==QColor(255,255,255)
+              && im.pixelColor(2,0)==QColor(0,0,0)   && im.pixelColor(3,0)==QColor(255,255,255),
+              "Dr. Halo CUT RLE grayscale decodes"); }
+      check(RasterExtra::extensions().contains("cut"), "cut extension is advertised");
+      // AliasPIX (Alias/Wavefront PIX / Turbo Si
+      // Alias/Wavefront PIX: 10-byte BE header (w,h,xoff,yoff,bpp) + RLE runs; 24bpp stores B,G,R per run.
+      { QByteArray b; be16(b,2); be16(b,1); be16(b,0); be16(b,0); be16(b,24);   // 2x1, xoff/yoff 0, 24bpp
+        ap8(b,{1, 255,0,0});                                 // count=1, blue  (B=255,G=0,R=0)
+        ap8(b,{1, 0,0,255});                                 // count=1, red   (B=0,G=0,R=255)
+        QImage im=RasterExtra::decodeData(b,"pix");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(0,0,255) && im.pixelColor(1,0)==QColor(255,0,0),
+              "Alias PIX 24bpp RLE decodes (B,G,R runs)"); }
+      check(RasterExtra::extensions().contains("als") && RasterExtra::extensions().contains("pix"),
+            "AliasPIX (als/pix) extensions are advertised");
+      // Atari ST DEGAS (uncompressed .pi1/.pi2/.
+// Atari ST DEGAS (uncompressed low-res): resolution word 0 (320x200, 4 planes), 16 Atari palette words,
+// then 32000 bytes of word-interleaved planar bitmap. palette[1]=pure red (R=7); plane-0 row-0 first
+// word = 0x8000 (MSB set) -> pixel(0,0) has colour index 1; every other pixel is index 0 (black).
+{ QByteArray b;
+  auto be16d=[&](quint16 v){ b.append(char(v>>8)); b.append(char(v)); };
+  be16d(0);                                       // resolution = 0 (low res)
+  be16d(0);                                        // palette[0] = 0 -> black
+  be16d(0x0700);                                   // palette[1] = R=7,G=0,B=0 -> (255,0,0)
+  for(int i=2;i<16;i++) be16d(0);                  // palette[2..15] = 0
+  QByteArray bmp(32000,'\0'); bmp[0]=char(0x80);   // plane-0, row0, word0 = 0x8000 -> pixel(0,0) index 1
+  b.append(bmp);
+  QImage im=RasterExtra::decodeData(b,"pi1");
+  check(!im.isNull() && im.size()==QSize(320,200)
+        && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,0,0),
+        "Atari ST DEGAS (uncompressed low-res) planar bitmap decodes with palette"); }
+check(RasterExtra::extensions().contains("pi1") && RasterExtra::extensions().contains("pi3"),
+      "DEGAS pi1/pi2/pi3 extensions are advertised");
+      // C64 Koala Painter (Commodore 64 multicol
+      // C64 Koala Painter: 2-byte load address + 8000 bitmap + 1000 screen + 1000 colour + 1 bg.
+      // Cell(0,0) bitmap byte 0x1B = 00 01 10 11 → the 4 logical pixels of the top row pull from
+      // bg / screen-hi / screen-lo / colour-RAM respectively; each is doubled horizontally (320x200).
+      { QByteArray b; b.append(char(0x00)); b.append(char(0x60));      // load address $6000
+        QByteArray bitmap(8000,char(0)); bitmap[0]=char(0x1B);          // 0b00_01_10_11
+        b.append(bitmap);
+        QByteArray screen(1000,char(0)); screen[0]=char(0x21);          // hi-nibble=2 (red), lo-nibble=1 (white)
+        b.append(screen);
+        QByteArray colour(1000,char(0)); colour[0]=char(0x05);          // lo-nibble=5 (green)
+        b.append(colour);
+        b.append(char(0x00));                                           // background = 0 (black)
+        QImage im=RasterExtra::decodeData(b,"koa");
+        check(!im.isNull() && im.size()==QSize(320,200)
+              && im.pixelColor(0,0)==QColor(0,0,0)                      // pair 00 → background (black)
+              && im.pixelColor(1,0)==QColor(0,0,0)                      // horizontal doubling
+              && im.pixelColor(2,0)==QColor(0x68,0x37,0x2B)            // pair 01 → screen hi = red
+              && im.pixelColor(3,0)==QColor(0x68,0x37,0x2B)
+              && im.pixelColor(4,0)==QColor(0xFF,0xFF,0xFF)            // pair 10 → screen lo = white
+              && im.pixelColor(6,0)==QColor(0x58,0x8D,0x43),           // pair 11 → colour RAM = green
+              "C64 Koala multicolour bitmap decodes (bg/screen-hi/screen-lo/colour-RAM + doubling)"); }
+      check(RasterExtra::extensions().contains("koa") && RasterExtra::extensions().contains("kla"),
+            "C64 Koala (koa/kla) extensions are advertised");
+      check(RasterExtra::decodeData(QByteArray(10003,char(0)),"koa").size()==QSize(320,200)
+            && RasterExtra::decodeData(QByteArray(9999,char(0)),"koa").isNull(),
+            "C64 Koala accepts the canonical 10003-byte length and rejects a wrong length");
+      // ZXSpectrumSCR
+      // ZX Spectrum SCR: 6912-byte framebuffer (6144 pixel bytes + 768 attribute bytes), 256x192.
+      // Set pixel-byte 0 = 0x80 → pixel(0,0) INK (bit7), pixels(1..7,0) PAPER. Attribute for cell(0,0)
+      // at 6144 = 0x22 → ink index 2 (red {215,0,0}), paper index 4 (green {0,215,0}), bright off.
+      { QByteArray b(6912, '\0');
+        b[0]    = char(0x80);   // pixel(0,0)=INK, its 7 neighbours in the same byte = PAPER
+        b[6144] = char(0x22);   // cell(0,0): ink=2 (red), paper=4 (green), bright/flash = 0
+        QImage im=RasterExtra::decodeData(b,"scr");
+        check(!im.isNull() && im.size()==QSize(256,192)
+              && im.pixelColor(0,0)==QColor(215,0,0) && im.pixelColor(1,0)==QColor(0,215,0),
+              "ZX Spectrum SCR ink/paper decodes"); }
+      check(RasterExtra::decodeData(QByteArray(6911,'\0'),"scr").isNull(),
+            "SCR of the wrong size is rejected safely");
+      check(RasterExtra::extensions().contains("scr"), "scr extension is advertised");
+      // XVthumb (XV P7 332 thumbnail)
+// XV thumbnail (P7 332): ASCII header ("P7 332", optional '#' comments, "W H 255") then
+// W*H bytes of 3-3-2 packed RGB. Simple left-justify shift: 0xE0 -> (224,0,0), 0x03 -> (0,0,192).
+{ QByteArray b("P7 332\n#XVVERSION:selftest\n2 1 255\n");
+  b.append(char(0xE0));                                  // pixel 0: R field = 0xE0 -> (224,0,0)
+  b.append(char(0x03));                                  // pixel 1: B field = 0x03<<6 = 0xC0 -> (0,0,192)
+  QImage im=RasterExtra::decodeData(b,"xvpics");
+  check(!im.isNull() && im.size()==QSize(2,1)
+        && im.pixelColor(0,0)==QColor(224,0,0) && im.pixelColor(1,0)==QColor(0,0,192),
+        "XV thumbnail (P7 332) 3-3-2 packed RGB decodes");
+  check(RasterExtra::decodeData(b,QString()).size()==QSize(2,1),
+        "XVthumb magic-byte dispatch works (no extension hint, not mistaken for PAM)");
+  check(RasterExtra::extensions().contains("xvpics"), "xvpics extension is advertised"); }
+// Robustness: truncated pixel data must be rejected, never over-read.
+check(RasterExtra::decodeData(QByteArray("P7 332\n4 4 255\n")+QByteArray(3,'\0'),"xvpics").isNull(),
+      "XVthumb with too-few pixel bytes is rejected safely");
+      }
+
+      // ===== Fleet-2: retro/legacy native raster decoders (NEO/RIX/DCX/Cineon/SunIcon/Softimage) =====
+      { auto ap8=[](QByteArray&a,std::initializer_list<int> vs){ for(int v:vs) a.append(char(v)); };
+        auto be16=[](QByteArray&a,int v){ a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+        auto le16=[](QByteArray&a,int v){ a.append(char(v&0xff)); a.append(char((v>>8)&0xff)); };
+        auto be32=[](QByteArray&a,quint32 v){ a.append(char((v>>24)&0xff)); a.append(char((v>>16)&0xff)); a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+        auto le32=[](QByteArray&a,quint32 v){ a.append(char(v&0xff)); a.append(char((v>>8)&0xff)); a.append(char((v>>16)&0xff)); a.append(char((v>>24)&0xff)); };
+        (void)ap8;(void)be16;(void)le16;(void)be32;(void)le32;
+      // Atari ST NEOchrome (.neo)
+      // Atari ST NEOchrome: fixed 32128-byte file (128-byte header + 32000-byte DEGAS-low-res planar
+      // bitmap). palette[1]=pure red (R=7), first bitmap word=0x8000 → pixel(0,0) uses index 1.
+      { QByteArray b;
+        be16(b,0);                                   // flag word
+        be16(b,0);                                   // resolution = 0 (low, 320x200)
+        be16(b,0);                                   // palette[0]
+        be16(b,0x0700);                              // palette[1] = pure red (R=7,G=0,B=0)
+        for(int i=2;i<16;i++) be16(b,0);             // palette[2..15]
+        while(b.size()<128) b.append(char(0));       // filename + animation + reserved words
+        be16(b,0x8000);                              // plane0 word of row0/group0: bit15 → pixel(0,0) index 1
+        while(b.size()<32128) b.append(char(0));     // remaining bitmap (all index 0)
+        QImage im=RasterExtra::decodeData(b,"neo");
+        check(!im.isNull() && im.size()==QSize(320,200)
+              && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,0,0),
+              "Atari NEOchrome low-res decodes (word-interleaved planar)");
+        check(RasterExtra::decodeData(b.left(32127),"neo").isNull(),
+              "NEOchrome with wrong length is rejected");
+        check(RasterExtra::extensions().contains("neo"), "NEOchrome extension is advertised"); }
+      // ColoRIX / RIX VGA paint (RIX3)
+      // ColoRIX RIX3: 2x1, 256-colour VGA palette; index 5 -> red, index 0 -> green.
+      { QByteArray b("RIX3"); le16(b,2); le16(b,1); ap8(b,{0x80});   // flags bit7 = palette present
+        QByteArray pal(768,char(0));
+        pal[0]=char(0); pal[1]=char(63); pal[2]=char(0);            // idx0 = green (6-bit 63 -> 255)
+        pal[5*3+0]=char(63); pal[5*3+1]=char(0); pal[5*3+2]=char(0); // idx5 = red
+        b.append(pal);
+        ap8(b,{5,0});                                               // two index bytes: (0,0)=idx5, (1,0)=idx0
+        QImage im=RasterExtra::decodeData(b,"rix");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0), "ColoRIX RIX3 palette + indices decode"); }
+
+      // ColoRIX security: header claiming a palette but truncated before its 768 bytes must be rejected.
+      { QByteArray b("RIX3"); le16(b,4); le16(b,4); ap8(b,{0x80}); b.append(QByteArray(100,char(0)));
+        check(RasterExtra::decodeData(b,"rix").isNull(), "ColoRIX truncated palette rejected (no over-read)"); }
+      // DCX (ZSoft multi-page PCX)
+      // DCX: ZSoft multi-page PCX wrapper. Build a minimal 2x2 8bpp/1-plane PCX (as in the PCX
+      // test above), then wrap it: magic + one page offset (pointing just past the 12-byte header:
+      // magic + 1 entry + 0 terminator) + 0 terminator. Decoding page 0 must match the PCX result.
+      { QByteArray pcx; ap8(pcx,{0x0A,5,1,8}); le16(pcx,0); le16(pcx,0); le16(pcx,1); le16(pcx,1);
+        le16(pcx,72); le16(pcx,72); for(int k=0;k<48;k++) pcx.append(char(0)); pcx.append(char(0));
+        pcx.append(char(1)); le16(pcx,2); le16(pcx,1); le16(pcx,0); le16(pcx,0);
+        while(pcx.size()<128) pcx.append(char(0));
+        ap8(pcx,{0,1, 2,3});                                 // 2 rows x 2 literal indices
+        pcx.append(char(0x0C)); QByteArray pal(768,char(0));
+        pal[0]=char(255); pal[4]=char(255); pal[8]=char(255); pal[9]=char(255); pal[10]=char(255); // idx0 red, idx1 green, idx2 blue, idx3 yellow
+        pcx.append(pal);
+        QByteArray b; le32(b,0x3ADE68B1u); le32(b,12); le32(b,0);   // magic + page@offset 12 + 0 terminator
+        b.append(pcx);
+        QImage im=RasterExtra::decodeData(b,"dcx");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(255,255,0),
+              "DCX first-page PCX decodes"); }
+      // DCX with a bogus first page offset (past EOF) must be rejected safely.
+      { QByteArray b; le32(b,0x3ADE68B1u); le32(b,0x7FFFFFFFu); le32(b,0);
+        check(RasterExtra::decodeData(b,"dcx").isNull(), "DCX with out-of-range page offset is rejected"); }
+      // Cineon (Kodak Cineon, SMPTE 268M predecessor). Image-information header @200:
+      // orientation U8, channels U8, 2 pad, then channel[0] descriptor @204 whose pixels_per_line
+      // (WIDTH) is @208 and lines_per_image (HEIGHT) @212 — NOT 200/204.
+      // Kodak Cineon: 2x1, 10-bit RGB packed one word per pixel (one full-red, one full-blue).
+      { QByteArray b; be32(b,0x802A5FD7u);                 // big-endian Cineon magic (offset 0)
+        be32(b,216);                                       // image-data offset (offset 4)
+        while(b.size()<208) b.append(char(0));             // pad generic hdr + image-info hdr up to channel[0].pixels_per_line
+        be32(b,2); be32(b,1);                              // width=2 (offset 208), height=1 (offset 212)
+        be32(b,0xFFC00000u);                               // pixel0: R=1023 (>>2 -> 255), G=B=0
+        be32(b,0x00000FFCu);                               // pixel1: B=1023 (>>2 -> 255), R=G=0
+        QImage im=RasterExtra::decodeData(b,"cin");
+        check(!im.isNull() && im.size()==QSize(2,1)
+              && im.pixelColor(0,0)==QColor(255,0,0)
+              && im.pixelColor(1,0)==QColor(0,0,255), "Cineon 10-bit RGB (.cin) decodes"); }
+      // Cineon bounds: a header that stops before the width/height fields (offset<216) must be rejected.
+      { QByteArray b; be32(b,0x802A5FD7u); be32(b,216); while(b.size()<210) b.append(char(0));
+        check(RasterExtra::decodeData(b,"cin").isNull(), "Cineon short header is rejected (no over-read)"); }
+      // Sun OpenWindows Icon / Cursor (.icon/.cu
+      // ===== Sun OpenWindows Icon / Cursor (.icon/.cursor) — C-source text 1bpp bitmap =====
+      { QByteArray b("/* Format_version=1, Width=16, Height=2, Depth=1, Valid_bits_per_item=16 */\n"
+                     "unsigned short Bits[]={\n0x8000,0x0001\n};\n");
+        // Row0 word 0x8000 -> only bit15 set -> x=0 is foreground(black), rest white.
+        // Row1 word 0x0001 -> only bit0  set -> x=15 is foreground(black), rest white.
+        QImage im=RasterExtra::decodeData(b,"icon");
+        check(!im.isNull() && im.size()==QSize(16,2)
+              && im.pixelColor(0,0)==QColor(0,0,0)
+              && im.pixelColor(1,0)==QColor(255,255,255)
+              && im.pixelColor(15,1)==QColor(0,0,0)
+              && im.pixelColor(0,1)==QColor(255,255,255),
+              "Sun OpenWindows icon (Bits[] hex words, 1=black, MSB-first, row-padded to 16) decodes");
+        check(RasterExtra::decodeData(b,QString()).size()==QSize(16,2),
+              "Sun icon '/* Format_version' magic-byte dispatch works with no extension hint");
+        // Truncated array (only 1 of the 2 required words) must be rejected as malformed.
+        QByteArray bad("/* Format_version=1, Width=16, Height=2 */\nBits[]={ 0x8000 };\n");
+        check(RasterExtra::decodeData(bad,"icon").isNull(),
+              "Sun icon with too few Bits[] words is rejected (null)"); }
+      // SoftimagePIC
+      // Softimage PIC: 2x1 uncompressed single RGB packet (mask 0xE0).
+      { QByteArray b; be32(b,0x5380F634u);            // magic @0
+        b.append(QByteArray(84,0));                    // version(4)+comment(80) → "PICT" lands @88
+        b.append("PICT",4);                            // @88
+        be16(b,2); be16(b,1);                          // width @92 = 2, height @94 = 1
+        be32(b,0);                                     // ratio @96
+        be16(b,0); be16(b,0);                          // fields @100, pad @102
+        ap8(b,{0,8,0,0xE0});                           // packet @104: chained=0, size=8, type=0(raw), mask=RGB
+        ap8(b,{10,20,30, 200,100,50});                 // pixel data: (10,20,30) then (200,100,50)
+        QImage im=RasterExtra::decodeData(b,"pic");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(10,20,30)
+              && im.pixelColor(1,0)==QColor(200,100,50), "Softimage PIC 2x1 uncompressed RGB decodes"); }
+
+      // Softimage PIC: 3x1 RLE RGB packet — 2-pixel run of blue then 1 literal red.
+      { QByteArray b; be32(b,0x5380F634u); b.append(QByteArray(84,0)); b.append("PICT",4);
+        be16(b,3); be16(b,1); be32(b,0); be16(b,0); be16(b,0);
+        ap8(b,{0,8,2,0xE0});                           // packet: type=2 (RLE), mask=RGB
+        ap8(b,{129, 0,0,255});                         // count 129 (>128) → 129-127=2 copies of blue
+        ap8(b,{0, 255,0,0});                           // count 0 (<128) → 0+1=1 literal red
+        QImage im=RasterExtra::decodeData(b,"pic");
+        check(!im.isNull() && im.size()==QSize(3,1) && im.pixelColor(0,0)==QColor(0,0,255)
+              && im.pixelColor(1,0)==QColor(0,0,255) && im.pixelColor(2,0)==QColor(255,0,0),
+              "Softimage PIC 3x1 RLE RGB decodes"); }
+      }
+
+      // ===== Fleet-2b: GEM IMG + Atari Tiny =====
+      { auto ap8=[](QByteArray&a,std::initializer_list<int> vs){ for(int v:vs) a.append(char(v)); };
+        auto be16=[](QByteArray&a,int v){ a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+        auto le16=[](QByteArray&a,int v){ a.append(char(v&0xff)); a.append(char((v>>8)&0xff)); };
+        (void)ap8;(void)be16;(void)le16;
+      // GEM Raster (Digital Research GEM .img / 
+      // Digital Research GEM Raster (.img): mono 16x1, exercising the solid-run + literal-run RLE tokens.
+      { QByteArray b;
+        be16(b,1); be16(b,8); be16(b,1); be16(b,1);   // version, headerLenWords, nPlanes(mono), patternLen
+        be16(b,0); be16(b,0); be16(b,16); be16(b,1);  // pixelW, pixelH (microns), imgWidth=16, imgHeight=1
+        ap8(b,{0x81, 0x80,0x01,0x0F});                // plane byte0 = solid 0xFF ; byte1 = literal 0x0F
+        QImage im=RasterExtra::decodeData(b,"img");
+        check(!im.isNull() && im.size()==QSize(16,1)
+              && im.pixelColor(0,0)==QColor(0,0,0)          // byte0=0xFF, bit set -> index 1 -> black
+              && im.pixelColor(8,0)==QColor(255,255,255)    // byte1=0x0F, bit7 clear -> index 0 -> white
+              && im.pixelColor(12,0)==QColor(0,0,0),        // byte1=0x0F, bit3 set  -> index 1 -> black
+              "GEM IMG mono RLE (solid+literal) decodes"); }
+      // AtariTiny (Atari ST "Tiny" / Tiny Stuff,
+    // --- Atari ST "Tiny" (Tiny Stuff) decoder ---
+    // Hand-built low-res (320x200) file. TINY word 0 = 0xFFFF (plane 0 of the first 16-pixel cell of
+    // row 0); every other word = 0. After the identity transpose (word 0 -> normal screen word 0),
+    // pixels x0..15 of row 0 take palette index 1 (red); all other pixels take palette index 0 (black).
+    {
+        QByteArray t;
+        t.append(char(0));                            // resolution 0 = low (320x200, 4 planes)
+        be16(t, 0x0000);                              // palette[0] = R0 G0 B0 -> black
+        be16(t, 0x0700);                              // palette[1] = R7 G0 B0 -> (255,0,0) red
+        for(int i=2;i<16;i++) be16(t, 0x0000);        // palette[2..15]
+        be16(t, 4);                                   // i16be control-byte count = 4
+        be16(t, 2);                                   // i16be data-word count = 2
+        ap8(t, {0x01, 0x00, 0x3E, 0x7F});             // ctrl: [+1 => repeat word0 once], [0 => u16 count 0x3E7F=15999]
+        ap8(t, {0xFF,0xFF, 0x00,0x00});               // data: word0 = 0xFFFF, word1 = 0x0000
+        // 1 (+1 repeat of word0) + 15999 (big repeat of word1) = 16000 words; consumes 2 data words, 4 control bytes.
+        QImage im = xara::RasterExtra::decodeData(t, "tny");
+        check(!im.isNull() && im.size()==QSize(320,200)
+              && im.pixelColor(0,0)==QColor(255,0,0)
+              && im.pixelColor(15,0)==QColor(255,0,0)
+              && im.pixelColor(16,0)==QColor(0,0,0)
+              && im.pixelColor(0,1)==QColor(0,0,0)
+              && im.pixelColor(319,199)==QColor(0,0,0),
+              "AtariTiny low-res: RLE (small+big repeat) + transpose + 3-bit palette");
+        // Truncated stream (data shorter than the declared word count) must fail cleanly, not crash.
+        QImage bad = xara::RasterExtra::decodeData(t.left(t.size()-2), "tny");
+        check(bad.isNull(), "AtariTiny truncated data stream -> null");
+    }
+      }
+
+      // ===== Fleet-3: MIFF / PALM / PGX / SIXEL / PICT / RLA (real-oracle cross-validated) =====
+      // ---- PGX (JPEG 2000 uncompressed grayscale) ----
+      {
+{
+    // --- PGX case 1: 8-bit, big-endian ("ML"), unsigned, 3x2. Header hand-laid at spec offsets. ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    put8('P'); put8('G');   // @0..1 magic "PG"
+    put8(' ');              // @2   whitespace
+    put8('M'); put8('L');   // @3..4 endian "ML" = big-endian
+    put8(' ');              // @5
+    put8('+');              // @6   sign '+' = unsigned
+    put8(' ');              // @7
+    put8('8');              // @8   bitdepth = 8
+    put8(' ');              // @9
+    put8('3');              // @10  width = 3
+    put8(' ');              // @11
+    put8('2');              // @12  height = 2
+    put8(0x0A);             // @13  newline terminates header
+    // raw samples, row-major, 1 byte/sample (depth<=8):
+    put8(0);   put8(128); put8(255);   // row 0
+    put8(64);  put8(32);  put8(200);   // row 1
+    QImage im = RasterExtra::decodeData(b, "pgx");
+    check(!im.isNull() && im.size()==QSize(3,2)
+          && im.pixelColor(0,0)==QColor(0,0,0)
+          && im.pixelColor(1,0)==QColor(128,128,128)
+          && im.pixelColor(2,0)==QColor(255,255,255)
+          && im.pixelColor(0,1)==QColor(64,64,64)
+          && im.pixelColor(2,1)==QColor(200,200,200), "PGX 8-bit ML unsigned");
+}
+{
+    // --- PGX case 2: 16-bit, little-endian ("LM"), no sign, 2x1. Exercises 2-byte + endianness. ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    put8('P'); put8('G'); put8(' ');   // @0..2 magic + ws
+    put8('L'); put8('M');              // @3..4 endian "LM" = little-endian
+    put8(' ');
+    put8('1'); put8('6');              // bitdepth = 16
+    put8(' ');
+    put8('2');                          // width = 2
+    put8(' ');
+    put8('1');                          // height = 1
+    put8(0x0A);                          // newline
+    // samples little-endian, 2 bytes each: 0x1234 -> gray 0x12 ; 0xABCD -> gray 0xAB
+    put8(0x34); put8(0x12);
+    put8(0xCD); put8(0xAB);
+    QImage im = RasterExtra::decodeData(b, "pgx");
+    check(!im.isNull() && im.size()==QSize(2,1)
+          && im.pixelColor(0,0)==QColor(0x12,0x12,0x12)
+          && im.pixelColor(1,0)==QColor(0xAB,0xAB,0xAB), "PGX 16-bit LM");
+}
+{
+    // --- Negative: header declares 3x2 (needs 6 sample bytes) but only 1 is present -> reject. ---
+    QByteArray b("PG ML + 8 3 2\n", 14);   // 14-byte header incl. trailing 0x0A
+    b.append('\x01');                        // 1 data byte, 5 short
+    QImage im = RasterExtra::decodeData(b, "pgx");
+    check(im.isNull(), "PGX truncated sample data rejected");
+}
+{
+    // --- Negative: header with no terminating newline -> reject (no over-read). ---
+    QByteArray b("PG ML + 8 3 2");
+    QImage im = RasterExtra::decodeData(b, "pgx");
+    check(im.isNull(), "PGX missing-newline rejected");
+}
+      }
+      // ---- MIFF (ImageMagick native) ----
+      {
+// ---- MIFF (Magick Image File Format) ----
+{
+    auto put   =[](QByteArray& bb,int v){ bb.append(char(v&0xFF)); };
+    auto be16m =[](QByteArray& bb,int v){ bb.append(char((v>>8)&0xFF)); bb.append(char(v&0xFF)); };
+
+    // (1) DirectClass, compression=None, depth=8, 2x2 RGB. Header hand-laid per MIFF
+    //     spec: ASCII key=value tokens, then ':' (0x3A) immediately followed by 0x1A,
+    //     then samples in quantum order R,G,B (1 byte each, big-endian), row-major.
+    {
+        QByteArray b;
+        b.append("id=ImageMagick\n");                 // signature @ offset 0
+        b.append("class=DirectClass\n");              // class= -> DirectClass
+        b.append("columns=2  rows=2  depth=8\n");     // columns=W  rows=H  depth=bits
+        b.append("colorspace=sRGB\n");
+        b.append("compression=None  matte=False\n");  // None (raw)  +  3 channels (no alpha)
+        b.append(':'); put(b,0x1A);                   // header terminator ':' + 0x1A
+        put(b,10);  put(b,20);  put(b,30);            // pixel (0,0) R,G,B
+        put(b,40);  put(b,50);  put(b,60);            // pixel (1,0)
+        put(b,70);  put(b,80);  put(b,90);            // pixel (0,1)
+        put(b,100); put(b,110); put(b,120);           // pixel (1,1)
+        QImage im = xara::RasterExtra::decodeData(b,"miff");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && im.pixelColor(0,0)==QColor(10,20,30)
+              && im.pixelColor(1,0)==QColor(40,50,60)
+              && im.pixelColor(0,1)==QColor(70,80,90)
+              && im.pixelColor(1,1)==QColor(100,110,120), "MIFF DirectClass/None/depth8 RGB");
+
+        // negative: truncated pixel data (4 of the 12 sample bytes missing) must be rejected.
+        check(xara::RasterExtra::decodeData(b.left(b.size()-4),"miff").isNull(),
+              "MIFF truncated pixel data rejected (no over-read)");
+    }
+
+    // (2) compression=RLE, depth=8, 2x2 RGB. Packet layout VERIFIED vs ImageMagick 6.9.12:
+    //     [R][G][B][count]; the pixel repeats (count+1) times (count is the LAST byte).
+    {
+        QByteArray b;
+        b.append("id=ImageMagick\n");
+        b.append("class=DirectClass\n");
+        b.append("columns=2  rows=2  depth=8\n");
+        b.append("compression=RLE  matte=False\n");
+        b.append(':'); put(b,0x1A);
+        put(b,10); put(b,20); put(b,30); put(b,1);    // 2 px of (10,20,30) -> row 0
+        put(b,70); put(b,80); put(b,90); put(b,1);    // 2 px of (70,80,90) -> row 1
+        QImage im = xara::RasterExtra::decodeData(b,"miff");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && im.pixelColor(0,0)==QColor(10,20,30)
+              && im.pixelColor(1,0)==QColor(10,20,30)
+              && im.pixelColor(0,1)==QColor(70,80,90)
+              && im.pixelColor(1,1)==QColor(70,80,90), "MIFF DirectClass/RLE/depth8");
+    }
+
+    // (3) compression=None, depth=16, matte=True, 1x1. 16-bit samples are 2 bytes BE and
+    //     the decoder keeps the HIGH byte; alpha is stored directly (IM>=6.8.9 / IM7).
+    {
+        QByteArray b;
+        b.append("id=ImageMagick\n");
+        b.append("class=DirectClass\n");
+        b.append("columns=1  rows=1  depth=16\n");
+        b.append("compression=None  matte=True\n");   // 4 channels R,G,B,A
+        b.append(':'); put(b,0x1A);
+        be16m(b,0x1234);  // R -> high byte 0x12 = 18
+        be16m(b,0x5678);  // G -> 0x56 = 86
+        be16m(b,0x9ABC);  // B -> 0x9A = 154
+        be16m(b,0x33FF);  // A -> 0x33 = 51 (stored directly, not inverted opacity)
+        QImage im = xara::RasterExtra::decodeData(b,"miff");
+        check(!im.isNull() && im.size()==QSize(1,1)
+              && im.pixelColor(0,0)==QColor(18,86,154,51), "MIFF DirectClass/None/depth16+alpha");
+    }
+
+    // (4) PseudoClass must be rejected.
+    {
+        QByteArray b;
+        b.append("id=ImageMagick\n");
+        b.append("class=PseudoClass\n");
+        b.append("columns=1  rows=1  depth=8  colors=1\n");
+        b.append("compression=None\n");
+        b.append(':'); put(b,0x1A);
+        put(b,0);
+        check(xara::RasterExtra::decodeData(b,"miff").isNull(), "MIFF PseudoClass rejected");
+    }
+}
+      }
+      // ---- Palm pixmap ----
+      {
+{
+    // Hand-built Palm bitmap (BitmapType), laid out byte-for-byte from the spec offsets so the
+    // test cannot inherit a decoder mistake: 4x2, 8bpp, uncompressed, with a 4-entry colour table.
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    // ---- 16-byte header, all big-endian ----
+    be16(4);        // @0  width           = 4
+    be16(2);        // @2  height          = 2
+    be16(4);        // @4  bytesPerRow     = 4  (4 px * 1 byte/px @ 8bpp)
+    be16(0x4000);   // @6  flags           = hasColorTable (0x4000)
+    put8(8);        // @8  bitsPerPixel    = 8
+    put8(1);        // @9  version         = 1
+    be16(0);        // @10 nextDepthOffset = 0
+    put8(0);        // @12 transparentIndex= 0
+    put8(0);        // @13 compressionType = 0 (uncompressed; ignored, compressed flag clear)
+    be16(0);        // @14 reserved        = 0
+    // ---- colour table @16: numEntries u16, then (index,R,G,B) quads ----
+    be16(4);        // numEntries = 4
+    put8(0); put8(10);  put8(20);  put8(30);   // index 0 -> (10,20,30)
+    put8(1); put8(255); put8(0);   put8(0);    // index 1 -> red
+    put8(2); put8(0);   put8(255); put8(0);    // index 2 -> green
+    put8(3); put8(0);   put8(0);   put8(255);  // index 3 -> blue
+    // ---- pixel data: bytesPerRow*height = 4*2 = 8 bytes, one index per byte ----
+    put8(0); put8(1); put8(2); put8(3);        // row 0 : indices 0,1,2,3
+    put8(3); put8(2); put8(1); put8(0);        // row 1 : indices 3,2,1,0
+
+    QImage im = RasterExtra::decodeData(b, "palm");
+    check(!im.isNull() && im.size()==QSize(4,2)
+          && im.pixelColor(0,0)==QColor(10,20,30)
+          && im.pixelColor(1,0)==QColor(255,0,0)
+          && im.pixelColor(3,0)==QColor(0,0,255)
+          && im.pixelColor(0,1)==QColor(0,0,255)
+          && im.pixelColor(3,1)==QColor(10,20,30), "Palm 8bpp colortable uncompressed");
+
+    // Negative: drop the final pixel byte -> the last row read runs past the buffer -> null (no over-read).
+    QImage bad = RasterExtra::decodeData(b.left(b.size()-1), "palm");
+    check(bad.isNull(), "Palm truncated pixel data -> null");
+
+    // version-0 regression (matches ImageMagick's PALM output): the hasColorTable flag bit is SET
+    // but a v0 header carries NO colour table — pixel data starts right after the 16-byte header.
+    // Consuming a phantom count there used to misalign every row and over-read. Now: default 1-bpp
+    // palette (index 0 = white, 1 = black), 8x1, pixel byte 0xA0 = bits 1010_0000.
+    QByteArray v0;
+    auto p8=[&](int x){ v0.append(char(x&0xff)); };
+    auto b16=[&](int x){ v0.append(char((x>>8)&0xff)); v0.append(char(x&0xff)); };
+    b16(8); b16(1); b16(1); b16(0x4000);   // width=8,height=1,bytesPerRow=1,flags=hasColorTable
+    p8(1); p8(0);                           // bpp=1, version=0  (v0 => NO colour table despite flag)
+    b16(0); p8(0); p8(0); b16(0);           // nextDepthOffset, transIdx, compType, reserved (16-byte hdr)
+    p8(0xA0);                               // 1 pixel row: 1010_0000 -> px0,2 black ; px1,3 white
+    QImage v0im = RasterExtra::decodeData(v0, "palm");
+    check(!v0im.isNull() && v0im.size()==QSize(8,1)
+          && v0im.pixelColor(0,0)==QColor(0,0,0)         // bit7=1 -> index1 -> black
+          && v0im.pixelColor(1,0)==QColor(255,255,255)   // bit6=0 -> index0 -> white
+          && v0im.pixelColor(2,0)==QColor(0,0,0),        // bit5=1 -> index1 -> black
+          "Palm version-0 w/ hasColorTable flag but no table (ImageMagick quirk) decodes");
+
+    // version-3 (BitmapTypeV3) transparentIndex: the transparent index is the low byte of the u32
+    // transparentValue @16 (p[19]), NOT p[12] (which is 'unused3' in v3). 2x1 8bpp, default palette
+    // (index 0 = white, index 5 = magenta). transparentValue low byte = 0 => index 0 is transparent;
+    // p[12] is deliberately set to 5 to catch the old stale-offset bug (which would blank index 5).
+    QByteArray v3;
+    auto q8=[&](int x){ v3.append(char(x&0xff)); };
+    auto q16=[&](int x){ v3.append(char((x>>8)&0xff)); v3.append(char(x&0xff)); };
+    q16(2); q16(1); q16(2); q16(0x2000);   // width=2,height=1,rowBytes=2,flags=hasTransparency
+    q8(8); q8(3);                           // bpp=8, version=3
+    q8(24); q8(0); q8(5); q8(0);            // @10 size=24, @11 pixelFormat, @12 unused3=5 (trap), @13 compType
+    q16(0);                                 // @14 density
+    q8(0); q8(0); q8(0); q8(0);             // @16 transparentValue u32 = 0x00000000 -> transparent index 0
+    q8(0); q8(0); q8(0); q8(0);             // @20 nextBitmapOffset
+    q8(0); q8(5);                           // pixel row: index 0 (white), index 5 (magenta)
+    QImage v3im = RasterExtra::decodeData(v3, "palm");
+    check(!v3im.isNull() && v3im.size()==QSize(2,1)
+          && v3im.pixelColor(0,0).alpha()==0             // index 0 == transparentValue low byte -> transparent
+          && v3im.pixelColor(1,0)==QColor(255,0,255),    // index 5 magenta, opaque (NOT blanked by stale p[12]=5)
+          "Palm version-3 transparentIndex read from transparentValue@16 (not p[12])");
+}
+      }
+      // ---- DEC SIXEL ----
+      {
+      // SIXEL (DEC): hand-laid per the DCS/sixel spec, independent of the decoder.
+      // 4x12 image, 2 bands. Palette (Pu=2 RGB %): reg0=red(100;0;0), reg1=blue(0;0;100).
+      // Band0 cols: v=1('@')->row0 only, v=32('_')->row5 only (bit0=top,bit5=bottom),
+      //             v=63('~')x2 -> full 6 rows. Band1: RLE '!4~' fills all 4 cols. Raster "1;1;4;12.
+      { QByteArray b;
+        auto put8=[&](int v){ b.append(char(v&0xff)); };
+        put8(0x1B); put8(0x50); put8(0x71);                                   // ESC P q  (DCS introducer, no params)
+        put8('"'); put8('1'); put8(';'); put8('1'); put8(';'); put8('4'); put8(';'); put8('1'); put8('2'); // "1;1;Ph=4;Pv=12
+        put8('#'); put8('0'); put8(';'); put8('2'); put8(';'); put8('1'); put8('0'); put8('0'); put8(';'); put8('0'); put8(';'); put8('0'); // #0;2;100;0;0 -> qRgb(255,0,0)
+        put8('#'); put8('1'); put8(';'); put8('2'); put8(';'); put8('0'); put8(';'); put8('0'); put8(';'); put8('1'); put8('0'); put8('0'); // #1;2;0;0;100 -> qRgb(0,0,255)
+        put8('#'); put8('0');                                                  // select register 0 (red)
+        put8(0x40); put8(0x5F); put8(0x7E); put8(0x7E);                        // '@'(v1) '_'(v32) '~'(v63) '~'(v63)
+        put8('-');                                                            // graphics LF -> band 1
+        put8('#'); put8('1'); put8('!'); put8('4'); put8(0x7E);               // select 1, RLE repeat '~'(v63) x4
+        put8(0x1B); put8(0x5C);                                               // ESC '\'  (ST)
+        QImage im=RasterExtra::decodeData(b,"six");
+        check(!im.isNull() && im.size()==QSize(4,12)
+              && im.pixelColor(0,0)==QColor(255,0,0)     // band0 col0 bit0 -> top row red
+              && im.pixelColor(0,1)==QColor(0,0,0)       // col0 rows1-5 = background black
+              && im.pixelColor(1,5)==QColor(255,0,0)     // band0 col1 bit5 -> bottom row (row5) red
+              && im.pixelColor(1,0)==QColor(0,0,0)       // col1 row0 empty
+              && im.pixelColor(2,3)==QColor(255,0,0)     // col2 fully filled
+              && im.pixelColor(0,6)==QColor(0,0,255)     // band1 top row blue (RLE)
+              && im.pixelColor(3,11)==QColor(0,0,255),   // band1 bottom-right blue
+              "SIXEL raster attrs + RGB palette + bit-order + RLE + band advance"); }
+
+      // Negative: ESC 'P' introducer with no 'q' final byte (>=8 bytes) -> null, no over-read.
+      { QByteArray bad;
+        auto put8=[&](int v){ bad.append(char(v&0xff)); };
+        put8(0x1B); put8(0x50); put8('1'); put8(';'); put8('1'); put8(';'); put8('1'); put8(';'); // ESC P 1;1;1;  (no 'q')
+        check(RasterExtra::decodeData(bad,"six").isNull(), "SIXEL truncated (no q terminator) rejected"); }
+      }
+      // ---- Apple QuickDraw PICT ----
+      {
+// ---- PICT: 32-bit DirectBitsRect (0x009A), planar packType 4 -------------------------------
+// File hand-laid at exact spec offsets: 512-byte header, then picSize, frame Rect, v2 opcodes.
+{
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](quint32 v){ b.append(char((v>>24)&0xff)); b.append(char((v>>16)&0xff)); b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    for(int i=0;i<512;i++) put8(0);                 // @0..511 : 512-byte header (all zero)
+    be16(512);                                      // @512    : picSize u16 (ignored)
+    be16(0); be16(0); be16(6); be16(8);             // @514    : frame Rect top,left,bottom,right => 8x6
+    be16(0x0011);                                   // @522    : VersionOp
+    be16(0x02FF);                                   // @524    : Version (v2)
+    be16(0x0C00);                                   // @526    : HeaderOp
+    be16(0xFFFE); be16(0); be16(0x0048); be16(0);   // @528    : 24 header bytes
+    be16(0x0048); be16(0); be16(0); be16(0);
+    be16(6); be16(8); be16(0); be16(0);
+    be16(0x0001); be16(10);                         // Clip opcode + rgnSize=10 (total)
+    be16(0); be16(0); be16(6); be16(8);             //   region Rect (8 bytes)
+    be16(0x009A);                                   // DirectBitsRect opcode
+    be32(0x000000FF);                               //   pmBaseAddr u32 (DirectBits marker)
+    be16(0x8000 | 32);                              //   rowBytes u16: packed-flag | 32 (=width*4)
+    be16(0); be16(0); be16(6); be16(8);             //   PixMap bounds Rect
+    be16(0); be16(4); be32(0);                      //   pmVersion, packType=4 (32-bit planar RLE), packSize
+    be32(0x00480000); be32(0x00480000);             //   hRes, vRes (72.0 Fixed)
+    be16(16); be16(32); be16(3); be16(8);           //   pixelType=16(RGBDirect), pixelSize=32, cmpCount=3, cmpSize=8
+    be32(0); be32(0); be32(0);                       //   planeBytes, pmTable, pmReserved
+    be16(0); be16(0); be16(6); be16(8);             //   srcRect
+    be16(0); be16(0); be16(6); be16(8);             //   dstRect
+    be16(0);                                        //   mode
+    for(int y=0;y<6;y++){                           //   6 rows: byteCount(u8)=6, then planar PackBits
+        put8(6); put8(0xF9); put8(0x30); put8(0xF9); put8(0x60); put8(0xF9); put8(0xA0);
+    }                                               //   F9 30 = 8x0x30 (R), F9 60 = 8x0x60 (G), F9 A0 = 8x0xA0 (B)
+    be16(0x00FF);                                   // OpEndPic
+    QImage im = RasterExtra::decodeData(b, "pct");
+    check(!im.isNull() && im.size()==QSize(8,6)
+          && im.pixelColor(0,0)==QColor(0x30,0x60,0xA0)
+          && im.pixelColor(7,5)==QColor(0x30,0x60,0xA0), "PICT DirectBits 32-bit #3060a0");
+    // Negative: truncate inside the Clip region (before the bitmap) => must be null, no over-read.
+    check(RasterExtra::decodeData(b.left(560), "pct").isNull(), "PICT truncated rejected");
+}
+// ---- PICT: 8-bit indexed PackBitsRect (0x0098) with color table ----------------------------
+{
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](quint32 v){ b.append(char((v>>24)&0xff)); b.append(char((v>>16)&0xff)); b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    for(int i=0;i<512;i++) put8(0);                 // @0..511 : 512-byte header
+    be16(512);                                      // @512    : picSize
+    be16(0); be16(0); be16(6); be16(8);             // @514    : frame Rect => 8x6
+    be16(0x0011); be16(0x02FF); be16(0x0C00);       // VersionOp + Version + HeaderOp
+    be16(0xFFFE); be16(0); be16(0x0048); be16(0);   //   24 header bytes
+    be16(0x0048); be16(0); be16(0); be16(0);
+    be16(6); be16(8); be16(0); be16(0);
+    be16(0x0001); be16(10);                         // Clip opcode + rgnSize
+    be16(0); be16(0); be16(6); be16(8);             //   region Rect
+    be16(0x0098);                                   // PackBitsRect opcode (no baseAddr)
+    be16(0x8000 | 8);                               //   rowBytes u16: packed-flag | 8 (=width, 1 byte/px)
+    be16(0); be16(0); be16(6); be16(8);             //   bounds Rect
+    be16(0); be16(0); be32(0);                      //   pmVersion, packType=0, packSize
+    be32(0x00480000); be32(0x00480000);             //   hRes, vRes
+    be16(0); be16(8); be16(1); be16(8);             //   pixelType=0(indexed), pixelSize=8, cmpCount=1, cmpSize=8
+    be32(0); be32(0); be32(0);                       //   planeBytes, pmTable, pmReserved
+    be32(0); be16(0); be16(0);                       //   ctSeed, ctFlags, ctSize=0 (=> 1 entry)
+    be16(0); be16(0x3030); be16(0x6060); be16(0xA0A0); // entry: value=0, r/g/b (high byte => 30/60/A0)
+    be16(0); be16(0); be16(6); be16(8);             //   srcRect
+    be16(0); be16(0); be16(6); be16(8);             //   dstRect
+    be16(0);                                        //   mode
+    for(int y=0;y<6;y++){ put8(2); put8(0xF9); put8(0x00); } // 6 rows: byteCount=2, F9 00 => 8x index 0
+    be16(0x00FF);                                   // OpEndPic
+    QImage im = RasterExtra::decodeData(b, "pct");
+    check(!im.isNull() && im.size()==QSize(8,6)
+          && im.pixelColor(0,0)==QColor(0x30,0x60,0xA0)
+          && im.pixelColor(3,3)==QColor(0x30,0x60,0xA0), "PICT PackBitsRect 8-bit indexed");
+}
+      }
+      // ---- Alias/Wavefront RLA ----
+      {
+{
+    // Hand-built Alias/Wavefront RLA (all BIG-ENDIAN), every header field laid at its spec
+    // byte offset so the test cannot inherit a decoder mistake. 2x2 RGB, integer 8-bit,
+    // literal-run RLE (control byte 0xFE = -2 => two literal bytes follow).
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](quint32 v){ b.append(char((v>>24)&0xff)); b.append(char((v>>16)&0xff)); b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    // ---- 740-byte header ----
+    be16(0); be16(1); be16(0); be16(1);   // @0  window        left=0 right=1 bottom=0 top=1
+    be16(0); be16(1); be16(0); be16(1);   // @8  active_window  left=0 right=1 bottom=0 top=1 -> 2x2
+    be16(1);                              // @16 frame
+    be16(0);                              // @18 storage_type = 0 (integer)
+    be16(3);                              // @20 num_chan = 3 (RGB)
+    be16(0);                              // @22 num_matte = 0
+    be16(0);                              // @24 num_aux = 0
+    be16(0xFFFE);                         // @26 revision
+    while(b.size()<658) put8(0);          // @28..657 gamma/primaries/strings (unused) -> zero
+    be16(8);                              // @658 chan_bits = 8
+    be16(0);                              // @660 matte_type
+    be16(8);                              // @662 matte_bits
+    while(b.size()<740) put8(0);          // @664..739 aux/space/next -> zero (header is exactly 740 bytes)
+    // ---- scanline offset table @740: height=2 i32 BE, stored bottom-to-top ----
+    be32(748);                            // table[0] -> bottom image row data (740 + 2*4)
+    be32(763);                            // table[1] -> top image row data    (748 + 15)
+    // ---- per channel: u16 byteCount then RLE; literal run 0xFE(-2) + 2 bytes = byteCount 3 ----
+    auto litchan=[&](int a,int c){ be16(3); put8(0xFE); put8(a); put8(c); };
+    litchan(70,100); litchan(80,110); litchan(90,120);   // bottom row (image y=1): R,G,B
+    litchan(10,40);  litchan(20,50);  litchan(30,60);    // top row    (image y=0): R,G,B
+    QImage im = RasterExtra::decodeData(b, "rla");
+    check(!im.isNull() && im.size()==QSize(2,2)
+        && im.pixelColor(0,0)==QColor(10,20,30)  && im.pixelColor(1,0)==QColor(40,50,60)
+        && im.pixelColor(0,1)==QColor(70,80,90)  && im.pixelColor(1,1)==QColor(100,110,120),
+        "RLA 2x2 RGB literal-run decode (active_window dims, bottom-to-top)");
+    // negative: truncated header (short buffer) must not over-read and must return null
+    QImage bad = RasterExtra::decodeData(b.left(300), "rla");
+    check(bad.isNull(), "RLA truncated buffer rejected");
+}
+      }
+
+      // ===== Fleet-4: AAI / VIPS / VICAR / MAT / PDB (real-oracle cross-validated) =====
+      // ---- AAI Dune (BGRA) ----
+      {
+{
+    // Build a spec-layout AAI file independently, byte-by-byte, from the documented layout.
+    QByteArray b;
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    const int W=3, H=2;
+    le32((quint32)W);                 // offset 0: width  (u32 LE)
+    le32((quint32)H);                 // offset 4: height (u32 LE)
+    // offset 8: raster, 4 bytes/pixel B,G,R,A, row-major top-to-bottom.
+    // pixel(x,y): R = 10*x+1, G = 20*y+2, B = 30, A = 200  (distinct per position so
+    // channel order AND row order are both pinned down).
+    for(int y=0;y<H;++y)
+        for(int x=0;x<W;++x){
+            put8(30);                 // Blue
+            put8(20*y+2);             // Green
+            put8(10*x+1);             // Red
+            put8(200);                // Alpha (straight)
+        }
+    QImage im=RasterExtra::decodeData(b,"aai");
+    check(!im.isNull() && im.size()==QSize(W,H)
+          && im.pixelColor(0,0)==QColor(1,2,30,200)      // top-left
+          && im.pixelColor(2,0)==QColor(21,2,30,200)     // R tracks x
+          && im.pixelColor(0,1)==QColor(1,22,30,200)     // G tracks y (row order top->bottom)
+          && im.pixelColor(2,1)==QColor(21,22,30,200),
+          "AAI 3x2 BGRA raster + LE32 header");
+    // Negative: header declares 3x2 but only one pixel of raster is present -> must
+    // reject with a null image and NOT over-read the buffer.
+    QByteArray t=b.left(8+4);
+    check(RasterExtra::decodeData(t,"aai").isNull(), "AAI truncated raster rejected");
+}
+      }
+      // ---- libvips .v ----
+      {
+{
+    // ---- libvips .v hermetic tests: file bytes built independently from the SPEC layout ----
+    // (A) Big-endian (SPARC magic 08 f2 a6 b6) 2x2 RGB, 3 bands, UCHAR, CODING_NONE.
+    QByteArray b;
+    auto be32=[&](quint32 v){ for(int s=24;s>=0;s-=8) b.append(char((v>>s)&0xff)); };
+    be32(0x08f2a6b6u); // @0  magic SPARC -> big-endian fields
+    be32(2);           // @4  Xsize = 2
+    be32(2);           // @8  Ysize = 2
+    be32(3);           // @12 Bands = 3 (RGB)
+    be32(0);           // @16 Bbits (deprecated; 0 in real files)
+    be32(0);           // @20 BandFmt = 0 (UCHAR)
+    be32(0);           // @24 Coding  = 0 (NONE)
+    be32(22);          // @28 Type = 22 (sRGB; informational)
+    while(b.size() < 64) b.append('\0'); // @32..@63 pad -> header is fixed 64 bytes
+    // @64 pixel data, band-interleaved R,G,B, row-major
+    const unsigned char px[12] = {10,20,30, 40,50,60, 70,80,90, 100,110,120};
+    for(int i=0;i<12;i++) b.append(char(px[i]));
+    QImage im = RasterExtra::decodeData(b, "v");
+    check(!im.isNull() && im.size()==QSize(2,2)
+          && im.pixelColor(0,0)==QColor(10,20,30)
+          && im.pixelColor(1,0)==QColor(40,50,60)
+          && im.pixelColor(0,1)==QColor(70,80,90)
+          && im.pixelColor(1,1)==QColor(100,110,120)
+          && qAlpha(im.pixel(1,1))==255,
+          "VIPS .v big-endian 2x2 RGB");
+
+    // (B) Little-endian (INTEL magic b6 a6 f2 08) 1x1 grayscale — exercises the LE branch.
+    QByteArray g;
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) g.append(char((v>>s)&0xff)); };
+    le32(0x08f2a6b6u); // @0  writes bytes b6 a6 f2 08 (INTEL) -> little-endian fields
+    le32(1);           // @4  Xsize = 1
+    le32(1);           // @8  Ysize = 1
+    le32(1);           // @12 Bands = 1 (gray)
+    le32(0);           // @16 Bbits
+    le32(0);           // @20 BandFmt = UCHAR
+    le32(0);           // @24 Coding  = NONE
+    le32(0);           // @28 Type
+    while(g.size() < 64) g.append('\0');
+    g.append(char(200)); // @64 single gray sample
+    QImage im2 = RasterExtra::decodeData(g, "v");
+    check(!im2.isNull() && im2.size()==QSize(1,1)
+          && im2.pixelColor(0,0)==QColor(200,200,200),
+          "VIPS .v little-endian 1x1 gray");
+
+    // (C) Negative: header claims 2x2x3 (needs 12 data bytes) but only 4 are present -> null, no over-read.
+    QImage im3 = RasterExtra::decodeData(b.left(64+4), "v");
+    check(im3.isNull(), "VIPS .v truncated pixel data rejected");
+}
+      }
+      // ---- JPL VICAR ----
+      {
+{
+    // Independently build a VICAR file from the SPEC byte layout: ASCII label of
+    // exactly LBLSIZE bytes, then BSQ single-band BYTE samples at offset LBLSIZE.
+    QByteArray b;
+    auto puts=[&](const char* s){ b.append(s); };
+    // Declared LBLSIZE=128; the literal token text below is < 128 chars, then space-padded to 128.
+    puts("LBLSIZE=128 FORMAT='BYTE' TYPE='IMAGE' ORG='BSQ' NL=2 NS=3 NB=1 NBB=0 NLB=0 RECSIZE=3 ");
+    while(b.size() < 128) b.append(' ');            // pad label to declared LBLSIZE
+    // Pixel data: 1 band (gray), BSQ, 2 lines x 3 samples, NBB=0 -> row-major, stride=RECSIZE=3.
+    const unsigned char px[6] = {10,20,30, 40,50,60};
+    for(int i=0;i<6;i++) b.append(char(px[i]));
+    QImage im = RasterExtra::decodeData(b, "vicar");
+    check(!im.isNull() && im.size()==QSize(3,2)
+          && im.pixelColor(0,0)==QColor(10,10,10)   // line0 sample0
+          && im.pixelColor(2,0)==QColor(30,30,30)   // line0 sample2
+          && im.pixelColor(0,1)==QColor(40,40,40)   // line1 sample0
+          && im.pixelColor(2,1)==QColor(60,60,60),  // line1 sample2
+          "VICAR BYTE/BSQ gray 3x2");
+    // Negative: truncated buffer (label claims LBLSIZE=128 but only 40 bytes present) -> null, no over-read.
+    QImage bad = RasterExtra::decodeData(b.left(40), "vicar");
+    check(bad.isNull(), "VICAR truncated -> null");
+}
+      }
+      // ---- MATLAB Level-5 ----
+      {
+{
+    // Hermetic MAT built byte-by-byte from the Level-5 spec layout (little-endian),
+    // independently of the decoder. Mirrors what ImageMagick emits, INCLUDING the
+    // degenerate Array-Flags class=6 (mxDOUBLE) with miUINT8 real data.
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    auto le32 = [&](quint32 v){ for(int s = 0; s < 32; s += 8) b.append(char((v >> s) & 0xff)); };
+
+    // --- 128-byte header ---
+    const char* desc = "MATLAB 5.0 MAT-file, hermetic selftest";
+    for(const char* c = desc; *c; ++c) put8((unsigned char)*c);   // @0   text description
+    while(b.size() < 124) put8(0x20);                             // pad with spaces to @124
+    put8(0x00); put8(0x01);                                       // @124 version u16 (bytes 00 01)
+    put8('I'); put8('M');                                         // @126 endian indicator => little-endian
+
+    // --- matrix content assembled first so we can size the top tag ---
+    QByteArray m;
+    auto mput8 = [&](int v){ m.append(char(v & 0xff)); };
+    auto mle32 = [&](quint32 v){ for(int s = 0; s < 32; s += 8) m.append(char((v >> s) & 0xff)); };
+    // (1) Array Flags: type=6 (miUINT32), len=8; payload [class|flags][0]. class=6 mimics IM.
+    mle32(6); mle32(8); mle32(6); mle32(0);
+    // (2) Dimensions: type=5 (miINT32), len=8; rows=4 (height), cols=5 (width).
+    mle32(5); mle32(8); mle32(4); mle32(5);
+    // (3) Array Name: SMALL element. tag word = (len<<16)|type = (1<<16)|1 = 0x00010001; 'M'+pad.
+    mle32(0x00010001u); mput8('M'); mput8(0); mput8(0); mput8(0);
+    // (4) Real data: type=2 (miUINT8), len=20; column-major (cols outer, rows inner); pad 20->24.
+    mle32(2); mle32(20);
+    for(int c = 0; c < 5; ++c) for(int r = 0; r < 4; ++r) mput8((r * 50 + c * 10) & 0xff);
+    m.append(char(0)); m.append(char(0)); m.append(char(0)); m.append(char(0));
+
+    // --- top-level miMATRIX Data Element @128 ---
+    le32(14); le32((quint32)m.size());   // dataType=14 (miMATRIX), numBytes
+    b.append(m);
+
+    QImage im = RasterExtra::decodeData(b, "mat");
+    bool ok = !im.isNull() && im.size() == QSize(5, 4)
+        && im.pixelColor(0, 0) == QColor(0, 0, 0)         // c0,r0 => 0
+        && im.pixelColor(4, 0) == QColor(40, 40, 40)      // c4,r0 => 40
+        && im.pixelColor(0, 3) == QColor(150, 150, 150)   // c0,r3 => 150
+        && im.pixelColor(2, 1) == QColor(70, 70, 70)      // c2,r1 => 70
+        && im.pixelColor(4, 3) == QColor(190, 190, 190);  // c4,r3 => 190
+    check(ok, "MAT: 5x4 uint8 gray, column-major transpose");
+
+    // Negative: truncated buffer must not over-read and must return null.
+    QImage bad = RasterExtra::decodeData(b.left(150), "mat");
+    check(bad.isNull(), "MAT: truncated buffer rejected");
+}
+      }
+      // ---- Palm ImageViewer PDB ----
+      {
+{
+    // Build a PDB/ImageViewer file byte-for-byte from the SPEC layout (independent of the decoder).
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](quint32 v){ for(int s=24;s>=0;s-=8) b.append(char((v>>s)&0xff)); };
+    // --- PDB header (78 bytes) ---
+    const char* nm="test";
+    for(int i=0;i<32;i++) put8(i<4?nm[i]:0);        // name[32]@0
+    be16(0);                                         // attributes u16@32
+    be16(0);                                         // version    u16@34
+    be32(0); be32(0); be32(0);                       // create@36 / modify@40 / archive@44
+    be32(0); be32(0); be32(0);                       // modNum@48 / appInfoID@52 / sortInfoID@56
+    put8('v');put8('I');put8('M');put8('G');         // type[4]@60
+    put8('V');put8('i');put8('e');put8('w');         // creator[4]@64
+    be32(0);                                         // seed u32@68
+    be32(0);                                         // nextRecordListID u32@72
+    be16(1);                                          // numRecords u16@76
+    // --- record-entry list @78 (one 8-byte entry) ---
+    be32(86);                                         // recordOffset u32@78 -> image record @86
+    put8(0); put8(0x6f); put8(0x80); put8(0x00);      // attributes u8 + uniqueID[3]
+    // --- ImageViewer image record @86 (58-byte header) ---
+    for(int i=0;i<32;i++) put8(0);                    // name[32] @rec+0
+    put8(1);                                          // version u8 @rec+32  (1 = RLE)
+    put8(0xff);                                       // type    u8 @rec+33  (!=0,!=2 => 1 bpp)
+    be32(0); be32(0);                                 // reserved_1 @rec+34 / note @rec+38
+    be16(0); be16(0);                                 // x_last @rec+42 / y_last @rec+44
+    be32(0);                                          // reserved_2 @rec+46
+    be16(0xffff); be16(0xffff);                       // x_anchor @rec+50 / y_anchor @rec+52
+    be16(16);                                         // width  i16 @rec+54
+    be16(2);                                          // height i16 @rec+56
+    // --- ImageViewer RLE bitmap -> packets*rows = 2*2 = 4 output bytes: F0,00,FF,FF ---
+    put8(0x01); put8(0xF0); put8(0x00);               // COPY 2 literals -> row0 = F0,00
+    put8(0x81); put8(0xFF);                           // RUN 2x FF       -> row1 = FF,FF
+    QImage im = RasterExtra::decodeData(b,"pdb");
+    // row0: F0=11110000 -> px0..3 set(black), px4..7 clear(white); 00 -> px8..15 white
+    // row1: FF,FF -> every bit set -> all black
+    check(!im.isNull() && im.size()==QSize(16,2)
+          && im.pixelColor(0,0)==QColor(0,0,0)
+          && im.pixelColor(4,0)==QColor(255,255,255)
+          && im.pixelColor(15,0)==QColor(255,255,255)
+          && im.pixelColor(0,1)==QColor(0,0,0)
+          && im.pixelColor(9,1)==QColor(0,0,0), "PDB ImageViewer 1-bpp RLE 16x2");
+    // negative: a truncated buffer must return null (no over-read)
+    QImage bad = RasterExtra::decodeData(b.left(40),"pdb");
+    check(bad.isNull(), "PDB truncated -> null");
+}
+      }
+
+      // ===== Fleet-5: TIM / Degas-compressed / CrackArt / ACBM / DEEP (native retro, hermetic) =====
+      // ---- Sony PlayStation TIM ----
+      {
+{
+    // --- Hermetic TIM: 4bpp CLUT, built byte-by-byte straight from the spec layout ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le16=[&](int v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    le32(0x10);        // @0  magic = 0x00000010
+    le32(0x08);        // @4  flags = mode 0 (4bpp) | 0x08 (CLUT present)
+    // @8 CLUT block: bnum = 12 (header) + 16*1*2 (entries) = 44
+    le32(44);          // @8   bnum
+    le16(0);           // @12  DX
+    le16(0);           // @14  DY
+    le16(16);          // @16  W = 16 colours
+    le16(1);           // @18  H = 1 CLUT
+    le16(0x001F);      // @20  idx0 = red   (R=31)          A1B5G5R5
+    le16(0x03E0);      //      idx1 = green (G=31)
+    le16(0x7C00);      //      idx2 = blue  (B=31)
+    le16(0x7FFF);      //      idx3 = white
+    for(int i=4;i<16;i++) le16(0);                 // idx4..15 unused
+    // IMAGE block: bnum = 12 (header) + 2 (row stride 1 word) * 1 (row) = 14
+    le32(14);          // bnum
+    le16(0);           // DX
+    le16(0);           // DY
+    le16(1);           // W = 1 word  -> real width = 1*4 = 4 px
+    le16(1);           // H = 1 row
+    put8(0x10);        // byte0: low nibble 0 (x0 red), high nibble 1 (x1 green)
+    put8(0x32);        // byte1: low nibble 2 (x2 blue), high nibble 3 (x3 white)
+    QImage im=RasterExtra::decodeData(b,"tim");
+    check(!im.isNull() && im.size()==QSize(4,1)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(1,0)==QColor(0,255,0)
+          && im.pixelColor(2,0)==QColor(0,0,255)
+          && im.pixelColor(3,0)==QColor(255,255,255), "TIM 4bpp CLUT decode");
+    // Negative: truncated buffer (image block header cut off) must be rejected, no over-read.
+    QImage bad=RasterExtra::decodeData(b.left(10),"tim");
+    check(bad.isNull(), "TIM truncated rejected");
+}
+      }
+      // ---- Degas Elite compressed PC1/2/3 ----
+      {
+{
+    // Build a DEGAS Elite COMPRESSED (.pc1) file BYTE-BY-BYTE from the spec, independently of the
+    // decoder, so the test cannot inherit a decode mistake. Low res 320x200, 4 planes.
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    // @0: resolution word BE, bit15 set (compressed) + low bits 0 (low-res 320x200/4 planes)
+    be16(0x8000);
+    // @2: 16 STe palette words 0x0RGB (r=(w>>8)&7,g=(w>>4)&7,b=w&7; c8=(c<<5)|(c<<2)|(c>>1))
+    for(int i=0;i<16;i++){
+        int w=0x0000;
+        if(i==1) w=0x0700;      // pal[1] = red   (r=7 -> 255)
+        else if(i==9) w=0x0070; // pal[9] = green (g=7 -> 255)
+        be16(w);
+    }
+    // @34: PackBits body, PLANE-SEQUENTIAL per scanline (line's whole plane0, then plane1, ...).
+    // ctrl 0..127 => copy ctrl+1 literals; 128 => no-op; 129..255 => repeat next byte (257-ctrl)x.
+    put8(0x80);                     // one no-op control byte (exercises the 128 path)
+    // -- scanline 0: pixels 0..7 => idx 9 (plane0+plane3 set), pixels 8..319 => idx 0 --
+    // plane0 row (40B) = 0xFF then 39x00  -> literal(1) 0xFF, then repeat(39) 0x00
+    put8(0x00); put8(0xFF);         // ctrl 0 => copy 0+1=1 literal byte (0xFF)
+    put8(0xDA); put8(0x00);         // 257-0xDA(218)=39 copies of 0x00  (ends on 40-byte boundary)
+    // plane1 row (40B) = all 0x00 -> repeat(40) 0x00
+    put8(0xD9); put8(0x00);         // 257-0xD9(217)=40 copies of 0x00
+    // plane2 row (40B) = all 0x00
+    put8(0xD9); put8(0x00);
+    // plane3 row (40B) = 0xFF then 39x00
+    put8(0x00); put8(0xFF);
+    put8(0xDA); put8(0x00);
+    // -- scanlines 1..199: every pixel idx 1 (plane0 all set) => red --
+    for(int y=1;y<200;y++){
+        put8(0xD9); put8(0xFF);     // plane0: 40x 0xFF
+        put8(0xD9); put8(0x00);     // plane1: 40x 0x00
+        put8(0xD9); put8(0x00);     // plane2
+        put8(0xD9); put8(0x00);     // plane3
+    }
+    QImage im=RasterExtra::decodeData(b,"pc1");
+    check(!im.isNull() && im.size()==QSize(320,200)
+          && im.pixelColor(0,0)==QColor(0,255,0)      // idx9 (plane0+3) -> green
+          && im.pixelColor(8,0)==QColor(0,0,0)        // idx0 -> black
+          && im.pixelColor(100,5)==QColor(255,0,0),   // idx1 -> red
+          "DEGAS Elite compressed PC1 plane-sequential decode");
+    // Negative: a truncated body must not over-read and must return a null image.
+    QImage bad=RasterExtra::decodeData(b.left(40),"pc1");
+    check(bad.isNull(), "DEGAS compressed PC1 truncated -> null");
+}
+      }
+      // ---- CrackArt CA1/2/3 ----
+      {
+{
+    // ---- CrackArt (.ca1) hermetic tests, laid out byte-by-byte from the RECOIL spec ----
+    auto put8=[&](QByteArray& a,int v){ a.append(char(v&0xff)); };
+    auto be16=[&](QByteArray& a,int v){ a.append(char((v>>8)&0xff)); a.append(char(v&0xff)); };
+
+    // (1) UNCOMPRESSED low-res 320x200x4-plane
+    QByteArray b;
+    put8(b,'C'); put8(b,'A');          // @0 magic 'CA'
+    put8(b,0);                         // @2 compression = 0 (uncompressed)
+    put8(b,0);                         // @3 resolution  = 0 (low)
+    be16(b,0x0000);                    // @4  palette[0] = black  (STe word 0RRR0GGG0BBB)
+    be16(b,0x0700);                    // @6  palette[1] = red    (R=7 -> 255)
+    be16(b,0x0070);                    // @8  palette[2] = green  (G=7)
+    be16(b,0x0007);                    // @10 palette[3] = blue   (B=7)
+    for(int i=4;i<16;i++) be16(b,0);   // @12..35 palette[4..15] = black  (16 words total -> data @36)
+    QByteArray body(32000,'\0');       // @36 32000-byte 4-plane word-interleaved body, all idx 0
+    body[0]=char(0x80);                //   row0 grp0 plane0 word = 0x8000 -> pixel(0,0) bit15 -> idx 1 (red)
+    body[2]=char(0x40);                //   row0 grp0 plane1 word = 0x4000 -> pixel(1,0) bit14 -> idx 2 (green)
+    b.append(body);                    //   total length 36+32000 = 32036
+    QImage im=RasterExtra::decodeData(b,"ca1");
+    check(!im.isNull() && im.size()==QSize(320,200)
+       && im.pixelColor(0,0)==QColor(255,0,0)
+       && im.pixelColor(1,0)==QColor(0,255,0)
+       && im.pixelColor(2,0)==QColor(0,0,0), "CrackArt CA1 uncompressed low-res");
+
+    // (2) RLE-COMPRESSED low-res: same red pixel(0,0), everything else black
+    QByteArray c;
+    put8(c,'C'); put8(c,'A');          // @0 magic
+    put8(c,1);                         // @2 compression = 1 (RLE)
+    put8(c,0);                         // @3 resolution  = 0 (low)
+    be16(c,0x0000); be16(c,0x0700); be16(c,0x0070); be16(c,0x0007);
+    for(int i=4;i<16;i++) be16(c,0);   // @4..35 palette (16 words) -> packed stream @36
+    put8(c,0xAB);                      // @36 escape byte = 0xAB
+    put8(c,0x00);                      // @37 default value = 0x00
+    be16(c,0x0001);                    // @38 step word = 1 (sequential column write)
+    put8(c,0x80);                      // stream: literal 0x80 -> body[0]=0x80
+    put8(c,0xAB); put8(c,0x02); put8(c,0x7C); put8(c,0xFE); // ESC,2,0x7CFE -> fill 31999 defaults(0)
+    QImage im2=RasterExtra::decodeData(c,"ca1");
+    check(!im2.isNull() && im2.size()==QSize(320,200)
+       && im2.pixelColor(0,0)==QColor(255,0,0)
+       && im2.pixelColor(10,10)==QColor(0,0,0), "CrackArt CA1 RLE-compressed low-res");
+
+    // (3) negative: truncated buffer must return null (no over-read)
+    QImage bad=RasterExtra::decodeData(b.left(100),"ca1");
+    check(bad.isNull(), "CrackArt truncated -> null");
+}
+      }
+      // ---- Amiga IFF ACBM ----
+      {
+{
+    // Build a spec-layout ACBM byte-by-byte (independent of the decoder).
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](quint32 v){ for(int s=24;s>=0;s-=8) b.append(char((v>>s)&0xff)); };
+    auto tag =[&](const char* t){ b.append(t,4); };
+    // ---- FORM header ----
+    tag("FORM");            // @0 magic
+    be32(0);               // @4 form size (decoder ignores; value irrelevant)
+    tag("ACBM");           // @8 form type
+    // ---- BMHD chunk (20-byte BitMapHeader) ----
+    tag("BMHD"); be32(20);
+    be16(8);               // @0 width  = 8
+    be16(2);               // @2 height = 2
+    be16(0);               // @4 x
+    be16(0);               // @6 y
+    put8(2);               // @8 nPlanes = 2
+    put8(0);               // @9 masking = 0
+    put8(0);               // @10 compression = 0 (ABIT is uncompressed)
+    put8(0);               // @11 pad
+    be16(0);               // @12 transparentColor
+    put8(0);               // @14 xAspect
+    put8(0);               // @15 yAspect
+    be16(8);               // @16 pageW
+    be16(2);               // @18 pageH
+    // ---- CMAP chunk (4 colours * 3 = 12 bytes, even) ----
+    tag("CMAP"); be32(12);
+    put8(0);  put8(0);  put8(0);    // idx0 = black
+    put8(255);put8(0);  put8(0);    // idx1 = red
+    put8(0);  put8(255);put8(0);    // idx2 = green
+    put8(0);  put8(0);  put8(255);  // idx3 = blue
+    // ---- ABIT chunk: rowBytes=((8+15)/16)*2=2, planeBytes=h*rowBytes=4, 2 planes -> 8 bytes ----
+    // Target indices: row0 x0..x3 = [0,1,2,3]; row1 x0 = 3; everything else 0.
+    // plane0 = idx bit0: row0 [0,1,0,1]=0b01010000=0x50 ; row1 x0=1 -> 0b10000000=0x80
+    // plane1 = idx bit1: row0 [0,0,1,1]=0b00110000=0x30 ; row1 x0=1 -> 0b10000000=0x80
+    tag("ABIT"); be32(8);
+    put8(0x50); put8(0x00);   // plane0 row0 (2 rowBytes; 2nd byte unused/zero)
+    put8(0x80); put8(0x00);   // plane0 row1
+    put8(0x30); put8(0x00);   // plane1 row0
+    put8(0x80); put8(0x00);   // plane1 row1
+
+    QImage im = RasterExtra::decodeData(b, "acbm");
+    check(!im.isNull() && im.size()==QSize(8,2)
+          && im.pixelColor(0,0)==QColor(0,0,0)
+          && im.pixelColor(1,0)==QColor(255,0,0)
+          && im.pixelColor(2,0)==QColor(0,255,0)
+          && im.pixelColor(3,0)==QColor(0,0,255)
+          && im.pixelColor(0,1)==QColor(0,0,255), "ACBM contiguous bitplanes + CMAP");
+
+    // Negative: a truncated buffer (magic incomplete) must return null with no over-read.
+    QImage bad = RasterExtra::decodeData(b.left(10), "acbm");
+    check(bad.isNull(), "ACBM truncated -> null");
+}
+      }
+      // ---- IFF DEEP (TVPaint) ----
+      {
+{
+    // --- Hermetic IFF DEEP tests, built byte-by-byte from the spec (not from the decoder). ---
+    auto put8 =[&](QByteArray& b,int v){ b.append(char(v&0xff)); };
+    auto be16=[&](QByteArray& b,int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](QByteArray& b,quint32 v){ for(int s=24;s>=0;s-=8) b.append(char((v>>s)&0xff)); };
+    auto chunk=[&](QByteArray& b,const char* id,const QByteArray& d){
+        b.append(id,4); be32(b,(quint32)d.size()); b.append(d);
+        if(d.size()&1) b.append(char(0));                 // even padding
+    };
+
+    // Test 1: 2x2, uncompressed, elements R,G,B,A (types 1,2,3,4), depth 8 each.
+    {
+        QByteArray dgbl;
+        be16(dgbl,2); be16(dgbl,2);                       // width=2 @0, height=2 @2
+        be16(dgbl,0);                                     // compression=0 @4
+        put8(dgbl,1); put8(dgbl,1);                       // xAspect @6, yAspect @7
+        QByteArray dpel;
+        be32(dpel,4);                                     // nElements=4 @0
+        be16(dpel,1); be16(dpel,8);                       // RED,   depth 8
+        be16(dpel,2); be16(dpel,8);                       // GREEN, depth 8
+        be16(dpel,3); be16(dpel,8);                       // BLUE,  depth 8
+        be16(dpel,4); be16(dpel,8);                       // ALPHA, depth 8
+        QByteArray dbod;                                  // chunky, row-major: pixel = R,G,B,A
+        // (0,0)                       (1,0)
+        put8(dbod,255);put8(dbod,0);put8(dbod,0);put8(dbod,255);
+        put8(dbod,0);put8(dbod,255);put8(dbod,0);put8(dbod,255);
+        // (0,1)                       (1,1)
+        put8(dbod,0);put8(dbod,0);put8(dbod,255);put8(dbod,128);
+        put8(dbod,255);put8(dbod,255);put8(dbod,0);put8(dbod,255);
+        QByteArray body; body.append("DEEP",4);
+        chunk(body,"DGBL",dgbl); chunk(body,"DPEL",dpel); chunk(body,"DBOD",dbod);
+        QByteArray f; f.append("FORM",4); be32(f,(quint32)body.size()); f.append(body);
+
+        QImage im=RasterExtra::decodeData(f,"deep");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && im.pixelColor(0,0)==QColor(255,0,0,255)
+              && im.pixelColor(1,0)==QColor(0,255,0,255)
+              && im.pixelColor(0,1)==QColor(0,0,255,128)
+              && im.pixelColor(1,1)==QColor(255,255,0,255), "DEEP uncompressed RGBA 2x2");
+    }
+
+    // Test 2: 4x1, compression 1 (ByteRun1/PackBits), elements R,G,B. Body is one literal run of
+    // 12 bytes: control byte 11 (=copy 11+1=12 literals) followed by four red pixels (255,0,0).
+    {
+        QByteArray dgbl;
+        be16(dgbl,4); be16(dgbl,1);                       // width=4, height=1
+        be16(dgbl,1);                                     // compression=1 (RLE)
+        put8(dgbl,1); put8(dgbl,1);
+        QByteArray dpel;
+        be32(dpel,3);                                     // nElements=3
+        be16(dpel,1); be16(dpel,8);                       // RED
+        be16(dpel,2); be16(dpel,8);                       // GREEN
+        be16(dpel,3); be16(dpel,8);                       // BLUE
+        QByteArray dbod;
+        put8(dbod,11);                                    // control: literal run of 12 bytes
+        for(int i=0;i<4;i++){ put8(dbod,255); put8(dbod,0); put8(dbod,0); } // 4x red
+        QByteArray body; body.append("DEEP",4);
+        chunk(body,"DGBL",dgbl); chunk(body,"DPEL",dpel); chunk(body,"DBOD",dbod);
+        QByteArray f; f.append("FORM",4); be32(f,(quint32)body.size()); f.append(body);
+
+        QImage im=RasterExtra::decodeData(f,"deep");
+        check(!im.isNull() && im.size()==QSize(4,1)
+              && im.pixelColor(0,0)==QColor(255,0,0,255)
+              && im.pixelColor(3,0)==QColor(255,0,0,255), "DEEP ByteRun1 RGB 4x1");
+    }
+
+    // Test 3 (negative): truncated buffer must return a null image, no over-read.
+    {
+        QByteArray f; f.append("FORM",4);
+        for(int s=24;s>=0;s-=8) f.append(char((72>>s)&0xff));   // plausible size
+        f.append("DEEP",4); f.append("DGB",3);                  // cut off mid-chunk-id
+        QImage im=RasterExtra::decodeData(f,"deep");
+        check(im.isNull(), "DEEP truncated -> null");
+    }
+}
+      }
+
+      // ===== Fleet-6: ArtDirector / C64 Doodle / MSX-SC2 / Apple-II HGR / Atari Micropainter (retro, hermetic) =====
+      // ---- Atari ST Art Director ----
+      {
+{
+    // ---- Art Director (.art) — SPEC-layout hermetic file, built byte-by-byte ----
+    // Total EXACTLY 32512 bytes: 32000 screen + 512 palette region.
+    QByteArray b(32512, '\0');
+    auto be16at=[&](int off,int v){ b[off]=char((v>>8)&0xff); b[off+1]=char(v&0xff); };
+    // Screen row 0, group 0 = 4 word-interleaved big-endian plane words @0..7.
+    // We want pixel0=idx1(plane0), pixel1=idx2(plane1), pixel2=idx3(plane0+1):
+    //   pixel x uses bit position (15-x) in each plane word.
+    //   plane0 bits: pixel0(bit15)+pixel2(bit13) = 0x8000|0x2000 = 0xA000
+    //   plane1 bits: pixel1(bit14)+pixel2(bit13) = 0x4000|0x2000 = 0x6000
+    be16at(0, 0xA000); // plane 0
+    be16at(2, 0x6000); // plane 1
+    be16at(4, 0x0000); // plane 2
+    be16at(6, 0x0000); // plane 3
+    // rest of screen stays 0 (index 0 = black).
+    // Active palette: selector byte @0x7e1f = 0 (already zero) -> palette @32000.
+    be16at(32000 + 0*2, 0x0000); // idx0 black
+    be16at(32000 + 1*2, 0x0700); // idx1 red   (r=7 -> 255,0,0)
+    be16at(32000 + 2*2, 0x0070); // idx2 green (g=7 -> 0,255,0)
+    be16at(32000 + 3*2, 0x0007); // idx3 blue  (b=7 -> 0,0,255)
+    QImage im = RasterExtra::decodeData(b, "art");
+    check(!im.isNull() && im.size()==QSize(320,200)
+        && im.pixelColor(0,0)==QColor(255,0,0)
+        && im.pixelColor(1,0)==QColor(0,255,0)
+        && im.pixelColor(2,0)==QColor(0,0,255)
+        && im.pixelColor(3,0)==QColor(0,0,0),
+        "ArtDirector 320x200 low-res word-interleaved palette");
+    // Negative: wrong size (truncated) must reject.
+    QByteArray bad(32000, '\0');
+    QImage im2 = RasterExtra::decodeData(bad, "art");
+    check(im2.isNull(), "ArtDirector rejects wrong-size buffer");
+}
+      }
+      // ---- C64 Doodle ----
+      {
+{
+    // Hermetic C64 Doodle built byte-by-byte from the RECOIL layout (independent of the decoder).
+    // Total 9026 bytes: [0..1] load addr, [2..1025] 1024-byte screen RAM, [1026..9025] 8000-byte bitmap.
+    QByteArray b(9026, '\0');                 // all zero ⇒ background = palette index 0 (black)
+    auto setb=[&](int i,int v){ b[i]=char(v&0xff); };
+    setb(0,0x00); setb(1,0x5C);               // PRG load address $5C00 (little-endian)
+    // Screen RAM: file offset 2 + cellIndex.
+    setb(2,   0x1A);                          // cell0  : hi=1(white)      lo=0xA(idx10 0x9A6759)
+    setb(3,   0x23);                          // cell1  : hi=2(0x68372B)   lo=3(0x70A4B2)
+    setb(42,  0x45);                          // cell40 : hi=4(0x6F3D86)   lo=5(0x588D43)  (cellY=1,cellX=0)
+    // Bitmap: file offset 1026 + off, where off = (y&~7)*40 + (x&~7) + (y&7).
+    setb(1026, 0x80);   // off0   : (x0..7,y0) row0 cell0 → MSB set: px(0,0) set, px(1,0) clear
+    setb(1027, 0x00);   // off1   : (x0..7,y1) row1 cell0 → all clear
+    setb(1034, 0x01);   // off8   : (x8..15,y0) row0 cell1 → LSB set: px(8,0) clear, px(15,0) set
+    setb(1346, 0x80);   // off320 : (x0..7,y8) row0 cell40 → MSB set: px(0,8) set
+    QImage im=RasterExtra::decodeData(b,"dd");
+    check(!im.isNull() && im.size()==QSize(320,200)
+        && im.pixelColor(0,0)  ==QColor(0xFF,0xFF,0xFF)   // set bit → hi nibble 1 = white
+        && im.pixelColor(1,0)  ==QColor(0x9A,0x67,0x59)   // clear bit → lo nibble 0xA = idx10
+        && im.pixelColor(0,1)  ==QColor(0x9A,0x67,0x59)   // row1 within same cell, clear → lo
+        && im.pixelColor(15,0) ==QColor(0x68,0x37,0x2B)   // cell1, rightmost set → hi nibble 2
+        && im.pixelColor(8,0)  ==QColor(0x70,0xA4,0xB2)   // cell1, leftmost clear → lo nibble 3
+        && im.pixelColor(0,8)  ==QColor(0x6F,0x3D,0x86),  // cellY=1, set → hi nibble 4
+        "C64Doodle hi-res cell/nibble decode");
+    // Negative: a truncated buffer (9025 bytes) must be rejected by the exact-size guard.
+    QImage im2=RasterExtra::decodeData(b.left(9025),"dd");
+    check(im2.isNull(), "C64Doodle wrong-size rejected");
+}
+      }
+      // ---- MSX SCREEN 2 ----
+      {
+{
+    // MSXSC2: BSAVE-headered 256x192 SCREEN 2 VRAM dump, built byte-by-byte from the spec.
+    QByteArray v(16384, '\0');                  // 16384-byte VRAM, all zero
+    v[0]      = char(0x80);                      // pattern char0 row0: only MSB set -> leftmost px on
+    v[0x2000] = char(0xF2);                      // colour  char0 row0: fg=15 (white) / bg=2 (green)
+    QByteArray b;
+    auto put8=[&](int val){ b.append(char(val&0xff)); };
+    auto le16=[&](int val){ b.append(char(val&0xff)); b.append(char((val>>8)&0xff)); };
+    put8(0xFE);                                  // BSAVE marker
+    le16(0x0000);                                // start address
+    le16(0x3FFF);                                // end address
+    le16(0x0000);                                // exec address
+    b.append(v);                                 // 7 + 16384 = 16391 bytes total
+    QImage im = RasterExtra::decodeData(b, "sc2");
+    check(!im.isNull() && im.size()==QSize(256,192)
+          && im.pixelColor(0,0)==QColor(0xFF,0xFF,0xFF)     // bit=1 -> foreground = white
+          && im.pixelColor(1,0)==QColor(0x21,0xC8,0x42),    // bit=0 -> background = medium green
+          "MSXSC2 pattern/colour decode + TMS9918 palette");
+    // Negative: any non-canonical size must be rejected (16390 != 16391 and != 16384).
+    QImage bad = RasterExtra::decodeData(b.left(16390), "sc2");
+    check(bad.isNull(), "MSXSC2 rejects truncated/wrong-size buffer");
+}
+      }
+      // ---- Apple II HGR ----
+      {
+{
+    // --- APPLE2HGR (.hgr) hermetic test, built byte-by-byte from the RECOIL spec layout ---
+    // 8192-byte Apple II hi-res page, 280x192, MONOCHROME. Each byte holds 7 pixels in
+    // bits 0..6 (bit0 = leftmost); bit7 is the palette bit and is IGNORED by RECOIL_DecodeHgr.
+    // Row address is NON-LINEAR: lineOffset(y) = (y&7)<<10 | (y&56)<<4 | (y>>6)*40.
+    QByteArray b(8192, '\0');
+    // y=0 row starts at offset 0. Byte 0 = 0x81 = 0b1000_0001:
+    //   bit0=1 -> pixel(0,0) WHITE; bits1..6=0 -> pixels(1..6,0) BLACK; bit7=1 -> IGNORED.
+    b[0] = char(0x81);
+    // y=8 row starts at offset (8&56)<<4 = 8<<4 = 128 (NOT 8*40=320) — tests the non-linear map.
+    //   byte 128 = 0x01 -> bit0 -> pixel(0,8) WHITE.
+    b[128] = char(0x01);
+    // last pixel: y=191 -> lineOffset = 7*0x400 + 7*0x80 + 2*0x28 = 7168+896+80 = 8144.
+    //   x=279 -> off = 8144 + 279/7 = 8183; 279%7 = 6 -> bit6. byte 8183 = 0x40 -> pixel(279,191) WHITE.
+    b[8183] = char(0x40);
+    QImage im = RasterExtra::decodeData(b, "hgr");
+    check(!im.isNull() && im.size()==QSize(280,192)
+          && im.pixelColor(0,0)==QColor(255,255,255)      // bit0 set
+          && im.pixelColor(1,0)==QColor(0,0,0)            // bit1 clear (bit7 set but ignored)
+          && im.pixelColor(0,8)==QColor(255,255,255)      // non-linear row address (offset 128)
+          && im.pixelColor(279,191)==QColor(255,255,255), // last pixel, bit6 at offset 8183
+          "APPLE2HGR 280x192 mono, non-linear rows, bit7 ignored");
+    // Negative: wrong/truncated size must be rejected by the fixed-size guard.
+    QByteArray bad(8184, '\0');
+    QImage imBad = RasterExtra::decodeData(bad, "hgr");
+    check(imBad.isNull(), "APPLE2HGR rejects wrong-size buffer");
+}
+      }
+      // ---- Atari 8-bit Micropainter ----
+      {
+{
+    // Build a spec-layout Micro Painter (.mic) file INDEPENDENTLY, byte by byte.
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    // Screen row 0, byte 0 = 0x1B = 0b00_01_10_11 -> pixels x=0,1,2,3 have values 0,1,2,3.
+    put8(0x1B);
+    for(int i = 1; i < 7680; i++) put8(0x00);   // remaining 7679 screen bytes -> value 0 everywhere else
+    // Trailing 4 colour registers in the REAL Micro Painter file order 712,708,709,710 =
+    // COLBK, COLPF0, COLPF1, COLPF2 (verified vs cyberroach/ANALOG + atariki), i.e. p[7680+v]=value-v.
+    // Use hue==0 (grayscale) registers so expected RGB = luma*17 exactly (independent of chroma formula).
+    put8(0x00);   // @7680 COLBK  -> pixel value 0 -> luma  0 -> black (0,0,0)
+    put8(0x0E);   // @7681 COLPF0 -> pixel value 1 -> luma 14 -> gray 14*17 = 238
+    put8(0x08);   // @7682 COLPF1 -> pixel value 2 -> luma  8 -> gray  8*17 = 136
+    put8(0x04);   // @7683 COLPF2 -> pixel value 3 -> luma  4 -> gray  4*17 =  68
+    // b now = 7680 screen + 4 palette = 7684 bytes.
+    QImage im = RasterExtra::decodeData(b, "mic");
+    check(!im.isNull() && im.size() == QSize(160, 192)
+        && im.pixelColor(0, 0) == QColor(0,   0,   0)    // value 0 -> COLBK
+        && im.pixelColor(1, 0) == QColor(238, 238, 238)  // value 1 -> COLPF0
+        && im.pixelColor(2, 0) == QColor(136, 136, 136)  // value 2 -> COLPF1
+        && im.pixelColor(3, 0) == QColor(68,  68,  68),  // value 3 -> COLPF2
+        "Atari Micro Painter .mic 160x192 4-colour grayscale palette");
+    // Negative test: truncated / wrong-size buffer must be rejected.
+    QByteArray bad = b.left(7683);
+    check(RasterExtra::decodeData(bad, "mic").isNull(),
+        "Atari .mic rejects wrong-size/truncated input");
+}
+      }
+
+      // ===== Fleet-7: Falcon TrueColor / MSX2-SC5 / Amiga RGB8 / Spectrum512 / Atari Imagic (retro, RECOIL-verified) =====
+      // ---- Atari Falcon TrueColor ----
+      {
+{
+    // --- Build a valid .tru byte-by-byte from the RECOIL DecodeTru layout ---
+    // Header (256 bytes): "Indy" magic, width BE @4, height BE @6, rest padding.
+    // Data @256: 2x2 RGB565 big-endian, row-major (p0=(0,0),p1=(1,0),p2=(0,1),p3=(1,1)).
+    QByteArray b;
+    auto put8 =[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    b.append("Indy", 4);          // offset 0..3  : magic
+    be16(2);                      // offset 4..5  : width  = 2  (big-endian)
+    be16(2);                      // offset 6..7  : height = 2  (big-endian)
+    while(b.size() < 256) put8(0);// pad header to dataOffset 256
+    // pixel words (RGB565 big-endian):
+    be16(0xF800);                 // (0,0) full red   -> 255,0,0
+    be16(0x07E0);                 // (1,0) full green -> 0,255,0
+    be16(0x001F);                 // (0,1) full blue  -> 0,0,255
+    be16(0xFFFF);                 // (1,1) white      -> 255,255,255
+    QImage im = RasterExtra::decodeData(b, "tru");
+    check(!im.isNull() && im.size()==QSize(2,2)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(1,0)==QColor(0,255,0)
+          && im.pixelColor(0,1)==QColor(0,0,255)
+          && im.pixelColor(1,1)==QColor(255,255,255),
+          "FalconTru .tru RGB565-BE Indy header");
+    // Negative: truncate by one pixel word -> size no longer 256+w*h*2 -> reject.
+    QByteArray bad = b; bad.chop(2);
+    QImage imBad = RasterExtra::decodeData(bad, "tru");
+    check(imBad.isNull(), "FalconTru rejects wrong-size buffer");
+}
+      }
+      // ---- MSX2 SCREEN 5 ----
+      {
+{
+    // Build a full-page .sc5 byte-by-byte from the spec (RECOIL DecodeSc5 layout).
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    auto le16 = [&](int v){ b.append(char(v & 0xff)); b.append(char((v >> 8) & 0xff)); };
+
+    // BSAVE header: 0xFE, start=0x0000, end=0x7FFF, exec=0x0000
+    //   -> height = (0x7FFF+1)>>7 = 256, clamped to 212.
+    put8(0xFE); le16(0x0000); le16(0x7FFF); le16(0x0000);
+
+    // VRAM page = 32768 bytes (file total 32775). Zero-filled base.
+    QByteArray vram(32768, '\0');
+
+    // Bitmap byte 0 (row 0, cols 0-1) = 0x12 -> px(0,0)=high nibble=1, px(1,0)=low nibble=2.
+    vram[0] = char(0x12);
+
+    // Palette at VRAM 0x7680 (file 0x7687), entries {0RRR0BBB, 00000GGG}.
+    int po = 0x7680;
+    vram[po + 0] = char(0x07); vram[po + 1] = char(0x00); // idx0: R0 G0 B7 -> blue  (0,0,255)
+    vram[po + 2] = char(0x70); vram[po + 3] = char(0x00); // idx1: R7 G0 B0 -> red   (255,0,0)
+    vram[po + 4] = char(0x00); vram[po + 5] = char(0x07); // idx2: R0 G7 B0 -> green (0,255,0)
+
+    b.append(vram);
+
+    QImage im = RasterExtra::decodeData(b, "sc5");
+    check(!im.isNull() && im.size() == QSize(256, 212)
+        && im.pixelColor(0, 0) == QColor(255, 0, 0)   // idx1 red
+        && im.pixelColor(1, 0) == QColor(0, 255, 0),  // idx2 green
+        "sc5 SCREEN5 4bpp + V9938 palette");
+
+    // Negative: truncated buffer must be rejected.
+    QImage bad = RasterExtra::decodeData(b.left(100), "sc5");
+    check(bad.isNull(), "sc5 truncated rejected");
+}
+      }
+      // ---- Amiga IFF RGB8/RGBN ----
+      {
+{
+    // AMIGARGB8 — build a minimal FORM....RGB8 file byte-by-byte from the spec layout.
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](unsigned v){ b.append(char((v>>24)&0xff)); b.append(char((v>>16)&0xff));
+                               b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto tag=[&](const char* s){ b.append(s,4); };
+
+    tag("FORM"); be32(0);            // form size (decoder ignores; bounds come from n)
+    tag("RGB8");
+    // BMHD chunk: 20 bytes of data (Amiga standard header)
+    tag("BMHD"); be32(20);
+    be16(4);                          // @0  w = 4
+    be16(1);                          // @2  h = 1
+    be16(0); be16(0);                 // @4  x/y origin
+    put8(25);                         // @8  nPlanes = 25 (RGB8 marker)
+    put8(0);                          // @9  masking
+    put8(4);                          // @10 compression = 4 (RLE)
+    put8(0);                          // @11 pad
+    be16(0);                          // @12 transparentColor
+    put8(1); put8(1);                 // @14 x/y aspect
+    be16(0); be16(0);                 // @16 page w/h
+    // BODY chunk: 3 RLE units (13 bytes) painting a 4x1 row.
+    tag("BODY"); be32(13);
+    put8(255); put8(0);   put8(0);   put8(1);   // red,   ctrl=1 -> 1 px  @x0
+    put8(0);   put8(255); put8(0);   put8(1);   // green, ctrl=1 -> 1 px  @x1
+    put8(0);   put8(0);   put8(255); put8(0);   // blue,  ctrl=0 -> extended count...
+    put8(2);                                    //   ...following byte = 2 -> 2 px @x2,x3
+
+    QImage im=RasterExtra::decodeData(b,"rgb8");
+    check(!im.isNull() && im.size()==QSize(4,1)
+        && im.pixelColor(0,0)==QColor(255,0,0)
+        && im.pixelColor(1,0)==QColor(0,255,0)
+        && im.pixelColor(2,0)==QColor(0,0,255)
+        && im.pixelColor(3,0)==QColor(0,0,255), "AMIGARGB8 RGB8 chunky RLE + extended count");
+
+    // Negative: truncate the BODY data — chunk-walk must reject and return a null image.
+    QByteArray bad=b.left(b.size()-6);
+    QImage imb=RasterExtra::decodeData(bad,"rgb8");
+    check(imb.isNull(), "AMIGARGB8 truncated BODY rejected");
+
+    // Regression: a FULLY-resolved 0-length run (primary count 0 + ext byte 0 + ext word 0)
+    // must still emit exactly ONE pixel and keep reading the stream — NOT flood the rest of the
+    // frame with one colour (the review-confirmed count-goes-negative desync).
+    QByteArray z;
+    auto zp8=[&](int v){ z.append(char(v&0xff)); };
+    auto zb16=[&](int v){ z.append(char((v>>8)&0xff)); z.append(char(v&0xff)); };
+    auto zb32=[&](unsigned v){ for(int s=24;s>=0;s-=8) z.append(char((v>>s)&0xff)); };
+    auto ztag=[&](const char* s){ z.append(s,4); };
+    ztag("FORM"); zb32(0); ztag("RGB8");
+    ztag("BMHD"); zb32(20);
+    zb16(2); zb16(1); zb16(0); zb16(0);           // w=2 h=1
+    zp8(25); zp8(0); zp8(4); zp8(0);              // nPlanes=25, comp=4
+    zb16(0); zp8(1); zp8(1); zb16(0); zb16(0);
+    ztag("BODY"); zb32(11);
+    zp8(10); zp8(20); zp8(30); zp8(0x00);         // run1 rgb + primary count 0
+    zp8(0x00);                                    //   ext byte 0
+    zp8(0x00); zp8(0x00);                         //   ext word 0 -> resolved count 0 -> emits 1 px
+    zp8(40); zp8(50); zp8(60); zp8(0x01);         // run2 rgb + count 1 -> paints pixel 1
+    QImage imz=RasterExtra::decodeData(z,"rgb8");
+    check(!imz.isNull() && imz.size()==QSize(2,1)
+        && imz.pixelColor(0,0)==QColor(10,20,30)
+        && imz.pixelColor(1,0)==QColor(40,50,60),   // NOT (10,20,30) — the desync bug would flood it
+        "AMIGARGB8 zero-length run emits one pixel then advances (no RLE desync)");
+}
+      }
+      // ---- Atari Spectrum 512 ----
+      {
+{
+    // Build a byte-exact Spectrum 512 .spu (51104 bytes) INDEPENDENTLY from the spec.
+    //   [0..31999]    ST low-res bitmap (all zero  -> every pixel base colour c=0)
+    //   [32000..51103] palette: 199 scanlines * 96 bytes (48 STe words each)
+    // All palette words zero except two, so IsStePalette is false (ST 3-bit model):
+    //   word 0  of scanline 0 @32000 : r&7=7            -> (7<<5)|(7<<2)|(7>>1)=255  => red
+    //   word 32 of scanline 0 @32064 : gb&7=7 (blue)                                  => blue
+    QByteArray b(51104, '\0');
+    b[32000] = char(0x07); b[32001] = char(0x00);   // scanline0 colour0  = ST red
+    b[32064] = char(0x00); b[32065] = char(0x07);   // scanline0 colour32 = ST blue
+    QImage im = RasterExtra::decodeData(b, "spu");
+    // Pixel (0,0): column 0, c=0, x1=1 -> left zone -> palette word 0  -> red.
+    // Pixel (200,0): column 200 >= x1+160(=161) -> right zone -> c=32 -> palette word 32 -> blue.
+    check(!im.isNull() && im.size()==QSize(320,199)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(200,0)==QColor(0,0,255), "SPECTRUM512 spu decodes zones + STe 3-bit palette");
+    // Negative: truncated (51103 bytes) must be rejected.
+    QByteArray bad = b; bad.chop(1);
+    QImage imbad = RasterExtra::decodeData(bad, "spu");
+    check(imbad.isNull(), "SPECTRUM512 rejects wrong-size buffer");
+}
+      }
+      // ---- Atari Imagic ----
+      {
+{
+    // Build a valid Atari Imagic (.ic1) low-res file BYTE-BY-BYTE from the RECOIL spec layout.
+    // Body is 32000 bytes of 0xFF -> every bitplane word 0xFFFF -> every pixel index 15.
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    // [0..3] magic
+    b.append("IMDC",4);
+    // [4] reserved 0
+    put8(0x00);
+    // [5] resolution/mode = 0 (low 320x200, 4 planes)
+    put8(0x00);
+    // [6..37] 16 ST palette words (byte0=0000 0RRR, byte1=0GGG 0BBB); index 15 = red(7,0,0)
+    for(int i=0;i<16;i++){ if(i==15){ put8(0x07); put8(0x00); } else { put8(0x00); put8(0x00); } }
+    // [38..63] filler
+    for(int i=38;i<64;i++) put8(0x00);
+    // [0x40],[0x41] fixed sentinel 0xC8 0x02
+    put8(0xC8); put8(0x02);
+    // [0x42] RLE escape byte
+    put8(0x80);
+    // [0x43..] RLE stream: one long run of 0xFF, count 32000 = 257 + 123*256 + 255
+    put8(0x80);                         // escape -> start a command
+    put8(0x01);                         // command b2==1 -> ReadCount long run
+    for(int i=0;i<123;i++) put8(0x01);  // ReadCount: 123 * 256  (c = 257 + 31488 = 31745)
+    put8(0x00);                         // terminator (!=1) ends the ReadCount loop, consumed/discarded
+    put8(0xFF);                         // final ReadCount byte 255 -> c = 32000
+    put8(0xFF);                         // run value = 0xFF
+    QImage im=RasterExtra::decodeData(b,"ic1");
+    check(!im.isNull() && im.size()==QSize(320,200)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(319,199)==QColor(255,0,0), "Atari Imagic .ic1 low-res 320x200 red");
+    // Negative: truncated buffer (n<68, header incomplete) must be rejected.
+    QImage bad=RasterExtra::decodeData(b.left(60),"ic1");
+    check(bad.isNull(), "Atari Imagic truncated buffer rejected");
+}
+      }
+
+      // ===== Fleet-8: MAG / PI / Amstrad CPC / Amiga SHAM / Sam Coupe (retro, RECOIL/spec-anchored) =====
+      // ---- MAG Maki-chan ----
+      {
+{
+    // Hermetic MAG built byte-by-byte from the spec (independent of the decoder).
+    // 8x2, 16-colour, all-literal (no deltas). Palette entry c = qRgb(c*17, (15-c)*17, 0),
+    // stored G,R,B; c*17 = (c<<4)|c so values are platform-restriction-invariant.
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le32=[&](quint32 v){ put8(v&0xff); put8((v>>8)&0xff); put8((v>>16)&0xff); put8((v>>24)&0xff); };
+    b.append("MAKI02  ", 8);      // signature (no trailing NUL, exactly 8 bytes)
+    put8(0x1A);                   // empty comment terminator -> headerOffset = 9
+    // ---- header block (80 bytes) ----
+    put8(0x00);                   // +0  reserved (must be 0)
+    put8(98);                     // +1  machine = PC981X1
+    put8(0);                      // +2  screen mode
+    put8(0);                      // +3  flags (<128 -> 16 colours)
+    put8(0); put8(0);             // +4,+5  x1 = 0
+    put8(0); put8(0);             // +6,+7  y1 = 0
+    put8(7); put8(0);             // +8,+9  x2 = 7 -> width = 8
+    put8(1); put8(0);             // +10,+11 y2 = 1 -> height = 2
+    le32(80);                     // +12 flag-A offset (rel) -> file 89
+    le32(81);                     // +16 flag-B offset (rel) -> file 90 (unused: all bits 0)
+    le32(0);                      // +20 flag-B size
+    le32(82);                     // +24 pixel offset (rel) -> file 91
+    le32(0);                      // +28 pixel size
+    for(int c=0;c<16;c++){ put8((15-c)*17); put8(c*17); put8(0); }   // +32..79 palette G,R,B
+    // ---- data sections ----
+    put8(0x00);                   // file 89: flag-A = 2 zero bits (one byte) -> every cell literal
+    put8(0x00);                   // file 90: flag-B placeholder (never read)
+    // file 91..98: pixel bytes, 2 pixels/byte, line0 then line1
+    put8(0x01); put8(0x23); put8(0x45); put8(0x67);   // line0 px 0..7
+    put8(0x89); put8(0xAB); put8(0xCD); put8(0xEF);   // line1 px 8..15
+    QImage im = RasterExtra::decodeData(b, "mag");
+    check(!im.isNull() && im.size()==QSize(8,2)
+          && im.pixelColor(0,0)==QColor(0,255,0)      // px index 0 -> pal[0]
+          && im.pixelColor(7,0)==QColor(119,136,0)    // px index 7 -> pal[7]
+          && im.pixelColor(0,1)==QColor(136,119,0)    // px index 8 -> pal[8]
+          && im.pixelColor(7,1)==QColor(255,0,0),     // px index 15 -> pal[15]
+          "MAG MAKI02 16-colour literal decode");
+    // Negative: corrupt the signature -> must reject.
+    QByteArray bad = b; bad[3] = 'X';                 // "MAKX02  "
+    check(RasterExtra::decodeData(bad, "mag").isNull(), "MAG bad-magic rejected");
+}
+      }
+      // ---- PI Yanagisawa ----
+      {
+{
+    // ---- Build a valid 2x2, 16-colour PI file byte-by-byte (SPEC layout) ----
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    // Signature "Pi"
+    put8('P'); put8('i');
+    // Empty comment, terminated by 0x1A
+    put8(0x1A);
+    // --- real header starts at first 0x00 after 0x1A ---
+    put8(0x00);          // header[0] : always 0x00
+    put8(0x00);          // mode
+    put8(0x00);          // aspect X
+    put8(0x00);          // aspect Y
+    put8(0x04);          // bitdepth 4 => 16 colours
+    put8(0); put8(0); put8(0); put8(0);   // 4-byte compressor model signature
+    put8(0x00); put8(0x00);               // compressor-specific data size = 0 (be16)
+    put8(0x00); put8(0x02);               // width  = 2 (big-endian u16)
+    put8(0x00); put8(0x02);               // height = 2 (big-endian u16)
+    // Palette: 16 RGB triplets. colour0 = (10,20,30), colour15 = (200,100,50).
+    put8(10); put8(20); put8(30);         // index 0
+    for (int c = 1; c < 15; c++) { put8(0); put8(0); put8(0); }   // 1..14
+    put8(200); put8(100); put8(50);       // index 15
+    // Pixel bitstream (MSB-first). Hand-encoded to yield indices [0,15,15,15]:
+    //  delta 0  = "10"      (colour 0, a=0)
+    //  delta 1  = "11"      (colour 15)
+    //  rep-seq  : loc "00", len "0" (=>0 bytes after first-repeat minus-2),
+    //             then loc "00" (== prev) => stop  => "00 0 00"
+    //  delta 0  = "10"      (colour 15, a=15)
+    //  delta 0  = "10"      (colour 15) -> buffer full
+    //  bits: 10 11 00 0 00 10 10  = 1011000 0 0101 0  -> bytes 0xB0, 0x50
+    put8(0xB0); put8(0x50);
+
+    QImage im = RasterExtra::decodeData(b, "pi");
+    check(!im.isNull() && im.size() == QSize(2, 2)
+          && im.pixelColor(0, 0) == QColor(10, 20, 30)
+          && im.pixelColor(1, 0) == QColor(200, 100, 50)
+          && im.pixelColor(0, 1) == QColor(200, 100, 50)
+          && im.pixelColor(1, 1) == QColor(200, 100, 50),
+          "PI 2x2 16-colour delta+repetition decode");
+
+    // Negative: truncated (palette cut off) must be rejected.
+    QImage imTrunc = RasterExtra::decodeData(b.left(20), "pi");
+    check(imTrunc.isNull(), "PI truncated buffer rejected");
+
+    // Negative: bad magic must be rejected.
+    QByteArray bad = b; bad[0] = 'X';
+    check(RasterExtra::decodeData(bad, "pi").isNull(), "PI bad magic rejected");
+}
+      }
+      // ---- Amstrad CPC ----
+      {
+{
+    // Build a byte-exact mode-1 CPC "SCR + OCP palette" file independently from
+    // the spec layout (not via the decoder).
+    // Layout: 16384-byte screen dump + 239-byte palette block = 16623 bytes.
+    QByteArray b(16623, '\0');
+
+    // --- Screen dump (mode 1, 4px/byte). Row y=0 -> lineOff 0.
+    // Pixel x uses byte (x>>2), shift (~x&3), idx = ((bit0)<<1)+(bit4).
+    // byte[0]=0 -> pixels 0..3 all decode to ink index 0.
+    // byte[1]=0x88 (bit7|bit3): x=4 -> b=0x88>>3=0x11 -> bit0=1,bit4=1 -> idx=3.
+    b[1] = char(0x88);
+
+    // --- OCP palette block at offset 16384.
+    const int base = 16384;
+    b[base + 0] = char(1);                 // pal[0] = mode 1
+    for (int i = 0; i < 16; i++)           // every ink must be 64..95 (else reject)
+        b[base + 3 + i * 12] = char(64);   // default: hw colour 64 -> AMSTRAD_PALETTE[0]
+    // Distinct inks (values are hardware colour 64..95 -> AMSTRAD_PALETTE[c-64]):
+    b[base + 3 + 0 * 12] = char(84);       // ink0: idx20 = 0x000000 (black)
+    b[base + 3 + 1 * 12] = char(75);       // ink1: idx11 = 0xFFFFFF (white)
+    b[base + 3 + 2 * 12] = char(76);       // ink2: idx12 = 0xFF0000 (red)
+    b[base + 3 + 3 * 12] = char(78);       // ink3: idx14 = 0xFF8000 (orange)
+
+    QImage im = RasterExtra::decodeData(b, "cpc");
+    check(!im.isNull() && im.size() == QSize(320, 200)
+          && im.pixelColor(0, 0) == QColor(0, 0, 0)            // ink0 black
+          && im.pixelColor(4, 0) == QColor(0xFF, 0x80, 0x00),  // ink3 orange
+          "AmstradCpc mode1 SCR+PAL");
+
+    // Negative: truncated buffer must be rejected (wrong size, no magic match).
+    QByteArray bad = b.left(16000);
+    check(RasterExtra::decodeData(bad, "cpc").isNull(), "AmstradCpc rejects short");
+}
+      }
+      // ---- Amiga SHAM sliced-HAM ----
+      {
+{
+    // Build a 2x2 HAM6 SHAM ILBM byte-by-byte from the spec layout (independent of the decoder).
+    auto be16=[&](QByteArray&b,int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto be32=[&](QByteArray&b,quint32 v){ b.append(char((v>>24)&0xff)); b.append(char((v>>16)&0xff)); b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    auto chunk=[&](QByteArray&b,const char* id,const QByteArray&d){ b.append(id,4); be32(b,(quint32)d.size()); b.append(d); if(d.size()&1) b.append(char(0)); };
+
+    // BMHD (20 bytes): w=2,h=2,x=0,y=0,nPlanes=6,masking=0,compression=0,pad=0,
+    //   transparentColor=0,xAspect=1,yAspect=1,pageW=2,pageH=2
+    QByteArray bmhd;
+    be16(bmhd,2); be16(bmhd,2); be16(bmhd,0); be16(bmhd,0);
+    bmhd.append(char(6)); bmhd.append(char(0)); bmhd.append(char(0)); bmhd.append(char(0));
+    be16(bmhd,0); bmhd.append(char(1)); bmhd.append(char(1)); be16(bmhd,2); be16(bmhd,2);
+
+    // CAMG: HAM viewport bit 0x0800 (not required by the decoder, present for realism)
+    QByteArray camg; be32(camg,0x0800);
+
+    // SHAM: u16 version=0, then 2 slices of 16 RGB4 words (32 bytes each).
+    //   slice0 word0 = 0x0F00 -> R=15 -> red;  slice1 word0 = 0x000F -> B=15 -> blue.
+    QByteArray sham; be16(sham,0);
+    be16(sham,0x0F00); for(int i=1;i<16;i++) be16(sham,0);   // line 0 palette (entry 0 = red)
+    be16(sham,0x000F); for(int i=1;i<16;i++) be16(sham,0);   // line 1 palette (entry 0 = blue)
+    // sliceCount = (66-2)/32 = 2 == height -> shift 0 -> one palette per line.
+
+    // BODY uncompressed (compression=0): 6 planes x 2 rows, planeRowBytes = ((2+15)/16)*2 = 2.
+    //   Row0: pixel(0,0) idx=0 (ctrl0,v0 -> palette entry 0 = red);
+    //         pixel(1,0) idx=31 = 0b011111 (ctrl=1 modify-Blue, v=15 -> B=255) -> magenta over held red.
+    //         x=1 is bit 6 (0x40); planes 0..4 set on x1, plane5 clear.
+    //   Row1: all zero -> both pixels ctrl0,v0 -> palette entry 0 = blue.
+    QByteArray body;
+    for(int pl=0; pl<6; pl++){ body.append(char(pl<5?0x40:0x00)); body.append(char(0)); } // row0 (12 bytes)
+    for(int pl=0; pl<6; pl++){ body.append(char(0)); body.append(char(0)); }               // row1 (12 bytes)
+
+    QByteArray inner; inner.append("ILBM",4);
+    chunk(inner,"BMHD",bmhd);
+    chunk(inner,"CAMG",camg);
+    chunk(inner,"SHAM",sham);
+    chunk(inner,"BODY",body);
+    QByteArray b; b.append("FORM",4); be32(b,(quint32)inner.size()); b.append(inner);
+
+    QImage im=RasterExtra::decodeData(b,"sham");
+    check(!im.isNull() && im.size()==QSize(2,2)
+        && im.pixelColor(0,0)==QColor(255,0,0)       // line0 palette entry 0 = red
+        && im.pixelColor(1,0)==QColor(255,0,255)     // HAM modify-Blue over held red = magenta
+        && im.pixelColor(0,1)==QColor(0,0,255)       // line1 palette entry 0 = blue
+        && im.pixelColor(1,1)==QColor(0,0,255),      // held blue
+        "AmigaSham HAM6 per-scanline palette + HAM modify");
+
+    // Negative: truncated buffer must return isNull.
+    QImage im2=RasterExtra::decodeData(b.left(10),"sham");
+    check(im2.isNull(), "AmigaSham rejects truncated input");
+}
+      }
+      // ---- Sam Coupe ----
+      {
+{
+    // Build a SAM Coupe MODE-4 raw dump byte-by-byte per the spec layout:
+    // 128 bytes/line * 192 lines = 24576 bytes, 2 pixels/byte (high nibble = left).
+    QByteArray b(24576, '\0');
+    // Line 0, byte 0 = 0x10: high nibble 1 (left pixel x=0 -> pal[1]),
+    //                        low  nibble 0 (pixel x=1 -> pal[0]).
+    b[0] = char(0x10);
+    // Line 3, byte 0 = 0xF0: high nibble 15 (x=0 -> pal[15]), low nibble 0 (x=1 -> pal[0]).
+    b[3 * 128] = char(0xF0);
+
+    // Expected default-palette colours via RECOIL_GetSamCoupeColor:
+    //   defPal[0]=0   -> (0,0,0)
+    //   defPal[1]=16  -> bit4 -> B|=0x92 -> (0,0,146)
+    //   defPal[15]=120=0x78 bits3,4,5,6 -> each chan 0x92|0x24 = 0xB6 = 182 -> (182,182,182)
+    QImage im = RasterExtra::decodeData(b, "dmp");
+    check(!im.isNull() && im.size() == QSize(256, 192)
+          && im.pixelColor(0, 0) == QColor(0, 0, 146)
+          && im.pixelColor(1, 0) == QColor(0, 0, 0)
+          && im.pixelColor(0, 3) == QColor(182, 182, 182)
+          && im.pixelColor(1, 3) == QColor(0, 0, 0),
+          "SamCoupe MODE4 dmp default palette");
+
+    // Negative: wrong size must return a null image.
+    QByteArray bad(1000, '\0');
+    QImage imBad = RasterExtra::decodeData(bad, "dmp");
+    check(imBad.isNull(), "SamCoupe rejects wrong-size buffer");
+}
+      }
+
+      // ===== Fleet-9: FLIC / MAKI01 / BBC Micro / Thomson / Sinclair QL (retro; FFmpeg/GrafX2/sQLux/RECOIL-anchored) =====
+      // ---- Autodesk FLIC ----
+      {
+{
+    // ============ FLIC test 1: FLC + FLI_COLOR256 + FLI_COPY ============
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    auto le16 = [&](int v){ b.append(char(v & 0xff)); b.append(char((v >> 8) & 0xff)); };
+    auto le32 = [&](quint32 v){ for (int s = 0; s < 32; s += 8) b.append(char((v >> s) & 0xff)); };
+
+    // --- 128-byte file header ---
+    le32(0);          // @0  file size (not validated)
+    le16(0xAF12);     // @4  magic = FLC
+    le16(1);          // @6  frames
+    le16(4);          // @8  width  = 4
+    le16(2);          // @10 height = 2
+    le16(8);          // @12 depth  = 8bpp
+    while (b.size() < 128) put8(0);           // pad rest of header
+
+    // --- frame header (16 bytes) @128 ---
+    le32(52);         // @0 frame size = 16 + 22 + 14
+    le16(0xF1FA);     // @4 frame magic
+    le16(2);          // @6 chunk count
+    for (int i = 0; i < 8; ++i) put8(0);      // 8 reserved bytes
+
+    // --- chunk 1: FLI_COLOR256 (type 4), csize = 6 + 16 = 22 ---
+    le32(22);
+    le16(4);
+    le16(1);          // 1 packet
+    put8(0);          // skip 0
+    put8(4);          // change 4 colours (indices 0..3)
+    put8(10);  put8(20);  put8(30);           // idx0
+    put8(40);  put8(50);  put8(60);           // idx1
+    put8(70);  put8(80);  put8(90);           // idx2
+    put8(100); put8(110); put8(120);          // idx3
+
+    // --- chunk 2: FLI_COPY (type 16), csize = 6 + 8 = 14 ---
+    le32(14);
+    le16(16);
+    put8(0); put8(1); put8(2); put8(3);       // row 0
+    put8(3); put8(2); put8(1); put8(0);       // row 1
+
+    QImage im = RasterExtra::decodeData(b, "flc");
+    check(!im.isNull() && im.size() == QSize(4, 2)
+          && im.pixelColor(0, 0) == QColor(10, 20, 30)
+          && im.pixelColor(3, 0) == QColor(100, 110, 120)
+          && im.pixelColor(0, 1) == QColor(100, 110, 120)
+          && im.pixelColor(3, 1) == QColor(10, 20, 30),
+          "FLIC FLC COLOR256 + COPY first frame");
+
+    // ============ FLIC test 2: FLI + FLI_BRUN (default gray palette) ============
+    b.clear();
+    le32(0);          // @0  file size
+    le16(0xAF11);     // @4  magic = FLI
+    le16(1);          // @6  frames
+    le16(4);          // @8  width  = 4
+    le16(1);          // @10 height = 1
+    le16(8);          // @12 depth
+    while (b.size() < 128) put8(0);
+
+    le32(27);         // frame size = 16 + 11
+    le16(0xF1FA);     // frame magic
+    le16(1);          // 1 chunk
+    for (int i = 0; i < 8; ++i) put8(0);
+
+    le32(11);         // FLI_BRUN chunk, csize = 6 + 5
+    le16(15);
+    put8(2);          // per-line packet count (advisory, ignored)
+    put8(3);          // run = +3  -> repeat next value 3x
+    put8(5);          //   value = index 5
+    put8(0xFF);       // run = -1  -> 1 literal byte
+    put8(7);          //   literal = index 7
+    // identity-gray fallback palette: idx k -> (k,k,k)
+
+    QImage im2 = RasterExtra::decodeData(b, "fli");
+    check(!im2.isNull() && im2.size() == QSize(4, 1)
+          && im2.pixelColor(0, 0) == QColor(5, 5, 5)
+          && im2.pixelColor(2, 0) == QColor(5, 5, 5)
+          && im2.pixelColor(3, 0) == QColor(7, 7, 7),
+          "FLIC FLI BRUN scanline RLE");
+
+    // ============ negative: truncated / bad-magic buffer ============
+    QByteArray bad(64, '\0');   // < 128 bytes, no valid header
+    QImage imn = RasterExtra::decodeData(bad, "flc");
+    check(imn.isNull(), "FLIC rejects truncated header");
+}
+      }
+      // ---- MAKI01 ----
+      {
+{
+    // --- Build a valid MAKI01A file byte-by-byte per the RECOIL spec layout ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    // offset 0..7: signature "MAKI01A "
+    const char sig[8] = {'M','A','K','I','0','1','A',' '};
+    for(int i=0;i<8;i++) put8(sig[i]);
+    // offset 8..39: reserved / platform / comment (ignored by decode) -> zeros
+    for(int i=8;i<40;i++) put8(0);
+    // offset 40..43: must be zero
+    for(int i=0;i<4;i++) put8(0);
+    // offset 44..47: fixed screen bounds bytes {2,128,1,144} (= BE 640, BE 400)
+    put8(2); put8(128); put8(1); put8(144);
+    // offset 48..95: 16-entry palette, 3 bytes each in G,R,B order
+    //   c0 = black; c1 -> qRgb(R=10,G=20,B=30); c2 -> qRgb(R=40,G=50,B=60); rest black
+    put8(0);  put8(0);  put8(0);     // c0: G,R,B
+    put8(20); put8(10); put8(30);    // c1: G=20,R=10,B=30
+    put8(50); put8(40); put8(60);    // c2: G=50,R=40,B=60
+    for(int c=3;c<16;c++){ put8(0); put8(0); put8(0); }
+    // offset 96..1095: 1000 "have" flag bytes (MSB-first). Set only have-bit i=0 -> byte0 0x80.
+    put8(0x80);
+    for(int i=1;i<1000;i++) put8(0);
+    // offset 1096..1097: the have-word for block 0 = 0x8000 (BE) -> flags only cell (row0,x0)
+    put8(0x80); put8(0x00);
+    // offset 1098: XOR-delta byte for that single cell = 0x12
+    put8(0x12);
+    // total length = 1099 bytes
+    QImage im = RasterExtra::decodeData(b, "mki");
+    QColor c0(0,0,0), c1(10,20,30), c2(40,50,60);
+    check(!im.isNull() && im.size()==QSize(640,400)
+          && im.pixelColor(0,0)==c1   // index byte 0x12 -> high nibble 1 -> pal[1]
+          && im.pixelColor(1,0)==c2   // low nibble 2 -> pal[2]
+          && im.pixelColor(2,0)==c0,  // byte-column 1 never touched -> pal[0]
+          "MAKI01A 640x400 xor-delta cell");
+    // negative: buffer shorter than the fixed 1096-byte header must be rejected
+    QImage bad = RasterExtra::decodeData(b.left(1000), "mki");
+    check(bad.isNull(), "MAKI01 truncated rejected");
+}
+      }
+      // ---- BBC Micro ----
+      {
+{
+    // BBC Micro MODE 2: 20480-byte raw screen dump -> 160x256, 16-colour.
+    // Char-cell interleaved. Byte holding pixel (x,y) = (y&~7)*80 + ((x&~1)<<2) + (y&7).
+    // In a byte the LEFT pixel (even x) = bits b7,b5,b3,b1 (value MSB..LSB),
+    //              the RIGHT pixel (odd x) = bits b6,b4,b2,b0.
+    QByteArray b(20480, '\0');
+    // pixel(0,0): byte @ 0. Set b7,b5,b3,b1 = 1 (0xAA) -> left index 15 = white;
+    //             right pixel bits b6,b4,b2,b0 = 0 -> index 0 = black.
+    b[0] = char(0xAA);
+    // pixel(2,1): addr = (1&~7)*80 + ((2&~1)<<2) + (1&7) = 0 + 8 + 1 = 9.
+    //             left pixel: only b1 set (0x02) -> index 1 = red.
+    b[9] = char(0x02);
+    QImage im = RasterExtra::decodeData(b, "bbc");
+    check(!im.isNull() && im.size()==QSize(160,256)
+          && im.pixelColor(0,0)==QColor(255,255,255)
+          && im.pixelColor(1,0)==QColor(0,0,0)
+          && im.pixelColor(2,1)==QColor(255,0,0), "BBC Micro MODE2 20KB");
+
+    // BBC Micro MODE 5: 10240-byte dump -> 160x256, 4-colour. 4 px/byte, bytesPerRow=40.
+    // LEFT pixel (x=0) value = (b7<<1)|b3. Set b7,b3 (0x88) -> value 3 = white (PAL4[3]).
+    QByteArray b5(10240, '\0');
+    b5[0] = char(0x88);
+    QImage im5 = RasterExtra::decodeData(b5, "bbc");
+    check(!im5.isNull() && im5.size()==QSize(160,256)
+          && im5.pixelColor(0,0)==QColor(255,255,255), "BBC Micro MODE5 10KB");
+
+    // Negative: any size other than 10240/20480 must be rejected.
+    QByteArray bad(20479, '\0');
+    check(RasterExtra::decodeData(bad, "bbc").isNull(), "BBC Micro bad-size rejected");
+}
+      }
+      // ---- Thomson MO/TO ----
+      {
+{
+    // Thomson .MAP (SAVEP/LOADP), 40col mode, 2 columns x 8 rows = 16x8 px.
+    // Built byte-for-byte from the DECB container + map header + RLE spec.
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    auto be16 = [&](int v){ b.append(char((v >> 8) & 0xff)); b.append(char(v & 0xff)); };
+
+    // -- container chunk: code, length(BE), address(BE) --
+    put8(0x00);        // code = data chunk
+    be16(43);          // length = 3 (map header) + 40 (RLE) ; must be >16
+    be16(0x0000);      // address = 0  -> MAP file
+    // -- 3-byte map header --
+    put8(0x00);        // map_mode = 0x00 => 40col, bpp4
+    put8(0x01);        // col_count => columns = 2  => width 16
+    put8(0x00);        // line_count => height = 8*(0+1) = 8
+    // -- RLE: forme bank = literal copy of 16 bytes, all 0x0F --
+    put8(0x00); put8(0x10);                 // copy-run, count = 16
+    for (int k = 0; k < 16; k++) put8(0x0F);
+    put8(0x00); put8(0x00);                 // end-of-bank (forme complete)
+    // -- RLE: couleur bank = literal copy of 16 bytes, all 0xCA --
+    put8(0x00); put8(0x10);                 // copy-run, count = 16
+    for (int k = 0; k < 16; k++) put8(0xCA);
+    put8(0x00); put8(0x00);                 // end-of-bank (couleur complete)
+    // -- DECB end record --
+    put8(0xFF); be16(0x0000); be16(0x0000);
+
+    // forme byte 0x0F => within each 8px cell, x0..3 use background, x4..7 use foreground.
+    // couleur 0xCA (transpose): foreground index = 1 (red 0x00F), background index = 2 (green 0x0F0).
+    QImage im = RasterExtra::decodeData(b, "map");
+    check(!im.isNull() && im.size() == QSize(16, 8)
+          && im.pixelColor(0, 0)  == QColor(0, 255, 0)     // bg green (idx2)
+          && im.pixelColor(4, 0)  == QColor(255, 0, 0)     // fg red   (idx1)
+          && im.pixelColor(8, 0)  == QColor(0, 255, 0)     // 2nd cell bg
+          && im.pixelColor(15, 7) == QColor(255, 0, 0),    // 2nd cell fg, last row
+          "THOMSON .map 40col 16x8");
+
+    // Negative: truncated buffer (no valid DECB end record) must be rejected.
+    QImage im2 = RasterExtra::decodeData(b.left(20), "map");
+    check(im2.isNull(), "THOMSON .map truncated rejected");
+}
+      }
+      // ---- Sinclair QL ----
+      {
+{
+    // Sinclair QL MODE 4 dump: headerless 32768-byte framebuffer, 256 rows x 128 bytes.
+    // Word 0 (bytes 0,1) covers pixels (0..7, row 0). Byte0 = GREEN plane, byte1 = RED plane;
+    // pixel i uses bit (7-i). idx = (green<<2)|(red<<1)|(green&red).
+    //   green byte 0xA0 = bits 7 and 5 set -> pixel0 green, pixel2 green
+    //   red   byte 0x60 = bits 6 and 5 set -> pixel1 red,   pixel2 red
+    //   -> pixel0 = green(00FF00), pixel1 = red(FF0000), pixel2 = white(FFFFFF), pixel3 = black
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    put8(0xA0);                 // byte0: green plane, row 0 word 0
+    put8(0x60);                 // byte1: red plane,   row 0 word 0
+    while(b.size() < 32768) b.append(char(0));   // pad remainder to full screen (all black)
+    QImage im = RasterExtra::decodeData(b, "ql");
+    check(!im.isNull() && im.size()==QSize(512,256)
+          && im.pixelColor(0,0)==QColor(0,255,0)
+          && im.pixelColor(1,0)==QColor(255,0,0)
+          && im.pixelColor(2,0)==QColor(255,255,255)
+          && im.pixelColor(3,0)==QColor(0,0,0)
+          && im.pixelColor(7,0)==QColor(0,0,0)
+          && im.pixelColor(0,1)==QColor(0,0,0),      // row 1 untouched -> black
+          "SinclairQL mode4 512x256 GRB planes");
+
+    // Negative: a truncated (one byte short) buffer must be rejected by the exact-size guard.
+    QByteArray bad(32767, '\0');
+    check(RasterExtra::decodeData(bad, "ql").isNull(), "SinclairQL rejects wrong size");
+}
+      }
+
+      // ===== Fleet-10: BLP / VTF / KTX / PVR / WAL (game textures; BCn reuses DDS-validated block decode) =====
+      // ---- Blizzard BLP ----
+      {
+{
+    // Build a minimal valid BLP2 palettized (encoding=1, alphaDepth=0), 4x4.
+    QByteArray b;
+    auto put8 = [&](int v){ b.append(char(v & 0xff)); };
+    auto le32 = [&](quint32 v){ for (int s = 0; s < 32; s += 8) b.append(char((v >> s) & 0xff)); };
+
+    b.append("BLP2", 4);          // @0  magic
+    le32(1);                      // @4  type = 1 (direct)
+    put8(1);                      // @8  encoding = 1 (palettized)
+    put8(0);                      // @9  alphaDepth = 0
+    put8(0);                      // @10 alphaEncoding
+    put8(0);                      // @11 hasMips
+    le32(4);                      // @12 width = 4
+    le32(4);                      // @16 height = 4
+    le32(148 + 1024);             // @20 mipOffsets[0] = 1172 (after palette)
+    for (int i = 0; i < 15; ++i) le32(0);   // mipOffsets[1..15]
+    le32(16);                     // @84 mipSizes[0] = 16 (4*4 indices)
+    for (int i = 0; i < 15; ++i) le32(0);   // mipSizes[1..15]
+    // @148 palette: 256 BGRA entries. entry1=(R200,G100,B50), entry2=(R10,G220,B30)
+    for (int i = 0; i < 256; ++i) {
+        if (i == 1)      { put8(50);  put8(100); put8(200); put8(0); }  // B,G,R,A
+        else if (i == 2) { put8(30);  put8(220); put8(10);  put8(0); }
+        else             { put8(0);   put8(0);   put8(0);   put8(0); }
+    }
+    // @1172 index data (16 bytes): [0]=1, [15]=2, rest 0
+    for (int i = 0; i < 16; ++i) {
+        if (i == 0)       put8(1);
+        else if (i == 15) put8(2);
+        else              put8(0);
+    }
+
+    QImage im = RasterExtra::decodeData(b, "blp");
+    check(!im.isNull() && im.size() == QSize(4, 4) &&
+          im.pixelColor(0, 0) == QColor(200, 100, 50) &&
+          im.pixelColor(3, 3) == QColor(10, 220, 30),
+          "BLP2 palettized 4x4 mip0");
+
+    // Negative: bad magic must be rejected.
+    QByteArray bad = b;
+    bad[0] = 'X';
+    QImage nim = RasterExtra::decodeData(bad, "blp");
+    check(nim.isNull(), "BLP bad-magic rejected");
+}
+      }
+      // ---- Valve VTF ----
+      {
+{
+    // ---- VTF selftest: build headers byte-by-byte per tagVTFHEADER ----------
+    auto buildHeader=[&](QByteArray& b, int w, int h, quint32 fmt){
+        auto put8 =[&](int v){ b.append(char(v&0xff)); };
+        auto le16 =[&](int v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+        auto le32 =[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+        b.append("VTF",3); put8(0);   // signature "VTF\0"        @0
+        le32(7);                       // version major            @4
+        le32(1);                       // version minor (classic)  @8
+        le32(64);                      // headerSize               @12
+        le16(w);                       // width                    @16
+        le16(h);                       // height                   @18
+        le32(0);                       // flags                    @20
+        le16(1);                       // frames                   @24
+        le16(0);                       // firstFrame               @26
+        le32(0);                       // padding0                 @28
+        le32(0); le32(0); le32(0);     // reflectivity[3]          @32
+        le32(0);                       // padding1                 @44
+        le32(0);                       // bumpScale                @48
+        le32(fmt);                     // highResImageFormat       @52
+        put8(1);                       // mipmapCount = 1          @56
+        le32(0xFFFFFFFFu);             // lowResImageFormat = none @57
+        put8(0);                       // lowResWidth              @61
+        put8(0);                       // lowResHeight             @62
+        put8(0);                       // pad -> headerSize 64     @63
+    };
+
+    // (1) uncompressed BGRA8888 (fmt 12), 4x4, no thumbnail, 1 mip.
+    {
+        QByteArray b; buildHeader(b, 4, 4, 12);
+        // 16 texels, BGRA order: B=30 G=20 R=10 A=255  -> RGBA (10,20,30,255)
+        for(int i=0;i<16;i++){ b.append(char(30)); b.append(char(20)); b.append(char(10)); b.append(char(255)); }
+        QImage im = RasterExtra::decodeData(b, "vtf");
+        check(!im.isNull() && im.size()==QSize(4,4) && im.pixelColor(0,0)==QColor(10,20,30)
+              && im.pixelColor(3,3)==QColor(10,20,30), "VTF BGRA8888 4x4");
+    }
+
+    // (2) DXT1 (fmt 13), 4x4 = one 8-byte BC1 block, all texels index 0 = c0 = red.
+    {
+        QByteArray b; buildHeader(b, 4, 4, 13);
+        // c0 = RGB565 pure red 0xF800 (LE), c1 = pure blue 0x001F (LE); c0>c1 => 4-colour.
+        b.append(char(0x00)); b.append(char(0xF8)); // c0 = 0xF800
+        b.append(char(0x1F)); b.append(char(0x00)); // c1 = 0x001F
+        b.append(char(0x00)); b.append(char(0x00)); // indices = 0 (all -> c0)
+        b.append(char(0x00)); b.append(char(0x00));
+        QImage im = RasterExtra::decodeData(b, "vtf");
+        check(!im.isNull() && im.size()==QSize(4,4) && im.pixelColor(0,0)==QColor(255,0,0)
+              && im.pixelColor(3,3)==QColor(255,0,0), "VTF DXT1 4x4 red");
+    }
+
+    // (3) negative: bad magic must be rejected.
+    {
+        QByteArray b; buildHeader(b, 4, 4, 12);
+        b[0] = 'X';
+        QImage im = RasterExtra::decodeData(b, "vtf");
+        check(im.isNull(), "VTF bad magic rejected");
+    }
+}
+      }
+      // ---- Khronos KTX ----
+      {
+{
+    // --- KTX v1 uncompressed RGBA, 2x2, little-endian ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    const unsigned char sig[12]={0xAB,'K','T','X',' ','1','1',0xBB,0x0D,0x0A,0x1A,0x0A};
+    for(int i=0;i<12;i++) put8(sig[i]);
+    le32(0x04030201);   // endianness -> little
+    le32(0x1401);       // glType = GL_UNSIGNED_BYTE
+    le32(1);            // glTypeSize
+    le32(0x1908);       // glFormat = GL_RGBA
+    le32(0x8058);       // glInternalFormat = GL_RGBA8
+    le32(0x1908);       // glBaseInternalFormat = GL_RGBA
+    le32(2);            // pixelWidth
+    le32(2);            // pixelHeight
+    le32(0);            // pixelDepth
+    le32(0);            // numberOfArrayElements
+    le32(1);            // numberOfFaces
+    le32(1);            // numberOfMipmapLevels
+    le32(0);            // bytesOfKeyValueData
+    le32(16);           // imageSize = 2*2*4 (rowStride 8 == 2*4, no padding)
+    put8(255);put8(0);  put8(0);  put8(255);  // (0,0) red
+    put8(0);  put8(255);put8(0);  put8(255);  // (1,0) green
+    put8(0);  put8(0);  put8(255);put8(255);  // (0,1) blue
+    put8(10); put8(20); put8(30); put8(255);  // (1,1)
+    QImage im=RasterExtra::decodeData(b,"ktx");
+    check(!im.isNull() && im.size()==QSize(2,2)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(1,0)==QColor(0,255,0)
+          && im.pixelColor(0,1)==QColor(0,0,255)
+          && im.pixelColor(1,1)==QColor(10,20,30), "KTX uncompressed RGBA 2x2");
+
+    // --- KTX v1 DXT1 (BC1), 4x4, single block, all-white ---
+    QByteArray c;
+    auto cput8=[&](int v){ c.append(char(v&0xff)); };
+    auto cle16=[&](int v){ c.append(char(v&0xff)); c.append(char((v>>8)&0xff)); };
+    auto cle32=[&](quint32 v){ for(int s=0;s<32;s+=8) c.append(char((v>>s)&0xff)); };
+    for(int i=0;i<12;i++) cput8(sig[i]);
+    cle32(0x04030201); // little
+    cle32(0);          // glType = 0 -> compressed
+    cle32(1);          // glTypeSize
+    cle32(0);          // glFormat = 0
+    cle32(0x83F0);     // glInternalFormat = COMPRESSED_RGB_S3TC_DXT1_EXT
+    cle32(0x1907);     // glBaseInternalFormat = GL_RGB
+    cle32(4);          // pixelWidth
+    cle32(4);          // pixelHeight
+    cle32(0);          // pixelDepth
+    cle32(0);          // arrayElements
+    cle32(1);          // faces
+    cle32(1);          // mip levels
+    cle32(0);          // kvd
+    cle32(8);          // imageSize = one 8-byte BC1 block
+    cle16(0xFFFF);     // c0 = white (RGB565 all-ones)
+    cle16(0x0000);     // c1 = black; c0>c1 -> 4-colour mode
+    cle32(0x00000000); // all texel indices 0 -> colour c0 (white)
+    QImage im2=RasterExtra::decodeData(c,"ktx");
+    check(!im2.isNull() && im2.size()==QSize(4,4)
+          && im2.pixelColor(0,0)==QColor(255,255,255)
+          && im2.pixelColor(3,3)==QColor(255,255,255), "KTX DXT1 4x4 white block");
+
+    // --- KTX DXT5 (BC3) 4x4: exercises the INTERPOLATED alpha table (a0>a1, 8-value mode).
+    // a0=255,a1=0 -> spec: at[2]=(6*255)/7=218, at[7]=(1*255)/7=36. Old code used (6-j)/j<=5
+    // weights and left at[7] uninitialised (UB); this pins the spec values. Alpha selectors:
+    // texel0=2 (->218), texel1=7 (->36), rest=0 (->a0=255). Colour block = solid white.
+    {
+        QByteArray d;
+        auto d8=[&](int v){ d.append(char(v&0xff)); };
+        auto d16=[&](int v){ d.append(char(v&0xff)); d.append(char((v>>8)&0xff)); };
+        auto d32=[&](quint32 v){ for(int s=0;s<32;s+=8) d.append(char((v>>s)&0xff)); };
+        for(int i=0;i<12;i++) d8(sig[i]);
+        d32(0x04030201); d32(0); d32(1); d32(0); d32(0x83F3); d32(0x1907); // glInternalFormat=DXT5
+        d32(4); d32(4); d32(0); d32(0); d32(1); d32(1); d32(0);            // 4x4, 1 mip
+        d32(16);                                                          // imageSize = one 16-byte BC3 block
+        // BC3 alpha sub-block: a0,a1 then 48 bits of 3-bit selectors (LSB-first).
+        d8(255); d8(0);                    // a0>a1 -> 8-value interpolation
+        d8(0x3A); d8(0); d8(0); d8(0); d8(0); d8(0);  // texel0=sel2(0b010), texel1=sel7(0b111): low bits 0b111010=0x3A
+        // BC1 colour sub-block: white, all indices 0.
+        d16(0xFFFF); d16(0x0000); d32(0x00000000);
+        QImage a=RasterExtra::decodeData(d,"ktx");
+        check(!a.isNull() && a.size()==QSize(4,4)
+              && a.pixelColor(0,0)==QColor(255,255,255,218)   // selector 2 -> (6*255)/7
+              && a.pixelColor(1,0)==QColor(255,255,255,36)    // selector 7 -> (1*255)/7  (was uninitialised)
+              && a.pixelColor(2,0)==QColor(255,255,255,255),  // selector 0 -> a0
+              "KTX DXT5 interpolated alpha (spec-exact, no UB)");
+    }
+
+    // --- negative: corrupt magic ---
+    QByteArray bad=b; bad[1]='X';
+    check(RasterExtra::decodeData(bad,"ktx").isNull(), "KTX bad magic rejected");
+}
+      }
+      // ---- PowerVR PVR ----
+      {
+{
+    // --- PVR v3 uncompressed RGBA8888, 2x2 (spec byte layout) ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    le32(0x03525650u);   // @0  version 'PVR\3'
+    le32(0);             // @4  flags
+    // @8 pixelFormat u64 low32 = channel names 'r','g','b','a'
+    le32( quint32('r') | (quint32('g')<<8) | (quint32('b')<<16) | (quint32('a')<<24) );
+    // @12 pixelFormat u64 high32 = bit counts 8,8,8,8 (non-zero -> uncompressed layout)
+    le32( 8u | (8u<<8) | (8u<<16) | (8u<<24) );
+    le32(0);             // @16 colourSpace
+    le32(0);             // @20 channelType
+    le32(2);             // @24 height
+    le32(2);             // @28 width
+    le32(1);             // @32 depth
+    le32(1);             // @36 numSurfaces
+    le32(1);             // @40 numFaces
+    le32(1);             // @44 numMipMaps
+    le32(0);             // @48 metaDataSize
+    // @52 pixel data, row-major, bytes r,g,b,a per pixel
+    put8(10);put8(20);put8(30);put8(40);     // (0,0)
+    put8(50);put8(60);put8(70);put8(80);     // (1,0)
+    put8(90);put8(100);put8(110);put8(120);  // (0,1)
+    put8(130);put8(140);put8(150);put8(160); // (1,1)
+    QImage im=RasterExtra::decodeData(b,"pvr");
+    check(!im.isNull() && im.size()==QSize(2,2)
+          && im.pixelColor(0,0)==QColor(10,20,30,40)
+          && im.pixelColor(1,1)==QColor(130,140,150,160), "PVR v3 RGBA8888 2x2");
+}
+{
+    // --- PVR v3 BC1/DXT1, 4x4, one hand-built all-red block ---
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    le32(0x03525650u);   // version
+    le32(0);             // flags
+    le32(7);             // pixelFormat low32 = 7 (DXT1/BC1)
+    le32(0);             // pixelFormat high32 = 0 -> compressed enum path
+    le32(0);             // colourSpace
+    le32(0);             // channelType
+    le32(4);             // height
+    le32(4);             // width
+    le32(1);             // depth
+    le32(1);le32(1);le32(1); // numSurfaces / numFaces / numMipMaps
+    le32(0);             // metaDataSize
+    // BC1 block: c0=0xF800 (red565) > c1=0x001F (blue565); all 16 indices = 0 -> pure red
+    put8(0x00);put8(0xF8);   // c0 LE = 0xF800
+    put8(0x1F);put8(0x00);   // c1 LE = 0x001F
+    put8(0);put8(0);put8(0);put8(0);  // 2-bit indices, all 0
+    QImage im=RasterExtra::decodeData(b,"pvr");
+    check(!im.isNull() && im.size()==QSize(4,4)
+          && im.pixelColor(0,0)==QColor(255,0,0)
+          && im.pixelColor(3,3)==QColor(255,0,0), "PVR v3 BC1 4x4 red");
+}
+{
+    // --- negative: valid magic but truncated header (< 52 bytes) must be rejected ---
+    QByteArray b;
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    le32(0x03525650u); le32(0); le32(0);   // only 12 bytes
+    QImage im=RasterExtra::decodeData(b,"pvr");
+    check(im.isNull(), "PVR v3 truncated header rejected");
+}
+      }
+      // ---- Quake2 WAL ----
+      {
+{
+    // Hand-build a Quake 2 WAL from the spec byte layout (100-byte miptex_t header
+    // + width*height palette indices at mipOffsets[0]).
+    QByteArray b;
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    auto le32=[&](quint32 v){ for(int s=0;s<32;s+=8) b.append(char((v>>s)&0xff)); };
+    for(int i=0;i<32;i++) put8('t');   // name[32] @0
+    le32(2);                           // width  @32
+    le32(2);                           // height @36
+    le32(100);                         // mipOffsets[0] @40 -> pixel data right after header
+    le32(0); le32(0); le32(0);         // mipOffsets[1..3] @44..52
+    for(int i=0;i<32;i++) put8(0);     // animname[32] @56
+    le32(0);                           // flags    @88
+    le32(0);                           // contents @92
+    le32(0);                           // value    @96  (header ends at 100)
+    // 2x2 palette indices: q2pal[0]=(0,0,0), q2pal[15]=(235,235,235)
+    put8(0);  put8(15);                // row 0
+    put8(15); put8(0);                 // row 1
+    QImage im = RasterExtra::decodeData(b,"wal");
+    check(!im.isNull() && im.size()==QSize(2,2)
+        && im.pixelColor(0,0)==QColor(0,0,0)
+        && im.pixelColor(1,0)==QColor(235,235,235)
+        && im.pixelColor(0,1)==QColor(235,235,235)
+        && im.pixelColor(1,1)==QColor(0,0,0), "WAL q2-palette 2x2");
+    // Negative: truncated header must be rejected.
+    QImage im2 = RasterExtra::decodeData(b.left(50),"wal");
+    check(im2.isNull(), "WAL truncated header rejected");
+}
+      }
+
+      // ===== Fleet-11: NIfTI / NRRD / MetaImage / MGH / VTK (scientific volume -> middle-slice grayscale) =====
+      // ---- NIfTI-1 ----
+      {
+{
+    // --- NIfTI-1 (.nii): 2x2x3 UINT8 volume, decode middle Z slice (z=1) ---
+    QByteArray b(364,'\0');                 // 348-byte header + vox_offset 352 + 12 data bytes
+    auto sLE32=[&](int off,quint32 v){ for(int s=0;s<4;s++) b[off+s]=char((v>>(8*s))&0xff); };
+    auto sLE16=[&](int off,int v){ b[off]=char(v&0xff); b[off+1]=char((v>>8)&0xff); };
+    auto sF32 =[&](int off,float f){ quint32 u; memcpy(&u,&f,4); sLE32(off,u); };
+    sLE32(0,348);                           // sizeof_hdr @0 (little-endian)
+    sLE16(40,3);                            // dim[0] = 3 dims
+    sLE16(42,2);                            // dim[1] = X = 2
+    sLE16(44,2);                            // dim[2] = Y = 2
+    sLE16(46,3);                            // dim[3] = Z = 3  -> middle slice index = 3/2 = 1
+    sLE16(70,2);                            // datatype @70 = 2 (UINT8)
+    sLE16(72,8);                            // bitpix   @72 = 8
+    sF32(108,352.0f);                       // vox_offset @108 = 352
+    sF32(112,0.0f);                         // scl_slope @112 = 0 (no scaling)
+    sF32(116,0.0f);                         // scl_inter @116 = 0
+    b[344]='n'; b[345]='+'; b[346]='1'; b[347]='\0';   // magic @344 = "n+1\0"
+    // data @352: slice0(z=0), slice1(z=1 middle), slice2(z=2); row-major, x fastest
+    unsigned char s0[4]={100,100,100,100};             // z=0 (ignored)
+    unsigned char s1[4]={10,20,30,40};                 // z=1 min=10 max=40 -> 0,85,170,255
+    unsigned char s2[4]={200,200,200,200};             // z=2 (ignored)
+    for(int i=0;i<4;i++){ b[352+i]=char(s0[i]); b[356+i]=char(s1[i]); b[360+i]=char(s2[i]); }
+    QImage im=RasterExtra::decodeData(b,"nii");
+    check(!im.isNull() && im.size()==QSize(2,2), "NIfTI: 2x2 middle slice decoded");
+    check(qGray(im.pixel(0,0))==0,   "NIfTI: min sample -> 0");
+    check(qGray(im.pixel(1,0))==85,  "NIfTI: (1,0)=20 -> 85");
+    check(qGray(im.pixel(0,1))==170, "NIfTI: (0,1)=30 -> 170");
+    check(qGray(im.pixel(1,1))==255, "NIfTI: max sample -> 255");
+    // negative: valid magic region but bogus header (sizeof_hdr != 348, no valid magic)
+    QByteArray bad(400,'\0');
+    QImage imBad=RasterExtra::decodeData(bad,"nii");
+    check(imBad.isNull(), "NIfTI: rejects header without sizeof_hdr/magic");
+}
+      }
+      // ---- NRRD ----
+      {
+{
+    // NRRD raw int16 middle-slice grayscale (teem.sourceforge.net/nrrd/format.html).
+    // 2x2x3 short volume; middle Z slice (z=1) values [0,100,200,300] -> min0/max300 ->
+    // g = round(v*255/300): 0, 85, 170, 255 exactly. Discriminator slices z0=1,z2=7.
+    QByteArray b;
+    auto le16=[&](int v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    b.append("NRRD0004\n");          // magic line
+    b.append("type: short\n");       // int16 signed
+    b.append("dimension: 3\n");      // 3D
+    b.append("sizes: 2 2 3\n");      // X=2 Y=2 Z=3 (fastest axis first)
+    b.append("encoding: raw\n");     // raw binary
+    b.append("endian: little\n");    // LE for >8-bit
+    b.append("\n");                  // blank line -> data follows
+    for(int i=0;i<4;i++) le16(1);            // slice z=0 (ignored)
+    le16(0); le16(100); le16(200); le16(300);// slice z=1 (MIDDLE, tested): y*X+x order
+    for(int i=0;i<4;i++) le16(7);            // slice z=2 (ignored)
+    QImage im=RasterExtra::decodeData(b,"nrrd");
+    check(!im.isNull() && im.size()==QSize(2,2)
+          && qGray(im.pixel(0,0))==0   && qGray(im.pixel(1,0))==85
+          && qGray(im.pixel(0,1))==170 && qGray(im.pixel(1,1))==255,
+          "NRRD raw int16 middle-slice min/max grayscale");
+    // Negative: bad magic.
+    { QByteArray bad=b; bad[0]='X'; check(RasterExtra::decodeData(bad,"nrrd").isNull(), "NRRD bad magic rejected"); }
+    // Negative: truncated data (only one slice present -> middle slice can't fit).
+    { QByteArray tr=b; tr.truncate(tr.size()-16); check(RasterExtra::decodeData(tr,"nrrd").isNull(), "NRRD truncated data rejected"); }
+}
+      }
+      // ---- MetaImage ----
+      {
+{
+    // --- MetaImage .mha: 2x2x3 MET_SHORT little-endian, middle Z slice (z=DimZ/2=1) ---
+    // Spec byte layout built independently: ASCII "Key = Value\n" header, then raw voxels
+    // (X fastest, then Y, then Z) immediately after the "ElementDataFile = LOCAL\n" newline.
+    QByteArray b;
+    auto puts=[&](const char* s){ b.append(s); };
+    auto le16=[&](int v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    puts("ObjectType = Image\n");
+    puts("NDims = 3\n");
+    puts("DimSize = 2 2 3\n");                 // X=2 Y=2 Z=3
+    puts("ElementType = MET_SHORT\n");         // int16
+    puts("BinaryData = True\n");
+    puts("BinaryDataByteOrderMSB = False\n");  // little-endian
+    puts("ElementDataFile = LOCAL\n");         // embedded; voxels follow this newline
+    // z=0 slice (NOT read): 4 shorts
+    le16(1000); le16(1000); le16(1000); le16(1000);
+    // z=1 slice (the MIDDLE slice we decode): (x,y) order = (0,0)(1,0)(0,1)(1,1)
+    le16(0); le16(10); le16(20); le16(30);     // min=0 max=30 => 0,85,170,255
+    // z=2 slice (NOT read)
+    le16(-500); le16(-500); le16(-500); le16(-500);
+    QImage im=RasterExtra::decodeData(b,"mha");
+    check(!im.isNull() && im.size()==QSize(2,2), "MetaImage: size 2x2 (middle Z slice)");
+    check(!im.isNull() && qGray(im.pixel(0,0))==0,   "MetaImage: (0,0)=0 (min)");
+    check(!im.isNull() && qGray(im.pixel(1,0))==85,  "MetaImage: (1,0)=85  (10/30*255)");
+    check(!im.isNull() && qGray(im.pixel(0,1))==170, "MetaImage: (0,1)=170 (20/30*255)");
+    check(!im.isNull() && qGray(im.pixel(1,1))==255, "MetaImage: (1,1)=255 (max)");
+    // negative: valid header but binary payload truncated (needs 24 bytes for the volume) -> null
+    QByteArray t;
+    t.append("ObjectType = Image\n");
+    t.append("NDims = 3\n");
+    t.append("DimSize = 2 2 3\n");
+    t.append("ElementType = MET_SHORT\n");
+    t.append("ElementDataFile = LOCAL\n");
+    t.append(char(0)); t.append(char(0));      // only 2 bytes of voxel data (need 12*2)
+    QImage bad=RasterExtra::decodeData(t,"mha");
+    check(bad.isNull(), "MetaImage: truncated voxel payload rejected");
+    // negative: detached data file (ElementDataFile != LOCAL) -> reject
+    QByteArray det;
+    det.append("ObjectType = Image\nNDims = 2\nDimSize = 2 2\nElementType = MET_UCHAR\n");
+    det.append("ElementDataFile = volume.raw\n");
+    det.append(char(1)); det.append(char(2)); det.append(char(3)); det.append(char(4));
+    QImage dbad=RasterExtra::decodeData(det,"mha");
+    check(dbad.isNull(), "MetaImage: detached ElementDataFile rejected");
+
+    // Regression (review-confirmed): a NaN first voxel must NOT poison min/max (was int(NaN) UB ->
+    // whole slice black). 2x2 MET_FLOAT, voxels [NaN, 0, 3, 6]: seed from first FINITE (0), rng=6.
+    {
+        QByteArray f;
+        f.append("ObjectType = Image\nNDims = 2\nDimSize = 2 2\nElementType = MET_FLOAT\n");
+        f.append("BinaryData = True\nBinaryDataByteOrderMSB = False\nElementDataFile = LOCAL\n");
+        auto lef=[&](float v){ quint32 u; memcpy(&u,&v,4); for(int s=0;s<4;s++) f.append(char((u>>(8*s))&0xff)); };
+        lef(std::numeric_limits<float>::quiet_NaN()); // (0,0) NaN -> guarded to 0, must not blank the rest
+        lef(0.0f);   // (1,0) min -> 0
+        lef(3.0f);   // (0,1) -> round(3/6*255)=128
+        lef(6.0f);   // (1,1) max -> 255
+        QImage im=RasterExtra::decodeData(f,"mha");
+        check(!im.isNull() && im.size()==QSize(2,2)
+              && qGray(im.pixel(0,0))==0            // NaN pixel -> 0 (no UB)
+              && qGray(im.pixel(1,0))==0            // finite min
+              && qGray(im.pixel(0,1))==128          // finite mid
+              && qGray(im.pixel(1,1))==255,         // finite max (proves NaN didn't poison the range)
+              "MetaImage: NaN first voxel does not blank the finite data (min/max seeded from finite)");
+    }
+}
+      }
+      // ---- FreeSurfer MGH ----
+      {
+{
+    // FreeSurfer MGH, BIG-ENDIAN. 2x2x3 SHORT volume; decode MIDDLE slice (z=depth/2=1).
+    QByteArray b;
+    auto be32=[&](qint32 v){ for(int s=24;s>=0;s-=8) b.append(char((v>>s)&0xff)); };
+    auto be16=[&](int v){ b.append(char((v>>8)&0xff)); b.append(char(v&0xff)); };
+    be32(1);   // version @0  = 1
+    be32(2);   // width   @4  = 2
+    be32(2);   // height  @8  = 2
+    be32(3);   // depth   @12 = 3
+    be32(1);   // nframes @16 = 1
+    be32(4);   // type    @20 = 4 (SHORT / int16)
+    be32(0);   // dof     @24 = 0
+    be16(0);   // goodRASFlag @28 = 0
+    while(b.size()<284) b.append(char(0));            // pad header to fixed 284
+    // slice0 (z=0): filler shorts
+    be16(1); be16(2); be16(3); be16(4);
+    // slice1 (z=1, MIDDLE): idx = y*width+x -> (0,0)=10 (1,0)=20 (0,1)=30 (1,1)=40
+    be16(10); be16(20); be16(30); be16(40);
+    // slice2 (z=2): filler shorts
+    be16(5); be16(6); be16(7); be16(8);
+    QImage im=RasterExtra::decodeData(b,"mgh");
+    // min=10 max=40 range=30: g=round((v-10)*255/30) -> 0,85,170,255
+    check(!im.isNull() && im.size()==QSize(2,2)
+        && qGray(im.pixel(0,0))==0
+        && qGray(im.pixel(1,0))==85
+        && qGray(im.pixel(0,1))==170
+        && qGray(im.pixel(1,1))==255, "MGH short middle-slice min/max grayscale");
+    // negative: corrupt version field
+    QByteArray bad=b; bad[3]=char(9);                 // version -> 9
+    check(RasterExtra::decodeData(bad,"mgh").isNull(), "MGH bad version rejected");
+}
+      }
+      // ---- VTK legacy ----
+      {
+{
+    // VTK legacy BINARY STRUCTURED_POINTS, 2x2x3 unsigned_char volume; middle slice z=nz/2=1.
+    QByteArray b;
+    b.append("# vtk DataFile Version 3.0\n");   // magic (line 0)
+    b.append("selftest volume\n");              // title (line 1)
+    b.append("BINARY\n");                        // format (big-endian data)
+    b.append("DATASET STRUCTURED_POINTS\n");
+    b.append("DIMENSIONS 2 2 3\n");              // nx=2 ny=2 nz=3
+    b.append("SPACING 1 1 1\n");
+    b.append("ORIGIN 0 0 0\n");
+    b.append("POINT_DATA 12\n");
+    b.append("SCALARS s unsigned_char\n");
+    b.append("LOOKUP_TABLE default\n");          // data starts right after this '\n'
+    auto put8=[&](int v){ b.append(char(v&0xff)); };
+    put8(0);  put8(0);   put8(0);   put8(0);     // slice z=0 (ignored)
+    put8(0);  put8(85);  put8(170); put8(255);   // slice z=1 (MIDDLE): (0,0)=0 (1,0)=85 (0,1)=170 (1,1)=255
+    put8(0);  put8(0);   put8(0);   put8(0);     // slice z=2 (ignored)
+    QImage im = RasterExtra::decodeData(b, "vtk");
+    check(!im.isNull() && im.size()==QSize(2,2), "VTK binary decodes middle slice size");
+    // min=0 max=255 -> g = round((v-0)*255/255) = v, so grayscale == raw byte
+    check(!im.isNull() && qGray(im.pixel(0,0))==0   && qGray(im.pixel(1,0))==85 &&
+                          qGray(im.pixel(0,1))==170 && qGray(im.pixel(1,1))==255,
+          "VTK binary middle-slice min/max grayscale normalise");
+
+    // ASCII variant, single slice 2x2 short, values 10 20 30 40 -> min10 max40 rng30
+    QByteArray a;
+    a.append("# vtk DataFile Version 2.0\n");
+    a.append("ascii test\n");
+    a.append("ASCII\n");
+    a.append("DATASET STRUCTURED_POINTS\n");
+    a.append("DIMENSIONS 2 2 1\n");
+    a.append("POINT_DATA 4\n");
+    a.append("SCALARS s short\n");
+    a.append("LOOKUP_TABLE default\n");
+    a.append("10 20\n30 40\n");
+    QImage ai = RasterExtra::decodeData(a, "vtk");
+    // g(10)=0, g(20)=round(10*255/30)=85, g(30)=round(20*255/30)=170, g(40)=255
+    check(!ai.isNull() && ai.size()==QSize(2,2) &&
+          qGray(ai.pixel(0,0))==0 && qGray(ai.pixel(1,0))==85 &&
+          qGray(ai.pixel(0,1))==170 && qGray(ai.pixel(1,1))==255,
+          "VTK ASCII single-slice grayscale normalise");
+
+    QByteArray bad("# NOT a vtk header at all......",30);
+    check(RasterExtra::decodeData(bad, "vtk").isNull(), "VTK rejects bad magic");
+    QByteArray trunc = b.left(b.size()-6);       // drop part of the scalar data
+    check(RasterExtra::decodeData(trunc, "vtk").isNull(), "VTK rejects truncated binary data");
+}
+      }
+
+      // Native TGA (Qt's plugin is v2-only + read-only; ours handles v1/uncompressed/RLE/flips).
+      { QByteArray b; ap8(b,{0,0,2}); for(int k=0;k<5;k++) b.append(char(0));   // idLen,cmapType,type2,cmapspec
+        le16(b,0); le16(b,0); le16(b,2); le16(b,2); ap8(b,{24,0x20});           // x,y,w=2,h=2,24bpp,top-origin
+        ap8(b,{0,0,255, 0,255,0, 255,0,0, 255,255,255});                        // BGR: red,green,blue,white
+        QImage im=RasterExtra::decodeData(b,"tga");
+        check(!im.isNull() && im.size()==QSize(2,2) && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(255,255,255), "native TGA (type-2, top-origin) decodes"); }
+
+      // PFM regression: a '#' comment line in the header (ImageMagick/Photoshop inject one) must be skipped.
+      { QByteArray b("PF\n#File written by a tool\n2 1\n-1.0\n");
+        float one=1.0f, zero=0.0f;
+        for(int k=0;k<3;k++) b.append(reinterpret_cast<const char*>(&one),4);
+        for(int k=0;k<3;k++) b.append(reinterpret_cast<const char*>(&zero),4);
+        QImage im=RasterExtra::decodeData(b,"pfm");
+        check(!im.isNull() && im.size()==QSize(2,1), "PFM with a header comment line still decodes"); }
+
+      // CALS Type 1 / CCITT Group 4 (T.6). A real 24x16 CALS produced by ImageMagick (2048-byte ASCII
+      // header + T.6 body); the pixels below were verified pixel-exact against IM's own readback
+      // (border+diagonal pattern: 292 black, 92 white). Exercises horizontal + vertical 2-D modes.
+      { const char* cb64 =
+          "c3JjZG9jaWQ6IE5PTkUgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICBkc3Rkb2NpZDogTk9ORSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgIHR4dGZpbGlkOiBOT05FICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZmlnaWQ6IE5PTkUgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBzcmNncGg6IE5PTkUgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRvY2"
+          "NsczogTk9ORSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgcnR5cGU6IDEgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICByb3JpZW50OiAwMDAsMjcwICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHJwZWxjbnQ6IDAwMDAyNCwwMDAwMTYgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgcmRlbnN0eTogMDIwMCAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICBub3Rlczog"
+          "Tk9ORSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+          "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC"
+          "CYDRCOPxKH7I4L4lD9kcExKH7I4TEofsjjxKH7I7xBAu4wAQAQ";
+        QByteArray cals = QByteArray::fromBase64(cb64);
+        QImage im = RasterExtra::decodeData(cals, "cals");
+        int black=0; if(!im.isNull()) for(int y=0;y<im.height();++y) for(int x=0;x<im.width();++x) if(qGray(im.pixel(x,y))<128) ++black;
+        check(!im.isNull() && im.size()==QSize(24,16), "CALS Type 1 (Group 4) decodes to 24x16");
+        check(black==292, "CALS Group-4 T.6 decode is pixel-exact vs ImageMagick (292 black px)");
+        // Robustness: a valid header claiming huge dimensions with a tiny body must not hang/crash.
+        { QByteArray h=cals.left(2048); h.replace("000024,000016","060000,060000"); h.append("\xff\xff\xff\xff",4);
+          check(true, "CALS with oversized rpelcnt + tiny body returns without hanging"); (void)RasterExtra::decodeData(h,"cals"); }
+        check(RasterExtra::decodeData(QByteArray("srcdocid: NONE"),"cals").isNull(), "CALS shorter than its 2048-byte header is rejected"); }
+
+      // ---------------------------------------------------------------- HP PCL raster ---
+      // Escape streams are built inline. The mode 0/1/2/3 vectors below are HP's OWN worked
+      // examples from the PCL 5 Printer Language Technical Reference, chapter 15 ("Set Compression
+      // Method Command"), so they check the decoder against the spec's published bytes rather than
+      // against our own encoder.
+      { auto esc=[](const char* s){ QByteArray b("\x1b",1); b.append(s); return b; };
+        auto raw=[](std::initializer_list<int> v){ QByteArray b; for(int x:v) b.append(char(x&0xFF)); return b; };
+        // Pack a decoded mono row back into bytes (our decoder maps a set bit to a black dot).
+        auto rowBits=[](const QImage& im,int y){ QByteArray o;
+            for(int xb=0; xb+8<=im.width(); xb+=8){ int v=0;
+                for(int b=0;b<8;++b) v=(v<<1)|(qGray(im.pixel(xb+b,y))<128?1:0);
+                o.append(char(v)); }
+            return o; };
+
+        // HP's reference row, 7 bytes / 56 dots: "UUUUATT".
+        const QByteArray hpRow("UUUUATT");
+        auto hpDoc=[&](const QByteArray& body){ return esc("*r56S")+esc("*r1A")+body+esc("*rC"); };
+
+        // Unencoded (method 0):  ESC*b0m7W UUUUATT   -- also covers a combined 0m/7W sequence.
+        { QImage im=RasterExtra::decodeData(hpDoc(esc("*b0m7W")+hpRow),"pcl");
+          check(!im.isNull() && im.size()==QSize(56,1) && rowBits(im,0)==hpRow,
+                "PCL method 0 (unencoded) decodes HP's reference row UUUUATT"); }
+        // Run-length (method 1):  ESC*b1m6W (3)U(0)A(1)T  -- count 0 means ONE occurrence.
+        { QImage im=RasterExtra::decodeData(hpDoc(esc("*b1m6W")+raw({3,'U',0,'A',1,'T'})),"pcl");
+          check(!im.isNull() && im.size()==QSize(56,1) && rowBits(im,0)==hpRow,
+                "PCL method 1 (run-length) decodes HP's (3)U(0)A(1)T: repetition count 0 = one occurrence"); }
+        // TIFF PackBits (method 2): HP gives two equivalent encodings of the same row.
+        { QImage a=RasterExtra::decodeData(hpDoc(esc("*b2m6W")+raw({253,'U',0,'A',255,'T'})),"pcl");
+          QImage b=RasterExtra::decodeData(hpDoc(esc("*b2m6W")+raw({253,'U',2,'A','T','T'})),"pcl");
+          check(!a.isNull() && a.size()==QSize(56,1) && rowBits(a,0)==hpRow,
+                "PCL method 2 (TIFF PackBits) decodes HP's (-3)U(0)A(-1)T");
+          check(!b.isNull() && b.size()==QSize(56,1) && rowBits(b,0)==hpRow,
+                "PCL method 2 decodes HP's alternate (-3)U(2)ATT (literal run) to the same row"); }
+        // NOP control byte (-128 = 128) must be skipped and the next byte treated as the control byte.
+        { QImage im=RasterExtra::decodeData(hpDoc(esc("*b2m7W")+raw({128,253,'U',0,'A',255,'T'})),"pcl");
+          check(!im.isNull() && rowBits(im,0)==hpRow, "PCL method 2 skips the -128 NOP control byte"); }
+
+        // Delta row (method 3): HP's three-row worked example, 5 bytes per row.
+        //   ESC*r1A zeroes the seed row; rows must come out 00FF000000 / 00FFF00000 / 0FFFF0AAAA.
+        { QByteArray d=esc("*r40S")+esc("*r1A")
+                     +esc("*b3m2W")+raw({0x01,0xFF})
+                     +esc("*b2W")  +raw({0x02,0xF0})
+                     +esc("*b5W")  +raw({0x00,0x0F,0x22,0xAA,0xAA})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(40,3), "PCL method 3 (delta row) HP example decodes to 40x3");
+          check(!im.isNull() && rowBits(im,0)==raw({0x00,0xFF,0x00,0x00,0x00})
+                             && rowBits(im,1)==raw({0x00,0xFF,0xF0,0x00,0x00})
+                             && rowBits(im,2)==raw({0x0F,0xFF,0xF0,0xAA,0xAA}),
+                "PCL delta row rebuilds HP's exact three rows (offset is counted from the first untreated byte)"); }
+        // Delta row long offset: the spec's own example totals 31 + 255 + 128 = 414.
+        { QByteArray d=esc("*r3320S")+esc("*r1A")+esc("*b3M")+esc("*b4W")+raw({0x1F,0xFF,0x80,0xAA})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          int black=0; if(!im.isNull()) for(int x=0;x<im.width();++x) if(qGray(im.pixel(x,0))<128) ++black;
+          check(!im.isNull() && im.size()==QSize(3320,1) && black==4,
+                "PCL delta row totals extra offset bytes (31+255+128=414) and stops at a byte < 255");
+          check(!im.isNull() && qGray(im.pixel(414*8+0,0))<128 && qGray(im.pixel(414*8+1,0))>=128,
+                "PCL delta row places the replacement byte at the accumulated offset 414"); }
+        // ESC*b0W repeats the previous row; a lone trailing control byte is ignored (ESC*b1W).
+        { QByteArray d=esc("*r8S")+esc("*r1A")+esc("*b3M")
+                     +esc("*b2W")+raw({0x00,0xF0})+esc("*b0W")+esc("*b1W")+raw({0x00})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(8,3)
+                && rowBits(im,0)==raw({0xF0}) && rowBits(im,1)==raw({0xF0}) && rowBits(im,2)==raw({0xF0}),
+                "PCL ESC*b0W and a data-less ESC*b1W both replicate the previous row"); }
+        // ESC*b#Y prints zeroed rows AND resets the seed row to zero: the row after it must not
+        // inherit byte 1 from the row before it.
+        { QByteArray d=esc("*r16S")+esc("*r1A")+esc("*b3M")
+                     +esc("*b3W")+raw({0x20,0xFF,0xFF})+esc("*b2Y")+esc("*b2W")+raw({0x00,0x0F})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(16,4)
+                && rowBits(im,0)==raw({0xFF,0xFF}) && rowBits(im,1)==raw({0x00,0x00})
+                && rowBits(im,2)==raw({0x00,0x00}) && rowBits(im,3)==raw({0x0F,0x00}),
+                "PCL ESC*b#Y prints zeroed rows and resets the seed row to zero"); }
+
+        // Adaptive compression (method 5): one block of 3-byte <command><count-hi><count-lo>
+        // headers mixing sub-methods 0-3 with empty-row (4) and duplicate-row (5).
+        { QByteArray blk=raw({0,0,2, 0xFF,0x0F})          // unencoded row     -> FF 0F
+                       + raw({5,0,2})                     // duplicate x2      -> FF 0F, FF 0F
+                       + raw({4,0,1})                     // empty row, seed zeroed -> 00 00
+                       + raw({1,0,2, 0x01,0xAA})          // run-length        -> AA AA
+                       + raw({2,0,2, 0xFF,0x3C})          // TIFF, repeat x2   -> 3C 3C
+                       + raw({3,0,3, 0x20,0x5A,0xA5})     // delta row         -> 5A A5
+                       + raw({9,0,1})                     // out of range -> skip rest of block
+                       + raw({0,0,2, 0x11,0x22});         // must NOT be decoded
+          QByteArray d=esc("*r16S")+esc("*r1A")+esc("*b5M")
+                     +esc(QByteArray("*b"+QByteArray::number(blk.size())+"W").constData())+blk+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(16,7), "PCL method 5 (adaptive) yields 7 rows and stops at the bad command byte");
+          check(!im.isNull() && rowBits(im,0)==raw({0xFF,0x0F}) && rowBits(im,1)==raw({0xFF,0x0F})
+                             && rowBits(im,2)==raw({0xFF,0x0F}) && rowBits(im,3)==raw({0x00,0x00})
+                             && rowBits(im,4)==raw({0xAA,0xAA}) && rowBits(im,5)==raw({0x3C,0x3C})
+                             && rowBits(im,6)==raw({0x5A,0xA5}),
+                "PCL adaptive block decodes sub-methods 0/1/2/3 plus duplicate-row and empty-row"); }
+
+        // Configure Image Data: the format ImageMagick writes and the fixture uses --
+        // 00 03 00 08 08 08 = device RGB, direct by pixel, 8/8/8 bits per primary = 24 bpp.
+        // Also exercises the combined ESC*r#s#T width/height sequence.
+        { QByteArray d=esc("*v6W")+raw({0,3,0,8,8,8})+esc("*r2s2T")+esc("*r1A")+esc("*b3M")
+                     +esc("*b7W")+raw({0xA0, 0xFF,0x00,0x00, 0x00,0xFF,0x00})
+                     +esc("*b4W")+raw({0x43, 0x00,0x00,0xFF})+esc("*rB");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(2,2), "PCL CID 24-bit direct-by-pixel RGB + combined ESC*r#s#T -> 2x2");
+          check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0)
+                             && im.pixelColor(0,1)==QColor(255,0,0) && im.pixelColor(1,1)==QColor(0,0,255),
+                "PCL 24-bit delta row patches only the bytes the offset names"); }
+        // Device CMY (colour space 1) is the same layout inverted.
+        { QByteArray d=esc("*v6W")+raw({1,3,0,8,8,8})+esc("*r1S")+esc("*r1A")+esc("*b0M")
+                     +esc("*b3W")+raw({0xFF,0x00,0x00})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(1,1) && im.pixelColor(0,0)==QColor(0,255,255),
+                "PCL CID device-CMY direct-by-pixel inverts to RGB (C=255 -> cyan)"); }
+        // Row length inferred when the file omits ESC*r#S (Ghostscript's PCL drivers never emit it).
+        { QByteArray d=esc("*r1A")+esc("*b0M")+esc("*b2W")+raw({0xFF,0x00})+esc("*b2W")+raw({0x00,0xFF})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(16,2) && rowBits(im,0)==raw({0xFF,0x00}),
+                "PCL infers the row length from the raster data when ESC*r#S is absent"); }
+
+        // Declined rather than guessed: planar transfers and the colour spaces whose conversion
+        // needs the long-form CID. Each must return a null image, never approximate pixels.
+        { auto cid=[&](std::initializer_list<int> v){
+              return RasterExtra::decodeData(esc("*v6W")+raw(v)+esc("*r8S")+esc("*r1A")+esc("*b0M")
+                                             +esc("*b1W")+raw({0xFF})+esc("*rC"),"pcl"); };
+          check(cid({0,0,8,8,8,8}).isNull(), "PCL declines indexed-by-plane CID (planar, no oracle)");
+          check(cid({0,1,8,8,8,8}).isNull(), "PCL declines indexed-by-pixel with no palette in the file");
+          // …but an indexed stream that DOES carry its palette decodes: ESC*v<r>a<g>b<b>c<i>I.
+          { const QImage im = RasterExtra::decodeData(
+                esc("*v6W")+raw({0,1,8,8,8,8})
+              + esc("*v255a0b0c0I") + esc("*v0a0b255c1I")      // index 0 = red, index 1 = blue
+              + esc("*r4S") + esc("*r1A") + esc("*b0M")
+              + esc("*b4W") + raw({0x00,0x01,0x01,0x00}) + esc("*rC"), "pcl");
+            check(!im.isNull() && im.size()==QSize(4,1), "PCL indexed-by-pixel with an inline palette decodes");
+            check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,0,255)
+                  && im.pixelColor(3,0)==QColor(255,0,0), "PCL indexed pixels map through the ESC*v…I palette"); }
+          check(cid({0,2,0,8,8,8}).isNull(), "PCL declines direct-by-plane CID (planar)");
+          check(cid({2,3,0,8,8,8}).isNull(), "PCL declines colorimetric-RGB CID");
+          check(cid({3,3,0,8,8,8}).isNull(), "PCL declines CIE L*a*b* CID");
+          check(cid({4,3,0,8,8,8}).isNull(), "PCL declines luminance-chrominance CID");
+          check(cid({0,3,0,1,1,1}).isNull(), "PCL declines 1-bit-per-primary direct-by-pixel"); }
+        check(RasterExtra::decodeData(esc("*r8S")+esc("*r1A")+esc("*b0M")+esc("*b1V")+raw({0xFF})
+                                      +esc("*b1W")+raw({0xFF})+esc("*rC"),"pcl").isNull(),
+              "PCL declines a plane transfer (ESC*b#V)");
+        check(RasterExtra::decodeData(esc("*r3U")+esc("*r8S")+esc("*r1A")+esc("*b0M")
+                                      +esc("*b1W")+raw({0xFF})+esc("*rC"),"pcl").isNull(),
+              "PCL declines simple-colour mode ESC*r3U (3 planes)");
+        check(RasterExtra::decodeData(esc("*r8S")+esc("*r1A")+esc("*b4M")
+                                      +esc("*b1W")+raw({0xFF})+esc("*rC"),"pcl").isNull(),
+              "PCL declines the reserved compression method 4");
+
+        // Robustness: nothing below may hang, over-read or over-allocate.
+        check(RasterExtra::decodeData(esc("E")+esc("&l0E")+esc("E")+QByteArray(64,'x'),"pcl").isNull(),
+              "PCL with no raster block decodes to nothing");
+        { QByteArray d=esc("*r8S")+esc("*r1A")+esc("*b0M")+esc("*b100W")+raw({0xFF,0x00,0xFF});
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(im.isNull() || im.size()==QSize(8,1), "PCL transfer claiming more bytes than the file holds is clamped"); }
+        check(RasterExtra::decodeData(esc("*r99999S")+esc("*r1A")+esc("*b0M")+esc("*b1W")+raw({0xFF}),"pcl").isNull(),
+              "PCL source raster width beyond 65535 is rejected");
+        check(RasterExtra::decodeData(esc("*r0S")+esc("*r1A")+esc("*b0M")+esc("*b1W")+raw({0xFF}),"pcl").isNull(),
+              "PCL raster width of 0 clips the whole raster away");
+        { QByteArray d=esc("*r64000S")+esc("*r1A")+esc("*b3M")+esc("*b40000W")+QByteArray(40000,'\x1f');
+          check(true, "PCL long chain of 31/255 offset bytes terminates without hanging");
+          (void)RasterExtra::decodeData(d,"pcl"); }
+        { QByteArray d=esc("*r16S")+esc("*r1A")+esc("*b1M")+esc("*b4W")+raw({255,0xAA,255,0xBB});
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(16,1) && rowBits(im,0)==raw({0xAA,0xAA}),
+                "PCL run-length runs longer than the row are clipped, not written past it"); }
+        // ESC&k#W is NOT a binary-payload command: mis-skipping its value desynchronises the stream.
+        { QByteArray d=esc("&k1W")+esc("*r8S")+esc("*r1A")+esc("*b0M")+esc("*b1W")+raw({0xF0})+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.size()==QSize(8,1) && rowBits(im,0)==raw({0xF0}),
+                "PCL does not swallow a payload for ESC&k#W (only the documented binary commands carry one)"); }
+        // A second raster block re-declaring a much wider raster must not make the image claim more
+        // pixels than a stored row holds (that would read past the row buffer).
+        { QByteArray d=esc("*v6W")+raw({0,3,0,8,8,8})+esc("*r2S")+esc("*r1A")+esc("*b0M")
+                     +esc("*b6W")+QByteArray(6,'\0')+esc("*rC")
+                     +esc("*r60000S")+esc("*r1A")+esc("*b0M")+esc("*b6W")+QByteArray(6,'\0')+esc("*rC");
+          QImage im=RasterExtra::decodeData(d,"pcl");
+          check(!im.isNull() && im.width()==2, "PCL ignores a width re-declared after the row length is fixed"); }
+        // Magic dispatch: a PCL stream opening with ESC E is recognised with no extension hint.
+        { QByteArray d=esc("E")+esc("*r8S")+esc("*r1A")+esc("*b0M")+esc("*b1W")+raw({0xF0})+esc("*rC")+esc("E");
+          check(!RasterExtra::decodeData(d,QString()).isNull(), "PCL is recognised by its ESC E magic without an extension"); }
+        check(RasterExtra::extensions().contains("pcl"), "rasterextra advertises the PCL extension for the Import filter");
+      }
+
+      check(RasterExtra::extensions().contains("qoi") && RasterExtra::qtExtraExtensions().contains("tga"),
+            "rasterextra advertises its native + Qt-plugin extensions for the Import filter");
+      check(RasterExtra::extensions().contains("cals") && RasterExtra::extensions().contains("cal"),
+            "rasterextra advertises CALS extensions for the Import filter");
+
+      // AVS X: u32-BE w/h then A,R,G,B bytes per pixel.
+      { QByteArray b; be32(b,2); be32(b,1); ap8(b,{255,255,0,0,  128,0,0,255});   // opaque red, half-alpha blue
+        QImage im=RasterExtra::decodeData(b,"avs");
+        check(!im.isNull() && im.size()==QSize(2,1), "AVS X decodes to 2x1");
+        check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0).alpha()==128,
+              "AVS X carries A,R,G,B channel order"); }
+      check(RasterExtra::decodeData(QByteArray("\x00\x00\x00\x02\x00\x00\x00\x01",8),"avs").isNull(),
+            "AVS X with a truncated pixel payload is rejected");
+
+      // LEGO Mindstorms RGF: width byte, height byte, packed 1-bpp rows (MSB first, 1 = black).
+      // (>=8 bytes total: decodeData's n<8 early-return would otherwise reject the file outright)
+      { QByteArray b; ap8(b,{8,6, 0x80, 0x01, 0x00, 0x00, 0x00, 0xFF});   // row0 leftmost black, row1 rightmost, row5 all black
+        QImage im=RasterExtra::decodeData(b,"rgf");
+        check(!im.isNull() && im.size()==QSize(8,6), "RGF decodes to 8x6");
+        check(!im.isNull() && qGray(im.pixel(0,0))==0 && qGray(im.pixel(1,0))==255
+              && qGray(im.pixel(7,1))==0 && qGray(im.pixel(3,5))==0, "RGF packs 1 = black, MSB first"); }
+      check(RasterExtra::decodeData(QByteArray("\x08\x06\x80\x01\x00\x00",6),"rgf").isNull(),
+            "RGF with a short row payload is rejected");
+
+      // VIFF storage type 0 (VFF_TYP_BIT): packed bilevel, previously rejected outright.
+      { QByteArray b(1024,'\0'); b[0]=char(0xAB); b[1]=char(0x01); b[4]=char(2);   // big-endian machine dep
+        auto put32=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        put32(520,8); put32(524,2); put32(560,1); put32(564,0);   // width=8, height=2, 1 band, BIT storage
+        ap8(b,{0x80, 0x01});
+        QImage im=RasterExtra::decodeData(b,"viff");
+        check(!im.isNull() && im.size()==QSize(8,2) && qGray(im.pixel(0,0))==0 && qGray(im.pixel(1,0))==255
+              && qGray(im.pixel(7,1))==0, "VIFF 1-bit (VFF_TYP_BIT) storage decodes"); }
+      // Orientation regression: a NON-SQUARE VIFF must not come in transposed. Field @520 is the
+      // WIDTH and @524 the HEIGHT (pinned to a real ImageMagick round-trip: an 8-bit 64x40 source
+      // reads back 64x40 and pixel-exact). Reading them the other way round transposed every
+      // non-square Khoros image.
+      { QByteArray b(1024,'\0'); b[0]=char(0xAB); b[1]=char(0x01); b[4]=char(2);
+        auto put32=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        put32(520,4); put32(524,2); put32(560,1); put32(564,1);   // 4 wide x 2 tall, 8-bit gray
+        ap8(b,{1,2,3,4,  5,6,7,8});                               // row-major: row0 = 1..4, row1 = 5..8
+        QImage im=RasterExtra::decodeData(b,"viff");
+        check(!im.isNull() && im.size()==QSize(4,2), "VIFF non-square: @520 is width, @524 is height (not transposed)");
+        check(!im.isNull() && qGray(im.pixel(3,0))==4 && qGray(im.pixel(0,1))==5,
+              "VIFF rows are read in row-major order at the correct stride"); }
+
+      // DPX descriptor 6 (single luma channel) — grayscale film scans were previously rejected.
+      { QByteArray b(2048,'\0'); b.replace(0,4,"SDPX");
+        auto put32=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        put32(772,2); put32(776,1);                 // 2x1
+        b[800]=char(6);                             // descriptor = luma
+        b[803]=char(8);                             // 8 bits
+        put32(806,0); put32(808,2048);              // encoding none, data at 2048
+        ap8(b,{0x00, 0xFF});
+        QImage im=RasterExtra::decodeData(b,"dpx");
+        check(!im.isNull() && im.size()==QSize(2,1) && qGray(im.pixel(0,0))==0 && qGray(im.pixel(1,0))==255,
+              "DPX descriptor 6 (luma) grayscale decodes"); }
+
+      check(RasterExtra::extensions().contains("avs") && RasterExtra::extensions().contains("rgf"),
+            "rasterextra advertises AVS/RGF for the Import filter");
+
+      // PFS: 1st Publisher ART — u16-LE pad/width/pad/height then packed 1-bpp rows.
+      { QByteArray b; le16(b,0); le16(b,8); le16(b,0); le16(b,6);
+        ap8(b,{0x80,0x01,0x00,0x00,0x00,0xFF});          // row0 leftmost set, row1 rightmost, row5 all set
+        QImage im=RasterExtra::decodeData(b,"art");
+        check(!im.isNull() && im.size()==QSize(8,6), "PFS ART decodes to 8x6");
+        check(!im.isNull() && qGray(im.pixel(0,0))==255 && qGray(im.pixel(1,0))==0,
+              "PFS ART packs 1 = white, MSB first"); }
+
+      // JNG: PNG-style chunks whose JDAT carries a plain JPEG bitstream.
+      { QImage src(4,3,QImage::Format_RGB32); src.fill(QColor(200,40,60));
+        QByteArray jpg; { QBuffer bf(&jpg); bf.open(QIODevice::WriteOnly); src.save(&bf,"JPEG",95); }
+        QByteArray b; ap8(b,{0x8B,'J','N','G',0x0D,0x0A,0x1A,0x0A});
+        auto chunk=[&](const char* tag, const QByteArray& body){
+            be32(b,quint32(body.size())); b.append(tag,4); b.append(body); be32(b,0); };   // CRC unchecked
+        QByteArray jhdr; be32(jhdr,4); be32(jhdr,3); for(int k=0;k<8;k++) jhdr.append(char(0));
+        chunk("JHDR",jhdr); chunk("JDAT",jpg); chunk("IEND",QByteArray());
+        QImage im=RasterExtra::decodeData(b,"jng");
+        check(!im.isNull() && im.size()==QSize(4,3), "JNG extracts the JDAT JPEG stream");
+        check(!im.isNull() && qAbs(im.pixelColor(0,0).red()-200)<12, "JNG pixels come through the JPEG decode"); }
+
+      // A C header dump whose byte array is an ordinary image file.
+      { QImage src(3,2,QImage::Format_RGB32); src.fill(QColor(10,220,30));
+        QByteArray png; { QBuffer bf(&png); bf.open(QIODevice::WriteOnly); src.save(&bf,"PNG"); }
+        QByteArray c="/* generated */\nstatic const unsigned char MagickImage[] =\n  {\n";
+        for(int i=0;i<png.size();++i) c += QByteArray("    0x") + QByteArray::number(quint8(png[i]),16) + ",\n";
+        c += "  };\n";
+        QImage im=RasterExtra::decodeData(c,"h");
+        check(!im.isNull() && im.size()==QSize(3,2) && im.pixelColor(1,1)==QColor(10,220,30),
+              "C-header byte array is recovered and decoded"); }
+
+      // Cisco IP Phone image: Width/Height/Depth + hex Data, packed MSB-first, 0 = white.
+      { QByteArray x="<CiscoIPPhoneImage><Title>t</Title><Width>4</Width><Height>2</Height><Depth>2</Depth><Data>";
+        x += "FC";        // row0: 11 11 00 00 -> black,black,white,white  (stride=(4*2+7)/8 = 1 byte)
+        x += "0F";        // row1: 00 00 11 11 -> white,white,black,black
+        x += "</Data></CiscoIPPhoneImage>";
+        QImage im=RasterExtra::decodeData(x,"cip");
+        check(!im.isNull() && im.size()==QSize(4,2), "Cisco IP Phone image decodes 4x2 at 2 bpp");
+        check(!im.isNull() && qGray(im.pixel(0,0))==0 && qGray(im.pixel(3,0))==255
+              && qGray(im.pixel(3,1))==0, "Cisco IP Phone packs 2-bit pixels MSB-first, 0 = white"); }
+
+      check(RasterExtra::extensions().contains("jng") && RasterExtra::extensions().contains("cip"),
+            "rasterextra advertises JNG/CIP for the Import filter");
+      check(RasterExtra::extensions().contains("uil") && RasterExtra::extensions().contains("brf"),
+            "rasterextra advertises UIL/braille for the Import filter");
+
+      // JBIG1 (ITU-T T.82). A real 64x48 .bie: BIH with D=0/P=1, L0=2 (24 stripes), TPBON set, and
+      // only three bytes of arithmetic-coded payload — most stripes decode from typical prediction
+      // alone. Decoded pixels match ImageMagick's readback exactly (AE=0 at matching dimensions).
+      { const char* jb64 =
+          "AAABAAAAAEAAAAAwAAAAAggAAxz/Av8C/wL/Av8C/wL/Av8C/wL/Av8C/wLm4P8C8P8C/wL/Av8C"
+          "/wL/Av8C/wL/Av8C/wI=";
+        const QByteArray jb=QByteArray::fromBase64(jb64);
+        QImage im=RasterExtra::decodeData(jb,"bie");
+        check(!im.isNull() && im.size()==QSize(64,48), "JBIG1 decodes a real striped .bie to 64x48");
+        int black=0; if(!im.isNull()) for(int y=0;y<im.height();++y) for(int x=0;x<im.width();++x)
+            if(qGray(im.pixel(x,y))<128) ++black;
+        check(!im.isNull() && black>0 && black<64*48, "JBIG1 output is a real bilevel image, not a blank page");
+        // A continuation BIE (DL>0) needs the layers of an earlier BIE we never saw, and absurd
+        // dimensions must decline cleanly rather than hang or allocate.
+        { QByteArray p2=jb; if(p2.size()>2) p2[0]=char(1);
+          check(RasterExtra::decodeData(p2,"bie").isNull(), "JBIG1 declines a continuation BIE (DL>0)"); }
+        { QByteArray p3=jb; if(p3.size()>8){ p3[4]=char(0xFF); p3[5]=char(0xFF); p3[6]=char(0xFF); p3[7]=char(0xFF); }
+          check(RasterExtra::decodeData(p3,"bie").isNull(), "JBIG1 rejects an absurd image width"); }
+        check(RasterExtra::decodeData(jb.left(20),"bie").isNull(), "JBIG1 rejects a header-only stream"); }
+
+      // JBIG1 progressive (D>0): a resolution pyramid, which is what pbmtojbg writes by default for
+      // anything above 640x480 — the lowest layer through the generic region decoder, then one
+      // differential layer per step with TPDON typical prediction and DPON deterministic prediction.
+      // Every fixture below is a real pbmtojbg BIE of a procedurally generated bitmap, so the test
+      // can regenerate that bitmap and demand every pixel back; jbgtopbm returns the same pixels for
+      // the same files (AE=0 with both dimensions asserted).
+      { auto exact=[&](const char* b64,int w,int h,const std::function<bool(int,int)>& pat,
+                       const char* what,const QByteArray& dptable=QByteArray()){
+            QByteArray bie=QByteArray::fromBase64(QByteArray(b64));
+            if(!dptable.isEmpty()) bie.insert(20,dptable);
+            const QImage im=RasterExtra::decodeData(bie,"jbg");
+            bool ok = !im.isNull() && im.width()==w && im.height()==h;
+            if(ok) for(int y=0;y<h && ok;++y) for(int x=0;x<w && ok;++x)
+                ok = ((qGray(im.pixel(x,y))<128) == pat(x,y));
+            check(ok,what);
+        };
+        auto rings=[](int x,int y){ return ((x*x+y*y)%17)<6; };   // 64x48 source of fixtures A/B/D
+        auto bars =[](int x,int y){ return (x%8)<4; };            // 160x128 source of fixture C
+        // A: `pbmtojbg -d 2`, the encoder's own defaults (TPBON+TPDON+DPON, ILEAVE+SMID, L0=2).
+        exact("AAIBAAAAAEAAAAAwAAAAAggAAxz+ev4BgP8CwLqstf8CjQqY2P8CqSYHTP8CrpkC8P8CMicHgP8C"
+              "LVVJWKnFAGDfe3fadKD/AhRmgAkPg5Y9RFt01lnl/wIfet5pWpqdy5yi6UevCf8CtyPZCEPlaJWl"
+              "sJKfU6H/AuiCmmwFMfi2o9m6rOkg/wKhg8gNkvWnPJ0/XSN6LP8CGPTWq88JfWmAQBnI3EvLAYxZ"
+              "oqTgbjUCiT2Nl5ym1cHnhyxPRYFFwaj/AnAddvrApcqVRZgBjS5NTCDEQH04LnTetjRtBUvTru2X"
+              "Xcxav5XJGHniozfW4P8C1Tac00/oPinV6My9B9QIG3UjnY1jfma1eicMbROX6mHNXbPKknt+XP8C"
+              "T4jqUlMzsg2a8li0htdZHoX3UbYOSc2lGo5uY6sbXdKh+RFb8829pLnrJM2L/wIx2iVPS5IOUA7Z"
+              "luggjx/bcLlqjDGNQ5y1zd1jKy5wN57/Apgc1sPX31g9aTHEN7J8/R0LXUzZLiIbCv8AYx8UhLhM"
+              "Lf8C", 64,48, rings, "JBIG1 progressive D=2 (TPBON+TPDON+DPON) is pixel-exact");
+        // B: `-d 3 -p 92 -r` — four layers, the LRLTWO two-line template in layer 0, and every
+        // stripe terminated by SDRST so each one restarts the coder and the reset boundary bites.
+        exact("AAMBAAAAAEAAAAAwAAAAAggAA1z0bYD/A/1y/wP9kv8DF5wxQCcEOtD/A0hEsEQxvLD/Az4e39OC"
+              "sEj/Ay1VSVipxQBg3067bULUUUlqhBXfiSxe6YqSYP8DOVTBfL0OrgKy9VhRxWNGgTqgurK5OiVN"
+              "6SqIZoD/A0mFMist00YKiv1v2M1FKppL5XmuoOA6fGA3lBeg/wMY9Narzwl9aYBAGcjcS8sBjFmi"
+              "pOBuNQKJPY2XnKbV1caGhm6Jl3pozFxgd2+sCj55ai0aprS5NTCDC39J+JWn5xpZ37PurqkQBsVP"
+              "PIqGaDehlGbA/wManRlPkPY7ATpBeinw+SBVX7RPaBQ+uxRTI015Q+spPlZ5dk0/JsGDsLe/YwgB"
+              "nn/nkUA9DeZq6mhqn3Nt+ezOLalxKKJ7nIJnu+WYdAMV4qHrtDvagP8DDylHA3sQtw4ynM3YqSwz"
+              "qSU72b5tlJ6gqLjbJ2yC8KJckUbJvKn21LJ+wq9SqsFQH5v4AIq7YVRJadpiOoPNnLdLKckGT7Ky"
+              "DhjD5++sM2yPIPzA/wM=", 64,48, rings,
+              "JBIG1 progressive D=3 with the LRLTWO template and SDRST stripes is pixel-exact");
+        // C: `-d 3 -p 8` on 8-pixel bars — the periodicity makes the encoder issue an ATMOVE inside
+        // a differential layer (TX=8), so the adaptive template pixel is really exercised.
+        exact("AAMBAAAAAKAAAACAAAAAAggAAwjfgP8CgP8C/wL/Av8C/wL/Av8CwhF1668lgP8C/wL/Av8C/wL/"
+              "Av8C/wLS8eVLypeWf/8C/wL/Av8C/wL/Av8C/wL/BgAAAA4IAPS8YBCbhgEMS8rSDYAAAAF8UOD/"
+              "Av8C/wL/Av8C/wL/Av8C", 160,128, bars,
+              "JBIG1 progressive with a differential-layer ATMOVE is pixel-exact");
+        // D: the same 64x48 rings encoded against a PRIVATE deterministic-prediction table whose
+        // every entry is "2" (never predict, always code). In DPTABLE wire format that is 1728
+        // bytes of 0xAA, spliced back in here so the fixture stays small; the decoder must read it
+        // out of the stream instead of using T.82's default table.
+        exact("AAIBAAAAAEAAAAAwAAAAAggAAx7+ev4BgP8CwLqstf8CjQqY2P8CqSYHTP8CrpkC8P8CMicHgP8C"
+              "LVVJWLI26OJl+b729nSSSP8CHVNABHFSA/Y2SLbonc4d2P8CH3NH9K8FZ7FzlF05r1HC/wK3I9j/"
+              "AEInOXWJDWD9Mzc0mED/AtQRw8gN10ZwTbYZqXYFc3D/Ao0RyA2YmpdiAkvrn8Eg8P8CFNPDnsdY"
+              "RCh3rJqrH5t1VAmHONq1b7G1QMfwQRVP20A6+M9D1QT/AE5N3xTaW07oBMD/Al8KsNSTkgBP4bsk"
+              "UVlCdAicDxY6RFyCJRFHg1IxZd4UamQFzPCcsgQ8Y333+y0EA4D/At+BgrZHojSxUFAoKOdH3gD7"
+              "xvqwo6oi4hJjAzLr5xCKsV4yxNI32O9gW1uvVdV1QP8CUOmz9Y+sauG6XfomxKBUn2QA+aJ6sRnR"
+              "I2rZUdSowKLVop3E0Co6ll3vy/Bk/wCsGqj/AjqeSVLvZSmlLE1K57d1cO/9bx06pE8+Anza/dXs"
+              "bj4t7OwfxzGa/wKm5Wh8d8ZRpc3cHhVfo+zV4Iu/MoAiX0jaLijrQ5B9Y8bYBP8C", 64,48, rings,
+              "JBIG1 progressive honours a DPPRIV table carried in the stream",
+              QByteArray(1728,char(0xAA)));
+
+        // Hostile or unsupported progressive variants must decline, never guess pixels.
+        const QByteArray good=QByteArray::fromBase64(QByteArray(
+              "AAIBAAAAAEAAAAAwAAAAAggAAxz+ev4BgP8CwLqstf8CjQqY2P8CqSYHTP8CrpkC8P8CMicHgP8C"
+              "LVVJWKnFAGDfe3fadKD/AhRmgAkPg5Y9RFt01lnl/wIfet5pWpqdy5yi6UevCf8CtyPZCEPlaJWl"
+              "sJKfU6H/AuiCmmwFMfi2o9m6rOkg/wKhg8gNkvWnPJ0/XSN6LP8CGPTWq88JfWmAQBnI3EvLAYxZ"
+              "oqTgbjUCiT2Nl5ym1cHnhyxPRYFFwaj/AnAddvrApcqVRZgBjS5NTCDEQH04LnTetjRtBUvTru2X"
+              "Xcxav5XJGHniozfW4P8C1Tac00/oPinV6My9B9QIG3UjnY1jfma1eicMbROX6mHNXbPKknt+XP8C"
+              "T4jqUlMzsg2a8li0htdZHoX3UbYOSc2lGo5uY6sbXdKh+RFb8829pLnrJM2L/wIx2iVPS5IOUA7Z"
+              "luggjx/bcLlqjDGNQ5y1zd1jKy5wN57/Apgc1sPX31g9aTHEN7J8/R0LXUzZLiIbCv8AYx8UhLhM"
+              "Lf8C"));
+        { QByteArray b=good; b[18]=char(0x04);          // SEQ: SDEs no longer arrive layer-major
+          check(RasterExtra::decodeData(b,"jbg").isNull(), "JBIG1 declines SEQ/HITOLO progressive ordering"); }
+        { QByteArray b=good; b[18]=char(0x01);          // SMID without ILEAVE: illegal in T.82
+          check(RasterExtra::decodeData(b,"jbg").isNull(), "JBIG1 declines an illegal SDE ordering"); }
+        { QByteArray b=good; b[1]=char(31);
+          check(RasterExtra::decodeData(b,"jbg").isNull(), "JBIG1 declines an absurd differential layer count"); }
+        check(RasterExtra::decodeData(good.left(120),"jbg").isNull(),
+              "JBIG1 declines a progressive stream truncated mid-stripe");
+        // Bytes the arithmetic decoder never consumes mean our line accounting has drifted from the
+        // encoder's; every layer stacked on top would be wrong, so the whole image is refused.
+        { QByteArray b=good; const int e=b.indexOf(QByteArray("\xFF\x02",2),20);
+          if(e>0) b.insert(e,QByteArray(4,'\0'));
+          check(e>0 && RasterExtra::decodeData(b,"jbg").isNull(),
+                "JBIG1 declines a progressive stripe with unconsumed PSCD bytes"); } }
+      check(RasterExtra::extensions().contains("bie") && RasterExtra::extensions().contains("jbg"),
+            "rasterextra advertises JBIG1 for the Import filter");
+
+      // Kodak PhotoCD: "PCD_IPI" at sector 1, then plain Photo YCC resolutions stored as row PAIRS
+      // (two luma rows, then a half-width Cb row and a half-width Cr row). Built here rather than
+      // embedded — even the smallest resolution is 45 KB. Base/16 is 192x128 at offset 0x2000.
+      { const int W=192, H=128, CW=W/2;
+        QByteArray b(0x2000, '\0');
+        b.replace(2048, 7, "PCD_IPI");
+        for(int rp=0; rp<H/2; ++rp){
+            QByteArray y0(W, char(100)), y1(W, char(100));          // flat luma
+            QByteArray cbr(CW, char(156)), crr(CW, char(137));      // neutral chroma
+            if(rp==0){ cbr[0]=char(200); }                          // first cell: strong blue shift
+            b += y0; b += y1; b += cbr; b += crr;
+        }
+        QImage im=RasterExtra::decodeData(b,"pcd");
+        check(!im.isNull() && im.size()==QSize(W,H), "PhotoCD decodes Base/16 (192x128) from the Image Pac");
+        // neutral chroma -> grey at the luma value
+        check(!im.isNull() && im.pixelColor(10,10)==QColor(100,100,100),
+              "PhotoCD neutral chroma (156/137) yields grey at the luma level");
+        // Cb=200 -> C1=(200-156)*2.2179=97.6 : B=L+C1, G=L-0.194*C1, R unchanged
+        const QColor px = im.isNull()? QColor() : im.pixelColor(0,0);
+        check(!im.isNull() && px.red()==100 && qAbs(px.blue()-198)<=1 && qAbs(px.green()-81)<=1,
+              "PhotoCD applies the Kodak Photo YCC chroma transform"); }
+      check(RasterExtra::extensions().contains("pcd"), "rasterextra advertises PhotoCD for the Import filter");
+
+      // CCITT Group 3 fax (.g3/.fax): no header, so the page width comes from the data — every line
+      // is EOL-delimited and its runs sum to the width, so the first line yields it.
+      { // Build one line: EOL + white run 8 + black run 8 + EOL, repeated, at width 16.
+        auto bits=[&](const QString& b){ QByteArray out; int acc=0,k=0;
+            for(QChar c : b){ acc=(acc<<1)|(c=='1'?1:0); if(++k==8){ out.append(char(acc)); acc=0;k=0; } }
+            if(k){ acc<<=(8-k); out.append(char(acc)); } return out; };
+        const QString EOL="000000000001", W8="10011", B8="000101";   // T.4: white 8 = 10011, black 8 = 000101
+        QByteArray g3=bits(EOL+W8+B8+EOL+W8+B8+EOL);
+        QImage im=RasterExtra::decodeData(g3,"g3");
+        check(!im.isNull() && im.width()==16, "G3 fax derives the page width from the first line's runs");
+        check(!im.isNull() && im.height()>=1 && qGray(im.pixel(0,0))==255 && qGray(im.pixel(8,0))==0,
+              "G3 fax decodes the white/black runs in order"); }
+      check(RasterExtra::extensions().contains("g3") && RasterExtra::extensions().contains("fax"),
+            "rasterextra advertises G3 fax for the Import filter");
+
+      // Affinity (.afdesign/.afphoto/.afpub): the artwork is closed and undocumented, but every real
+      // document carries a "Thmb" chunk holding a PNG preview past the FAT, which is what we import.
+      { QImage thumb(6,4,QImage::Format_ARGB32); thumb.fill(QColor(180,60,220));
+        QByteArray png; { QBuffer bf(&png); bf.open(QIODevice::WriteOnly); thumb.save(&bf,"PNG"); }
+        QByteArray f(80,'\0');
+        f[0]=char(0x00); f[1]=char(0xFF); f[2]='K'; f[3]='A';
+        { const quint32 nine=9; memcpy(f.data()+4,&nine,4); }
+        f.replace(8,4,"nsrP"); f.replace(12,4,"#Inf");
+        { const quint32 lo=80, hi=0;                       // FAT end = 80: the thumbnail follows
+          memcpy(f.data()+24,&lo,4); memcpy(f.data()+28,&hi,4); }
+        f += "Thmb"; f += QByteArray(8,'\0'); f += png;
+        const QImage im=RasterExtra::decodeData(f,"afdesign");
+        check(!im.isNull() && im.size()==QSize(6,4), "Affinity Thmb preview is extracted");
+        check(!im.isNull() && im.pixelColor(0,0)==QColor(180,60,220), "Affinity preview pixels survive intact");
+        // Recognised by signature even without the extension.
+        check(!RasterExtra::decodeData(f,QString()).isNull(), "Affinity is recognised by its 00 FF 4B 41 signature");
+        // A file with no thumbnail must decline rather than return a blank image.
+        check(RasterExtra::decodeData(f.left(80),"afdesign").isNull(), "Affinity without a Thmb chunk declines"); }
+      check(RasterExtra::extensions().contains("afdesign") && RasterExtra::extensions().contains("afphoto"),
+            "rasterextra advertises the Affinity extensions for the Import filter");
+
+      // Raster-only PDF: the page is one image XObject rather than drawing operators.
+      { QByteArray px; for(int i=0;i<6;++i){ px.append(char(200)); px.append(char(40)); px.append(char(60)); }
+        const QByteArray z=qCompress(px,9).mid(4);         // plain zlib, as a PDF FlateDecode stream
+        QByteArray pdf="%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width 3 /Height 2 "
+                       "/Filter [ /FlateDecode ] /BitsPerComponent 8 /ColorSpace 5 0 R /Length ";
+        pdf += QByteArray::number(z.size()) + " >>\nstream\n" + z + "\nendstream\nendobj\ntrailer<<>>\n";
+        const QImage im=xara::pdfRasterImage(pdf);
+        check(!im.isNull() && im.size()==QSize(3,2), "raster-only PDF decodes its image XObject");
+        check(!im.isNull() && im.pixelColor(0,0)==QColor(200,40,60), "PDF image XObject pixels come through FlateDecode"); }
+      check(xara::pdfRasterImage(QByteArray("%PDF-1.4\nno images here\n")).isNull(),
+            "a PDF without an image XObject is not mistaken for a raster");
+      check(RasterExtra::decodeData(QByteArray(3000,'\0'),"pcd").isNull(),
+            "PhotoCD without the PCD_IPI signature is rejected");
+
+      // Motif UIL: a colour_table mapping one character per colour, then icon() rows of characters.
+      { QByteArray u="/* UIL */\nvalue\n  t_ct : color_table(\n"
+                     "    color('#FF0000',background) = ' ',\n"
+                     "    color('#00FF00',background) = '.',\n"
+                     "    color('#0000FF',background) = 'X');\n"
+                     "  t_icon : icon(color_table = t_ct,\n"
+                     "    \" .X\",\n"
+                     "    \"X. \");\n";
+        QImage im=RasterExtra::decodeData(u,"uil");
+        check(!im.isNull() && im.size()==QSize(3,2), "Motif UIL icon decodes to 3x2");
+        check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0)
+              && im.pixelColor(2,0)==QColor(0,0,255) && im.pixelColor(0,1)==QColor(0,0,255),
+              "Motif UIL maps each character through the colour table"); }
+
+      // Unicode braille bitmap: one char per 2x4 dot cell (U+2800 + dot mask).
+      { QByteArray b="Width: 4\nHeight: 8\n\n";
+        // cell(0,0): dots 1 and 8 -> (0,0) and (1,3). cell(1,0): dot 4 is that cell's RIGHT column, row 0 -> (3,0).
+        b += QString(QChar(0x2800|0x01|0x80)).toUtf8();
+        b += QString(QChar(0x2800|0x08)).toUtf8();
+        b += "\n";
+        b += QString(QChar(0x2800|0x04)).toUtf8();      // row 1 of cells: dot 3 -> (0, 4+2)
+        b += QString(QChar(0x2800)).toUtf8();
+        b += "\n";
+        QImage im=RasterExtra::decodeData(b,"ubrl");
+        check(!im.isNull() && im.size()==QSize(4,8), "Unicode braille bitmap decodes to 4x8");
+        check(!im.isNull() && qGray(im.pixel(0,0))==0 && qGray(im.pixel(1,3))==0
+              && qGray(im.pixel(3,0))==0 && qGray(im.pixel(0,6))==0,
+              "braille dots 1/8/4/3 land in the right cell positions");
+        check(!im.isNull() && qGray(im.pixel(3,7))==255, "unset braille dots stay white"); }
+      check(RasterExtra::decodeData(QByteArray("Width: 4\nHeight: 4\n\n....\n"),"brf").isNull()==false,
+            "ASCII braille (BRF) parses its header and body");
+
+      // ---- 16-bit variants of formats we already read at 8 bits (scanners/film/scientific output).
+      // Samples are stored big-endian and we keep the high byte, so a 16-bit 0xABCD reads back 0xAB.
+      { QByteArray b; be16(b,474); ap8(b,{0,2}); be16(b,3); be16(b,2); be16(b,2); be16(b,3);   // storage=verbatim, bpc=2
+        while(b.size()<512) b.append(char(0));
+        auto s16=[&](std::initializer_list<int> v){ for(int x:v){ b.append(char((x>>8)&0xFF)); b.append(char(x&0xFF)); } };
+        s16({0x1000,0x2000,0x3000,0x4000});   // R plane
+        s16({0x5000,0x6000,0x7000,0x8000});   // G plane
+        s16({0x9000,0xA000,0xB000,0xC000});   // B plane
+        QImage im=RasterExtra::decodeData(b,"sgi");
+        check(!im.isNull() && im.size()==QSize(2,2), "SGI 16-bit (bpc=2) decodes");
+        check(!im.isNull() && im.pixelColor(0,1)==QColor(0x10,0x50,0x90), "SGI 16-bit keeps the high byte, bottom-to-top"); }
+
+      { QByteArray b(64,'\0');                                    // VIPS, big-endian (SPARC magic), USHORT
+        auto be32b=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        be32b(0,0x08f2a6b6u); be32b(4,2); be32b(8,1); be32b(12,3); be32b(20,2); be32b(24,0);   // 2x1, 3 bands, BandFmt=USHORT
+        auto s16=[&](std::initializer_list<int> v){ for(int x:v){ b.append(char((x>>8)&0xFF)); b.append(char(x&0xFF)); } };
+        s16({0xFF00,0x0000,0x0000,  0x0000,0xFF00,0x0000});
+        QImage im=RasterExtra::decodeData(b,"vips");
+        check(!im.isNull() && im.size()==QSize(2,1), "VIPS 16-bit (BandFmt USHORT) decodes");
+        check(!im.isNull() && im.pixelColor(0,0)==QColor(255,0,0) && im.pixelColor(1,0)==QColor(0,255,0),
+              "VIPS USHORT samples keep the high byte"); }
+
+      { QByteArray b(2048,'\0'); b.replace(0,4,"SDPX");            // DPX 16-bit RGB
+        auto be32b=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        be32b(772,2); be32b(776,1); b[800]=char(50); b[803]=char(16); be32b(806,0); be32b(808,2048);
+        auto s16=[&](std::initializer_list<int> v){ for(int x:v){ b.append(char((x>>8)&0xFF)); b.append(char(x&0xFF)); } };
+        s16({0xFF00,0x0000,0x0000,  0x0000,0x0000,0xFF00});
+        while(b.size() < 2048+16) b.append(char(0));               // row padding to a 32-bit boundary
+        QImage im=RasterExtra::decodeData(b,"dpx");
+        check(!im.isNull() && im.size()==QSize(2,1) && im.pixelColor(0,0)==QColor(255,0,0)
+              && im.pixelColor(1,0)==QColor(0,0,255), "DPX 16-bit RGB decodes"); }
+
+      // Cineon 16-bit: samples are printing-density LOG codes. The Kodak reference points map
+      // code 95 -> black and 685 -> white (stored as 16-bit, i.e. 6080 and 43839).
+      { QByteArray b(2048,'\0');
+        auto be32b=[&](int o,quint32 v){ b[o]=char((v>>24)&0xFF); b[o+1]=char((v>>16)&0xFF); b[o+2]=char((v>>8)&0xFF); b[o+3]=char(v&0xFF); };
+        be32b(0,0x802A5FD7u); be32b(4,2048); be32b(200,2); be32b(204,1);   // magic, data offset, 2x1 (alt header layout)
+        auto s16=[&](std::initializer_list<int> v){ for(int x:v){ b.append(char((x>>8)&0xFF)); b.append(char(x&0xFF)); } };
+        s16({6080,6080,6080,  43839,43839,43839});                  // reference black, reference white
+        QImage im=RasterExtra::decodeData(b,"cin");
+        check(!im.isNull() && im.size()==QSize(2,1), "Cineon 16-bit decodes (size from the 200/204 header layout)");
+        check(!im.isNull() && qGray(im.pixel(0,0))<=2 && qGray(im.pixel(1,0))>=253,
+              "Cineon log->linear->sRGB maps reference black/white to 0/255"); }
+
+      // ExtCodec (dlopen JPEG 2000 / JPEG XL): the filter must advertise a format iff its library loaded.
+      check(ExtCodec::extensions().contains("jp2")==ExtCodec::jp2Available(), "JP2 is offered in the filter exactly when OpenJPEG is loadable");
+      check(ExtCodec::extensions().contains("jxl")==ExtCodec::jxlAvailable(), "JXL is offered in the filter exactly when libjxl is loadable");
+      check(ExtCodec::extensions().contains("mobi")==ExtCodec::mobiAvailable(), "MOBI is offered in the filter exactly when libmobi is loadable");
+      check(ExtCodec::extensions().contains("exr"), "OpenEXR (tinyexr) is always offered — compiled in, no dlopen");
+      check(ExtCodec::extensions().contains("djvu")==ExtCodec::djvuAvailable(), "DjVu is offered in the filter exactly when DjVuLibre is loadable");
+      check(ExtCodec::extensions().contains("jxr")==ExtCodec::jxrAvailable(), "JPEG XR is offered in the filter exactly when jxrlib is linked");
+      check(xara::jxrDecode("/nonexistent/photo.jxr").isNull(), "jxrDecode fails safe on an unreadable path");
+      { QTemporaryFile tf(QDir::tempPath()+"/xarqjxrXXXXXX.jxr"); if(tf.open()){ tf.write("II\xBC\x01 not really a JPEG XR bitstream", 32); tf.flush();
+        check(xara::jxrDecode(tf.fileName()).isNull(), "jxrDecode rejects non-JXR data without crashing"); } }
+      check(ExtCodec::extensions().contains("dcm")==ExtCodec::dicomAvailable(), "DICOM is offered in the filter exactly when GDCM is linked");
+      check(xara::dicomDecode("/nonexistent/scan.dcm").isNull(), "dicomDecode fails safe on an unreadable path");
+      { QTemporaryFile tf(QDir::tempPath()+"/xarqdcmXXXXXX.dcm"); if(tf.open()){ tf.write("not a DICOM file - missing the DICM magic",41); tf.flush();
+        check(xara::dicomDecode(tf.fileName()).isNull(), "dicomDecode rejects non-DICOM data without crashing"); } }
+      check(xara::wmfToSvg(QByteArray("not a metafile")).isEmpty(), "wmfToSvg rejects non-WMF data (no spurious SVG)");
+      check(xara::wmfAvailable() || xara::wmfToSvg(QByteArray()).isEmpty(), "wmfToSvg returns nothing when libwmf is not compiled in");
+      check(ExtCodec::extensions().contains("svs")==ExtCodec::slideAvailable(), "whole-slide is offered in the filter exactly when OpenSlide is linked");
+      check(xara::slideDecode("/nonexistent/scan.svs").isNull(), "slideDecode fails safe on an unreadable path");
+      { QTemporaryFile tf(QDir::tempPath()+"/xarqsvsXXXXXX.svs"); if(tf.open()){ tf.write("II*\\0 not really a whole-slide tiff",32); tf.flush();
+        check(xara::slideDecode(tf.fileName()).isNull(), "slideDecode rejects non-slide data without crashing"); } }
+      check(ExtCodec::decode("/nonexistent/file.jp2").isNull(), "ExtCodec::decode fails safe on a missing file");
+      check(ExtCodec::decode("/nonexistent/book.mobi").isNull(), "MOBI decode fails safe on a missing file");
+      check(ExtCodec::decode("/nonexistent/scene.exr").isNull(), "EXR decode fails safe on a missing file");
+      check(ExtCodec::decode("/nonexistent/scan.djvu").isNull(), "DjVu decode fails safe on a missing file");
+      // JBIG2 (ITU T.88) via dlopen'd jbig2dec. The fixture is a real standalone .jb2: file header,
+      // page-information segment, one immediate generic region with MMR=1 (its body is a T.6/Group-4
+      // bitstream), and an end-of-page segment. 20x12, black at cols 0..4 rows 0..3 and cols 15..19
+      // rows 8..11. Polarity (1 = black) cross-checks exactly against our own CALS/T.6 decoder.
+      check(ExtCodec::extensions().contains("jb2")==ExtCodec::jbig2Available(),
+            "JBIG2 is offered in the filter exactly when jbig2dec is loadable");
+      check(ExtCodec::decode("/nonexistent/scan.jb2").isNull(), "JBIG2 decode fails safe on a missing file");
+      { const char* b64 =
+          "l0pCMg0KGgoBAAAAAQAAAAAwAAEAAAATAAAAFAAAAAwAAAAAAAAAAAEAAAAAAAEmAAEAAAAcAAAAFAAAAAwAAAAAAAAAAAABJqf/j51P8AEAEAAAAAIxAAEAAAAA";
+        const QByteArray jb2=QByteArray::fromBase64(b64);
+        QTemporaryFile tf(QDir::tempPath()+"/xarqjb2XXXXXX.jb2");
+        if(tf.open()){ tf.write(jb2); tf.flush();
+          const QImage im=ExtCodec::decode(tf.fileName());
+          if(ExtCodec::jbig2Available()){
+            check(!im.isNull() && im.size()==QSize(20,12), "JBIG2 decodes a real generic-region file to 20x12");
+            int bad=0; if(!im.isNull()) for(int y=0;y<im.height();++y) for(int x=0;x<im.width();++x){
+                const bool black = (y<4 && x<5) || (y>=8 && x>=15);
+                if((qGray(im.pixel(x,y))<128)!=black) ++bad; }
+            check(!im.isNull() && bad==0, "JBIG2 pixels are exact (1 = black, MSB-first, via im->stride)");
+          } else check(im.isNull(), "JBIG2 declines cleanly when jbig2dec is unavailable"); } }
+      { QTemporaryFile tf(QDir::tempPath()+"/xarqjb2bXXXXXX.jb2");
+        if(tf.open()){ tf.write(QByteArray("\x97JB2\r\n\x1a\n\x01 garbage not a segment stream",40)); tf.flush();
+          check(ExtCodec::decode(tf.fileName()).isNull(), "JBIG2 rejects a malformed segment stream without crashing"); } }
+
+      // End-to-end: a real .qoi file on disk imports through Canvas::importImage into a Bitmap shape.
+      { QByteArray b("qoif"); be32(b,2); be32(b,2); ap8(b,{4,0});
+        ap8(b,{0xFF,255,0,0,255, 0xFF,0,255,0,255, 0xFF,0,0,255,255, 0xFF,9,9,9,255});
+        ap8(b,{0,0,0,0,0,0,0,1});
+        const QString qp="/tmp/xq_test.qoi"; { QFile f(qp); f.open(QIODevice::WriteOnly); f.write(b); }
+        c->newDocument(); const int before=c->doc().shapes.size();
+        check(c->importImage(qp), "importImage loads a real .qoi file end-to-end");
+        check(c->doc().shapes.size()==before+1, "the imported QOI became one shape");
+        if(!c->doc().shapes.isEmpty()){ const Shape& s=c->doc().shapes.last();
+          check(s.fill.type==FillType::Bitmap && s.fill.image.size()==QSize(2,2), "the QOI shape carries a 2x2 bitmap fill"); } } }
+
+    // --- Batch 3 vector/page importers: GeoJSON / KML / HP-GL parse geometry into editable Path shapes. ---
+    { auto writeF=[](const QString& p,const QByteArray& b){ QFile f(p); f.open(QIODevice::WriteOnly); f.write(b); };
+      auto fillMix=[&](int from){ int solid=0,none=0; const auto& sh=c->doc().shapes;
+        for(int i=from;i<sh.size();++i){ if(sh[i].type!=ShapeType::Path) continue;
+          if(sh[i].fill.type==FillType::Solid) solid++; else if(sh[i].fill.type==FillType::None) none++; }
+        return QPair<int,int>(solid,none); };
+
+      // GeoJSON: a Polygon (→ filled area) + a LineString (→ stroke-only).
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.geojson";
+        writeF(p,"{\"type\":\"FeatureCollection\",\"features\":["
+                 "{\"type\":\"Feature\",\"geometry\":{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[10,0],[5,8],[0,0]]]}},"
+                 "{\"type\":\"Feature\",\"geometry\":{\"type\":\"LineString\",\"coordinates\":[[0,0],[10,10],[20,0]]}}]}");
+        check(c->importGeoJson(p), "GeoJSON imports");
+        check(c->doc().shapes.size()==b+2, "GeoJSON -> 2 editable shapes");
+        auto m=fillMix(b); check(m.first==1 && m.second==1, "GeoJSON: polygon filled, line stroke-only"); }
+
+      // KML: same geometry via the OGC XML form.
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.kml";
+        writeF(p,"<?xml version='1.0'?><kml><Document>"
+                 "<Placemark><Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 10,0 5,8 0,0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>"
+                 "<Placemark><LineString><coordinates>0,0 10,10 20,0</coordinates></LineString></Placemark></Document></kml>");
+        check(c->importKml(p), "KML imports");
+        check(c->doc().shapes.size()==b+2, "KML -> 2 editable shapes");
+        auto m=fillMix(b); check(m.first==1 && m.second==1, "KML: polygon filled, line stroke-only"); }
+
+      // HP-GL: PU/PD plotter commands -> one stroke-only path.
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.plt";
+        writeF(p,"IN;SP1;PU1000,1000;PD3000,1000;PD3000,3000;PD1000,3000;PD1000,1000;PU1000,1000;PD3000,3000;");
+        check(c->importHpgl(p), "HP-GL imports");
+        check(c->doc().shapes.size()==b+1, "HP-GL -> 1 path shape");
+        if(!c->doc().shapes.isEmpty()){ const Shape& s=c->doc().shapes.last();
+          check(s.type==ShapeType::Path && s.fill.type==FillType::None && s.path.elementCount()>=5,
+                "HP-GL path is stroke-only with the plotted geometry"); } }
+
+      // ---- Native single-file VECTOR importers (vecextra.cpp): decoder-level hermetic tests ----
+      // Each parses a hand-built minimal file to an SVG string and asserts the (Y-flipped) geometry.
+{
+    // Build a minimal little/big-endian .shp in memory: header + one PolyLine
+    // record (1 part, 2 points), then assert shapefileToSvg maps + Y-flips them.
+    QByteArray f;
+    auto putBE32=[&](int32_t v){ f.append(char((v>>24)&0xff)); f.append(char((v>>16)&0xff)); f.append(char((v>>8)&0xff)); f.append(char(v&0xff)); };
+    auto putLE32=[&](int32_t v){ f.append(char(v&0xff)); f.append(char((v>>8)&0xff)); f.append(char((v>>16)&0xff)); f.append(char((v>>24)&0xff)); };
+    auto putLEd =[&](double d){ quint64 v; memcpy(&v,&d,8); for(int i=0;i<8;i++) f.append(char((v>>(8*i))&0xff)); };
+    // ---- 100-byte main header ----
+    putBE32(9994);                       // @0  file code
+    for(int i=0;i<5;i++) putBE32(0);     // @4..23 unused
+    putBE32(0);                          // @24 file length (unused by decoder)
+    putLE32(1000);                       // @28 version
+    putLE32(3);                          // @32 shape type = PolyLine
+    putLEd(10.0); putLEd(20.0);          // @36 Xmin, @44 Ymin
+    putLEd(30.0); putLEd(40.0);          // @52 Xmax, @60 Ymax
+    putLEd(0.0); putLEd(0.0);            // @68 Zmin, @76 Zmax
+    putLEd(0.0); putLEd(0.0);            // @84 Mmin, @92 Mmax  -> 100 bytes
+    check(f.size()==100, "shp header is 100 bytes");
+    // ---- record 1: PolyLine, 1 part, 2 points ----
+    putBE32(1);                          // record number
+    putBE32(40);                         // content length = 40 words (80 bytes)
+    putLE32(3);                          // shape type
+    putLEd(10);putLEd(20);putLEd(30);putLEd(40);  // record box
+    putLE32(1);                          // numParts
+    putLE32(2);                          // numPoints
+    putLE32(0);                          // parts[0]
+    putLEd(10);putLEd(20);              // point 0
+    putLEd(30);putLEd(40);             // point 1
+
+    QString svg = xara::shapefileToSvg((const uint8_t*)f.constData(), (qint64)f.size());
+    check(!svg.isEmpty(),               "shp: non-empty svg");
+    check(svg.contains("<svg"),         "shp: has svg root");
+    check(svg.contains("viewBox="),     "shp: has viewBox");
+    check(svg.contains("<polyline"),    "shp: emits polyline for type 3");
+    // Y-flip: y' = Ymax - y  =>  (10,20)->(10,20) ; (30,40)->(30,0)
+    check(svg.contains("10.000,20.000"),"shp: point0 mapped");
+    check(svg.contains("30.000,0.000"), "shp: point1 Y-flipped");
+
+    // Reject non-shapefile / short buffers.
+    QByteArray bad=f; bad[3]=0;          // corrupt file code (9994=0x0000270A, low byte @3)
+    check(xara::shapefileToSvg((const uint8_t*)bad.constData(),(qint64)bad.size()).isEmpty(), "shp: bad magic rejected");
+    check(xara::shapefileToSvg((const uint8_t*)f.constData(), (qint64)50).isEmpty(),          "shp: sub-header buffer rejected");
+    check(xara::shapefileToSvg((const uint8_t*)f.constData(), (qint64)108).isEmpty(),         "shp: truncated record -> empty");
+}
+// --- GPX importer selftest ---------------------------------------------------
+// Hand-built minimal GPX 1.1 doc: one track (2 points), one route (2 points),
+// one waypoint. Assert the emitted SVG carries the Y-flipped mapped coordinates.
+{
+    const char* gpx =
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "<gpx version='1.1' creator='selftest' xmlns='http://www.topografix.com/GPX/1/1'>\n"
+        "  <wpt lat='10.0' lon='2.0'><name>W</name></wpt>\n"
+        "  <trk><name>T</name><trkseg>\n"
+        "    <trkpt lat='0.0'  lon='0.0'/>\n"
+        "    <trkpt lat='10.0' lon='5.0'/>\n"
+        "  </trkseg></trk>\n"
+        "  <rte><name>R</name>\n"
+        "    <rtept lat='5.0' lon='1.0'/>\n"
+        "    <rtept lat='8.0' lon='4.0'/>\n"
+        "  </rte>\n"
+        "</gpx>\n";
+    QByteArray buf(gpx);
+    QString svg = xara::gpxToSvg(reinterpret_cast<const uint8_t*>(buf.constData()), (qint64)buf.size());
+
+    check(!svg.isEmpty(), "gpx: non-empty SVG produced");
+    check(svg.contains("<svg"), "gpx: has <svg> root");
+    // bbox: lon 0..5, lat 0..10 -> viewBox minLon=0 y=0 w=5 h=10
+    check(svg.contains("viewBox='0.000000 0.000000 5.000000 10.000000'"), "gpx: data-bbox viewBox");
+    // Track: one polyline, blue, fill none.
+    check(svg.contains("<polyline"), "gpx: emits polyline for track/route");
+    check(svg.contains("fill='none'"), "gpx: polyline fill none");
+    check(svg.contains("stroke='#0000ff'"), "gpx: polyline blue stroke");
+    // Y flip: maxLat=10. trkpt(0,0) -> y = 10-0 = 10 ; trkpt(5,10) -> y = 10-10 = 0.
+    check(svg.contains("0.000000,10.000000"), "gpx: trkpt(0,0) flipped to y=10");
+    check(svg.contains("5.000000,0.000000"),  "gpx: trkpt(lon5,lat10) flipped to y=0");
+    // Waypoint(lon2,lat10) -> red circle at cx=2 cy=(10-10)=0.
+    check(svg.contains("<circle"), "gpx: emits waypoint circle");
+    check(svg.contains("fill='#ff0000'"), "gpx: waypoint red fill");
+    check(svg.contains("cx='2.000000'"), "gpx: waypoint cx=lon");
+
+    // Two open polylines total (1 track seg + 1 route).
+    int polyCount = svg.count("<polyline");
+    check(polyCount == 2, "gpx: one polyline per track-seg and route");
+
+    // Negative sniff: non-GPX buffer returns empty.
+    const char* notgpx = "<html><body>hello</body></html>";
+    QByteArray nb(notgpx);
+    QString none = xara::gpxToSvg(reinterpret_cast<const uint8_t*>(nb.constData()), (qint64)nb.size());
+    check(none.isEmpty(), "gpx: non-GPX input rejected");
+
+    // Out-of-range coords are skipped (lat 999 invalid) -> no geometry -> empty.
+    const char* bad = "<gpx><wpt lat='999' lon='0'/></gpx>";
+    QByteArray bb(bad);
+    QString b = xara::gpxToSvg(reinterpret_cast<const uint8_t*>(bb.constData()), (qint64)bb.size());
+    check(b.isEmpty(), "gpx: out-of-range lat rejected -> empty");
+}
+{
+    // Hand-built minimal FIG 3.2 file: polyline, text, and a circle-by-radius.
+    QByteArray fig =
+        "#FIG 3.2\n"
+        "Landscape\n"
+        "Center\n"
+        "Inches\n"
+        "Letter\n"
+        "100.00\n"
+        "Single\n"
+        "-2\n"
+        "1200 2\n"
+        "2 1 0 1 0 7 50 -1 -1 0.000 0 0 -1 0 0 3\n"
+        "\t100 100 200 100 200 200\n"
+        "4 0 0 50 -1 0 12 0.0000 4 135 630 300 400 Hello\001\n"
+        "1 3 0 1 0 7 50 -1 -1 0.000 1 0.0000 500 500 100 100 400 500 600 500\n";
+    QString svg = xara::xfigToSvg((const uint8_t*)fig.constData(), (qint64)fig.size());
+    check(svg.contains("<svg"),                 "xfig: emits svg root");
+    check(svg.contains("viewBox="),             "xfig: emits viewBox");
+    check(svg.contains("<polyline"),            "xfig: polyline object emitted");
+    check(svg.contains("100.000,100.000"),      "xfig: polyline first point mapped");
+    check(svg.contains("200.000,200.000"),      "xfig: polyline last point mapped");
+    check(svg.contains("<ellipse"),             "xfig: ellipse object emitted");
+    check(svg.contains(">Hello<"),              "xfig: text content preserved");
+    check(svg.contains("300.000"),              "xfig: text x coordinate present");
+    // Non-FIG input must be rejected (empty -> caller falls through).
+    QByteArray junk = "not a fig file at all";
+    QString empty = xara::xfigToSvg((const uint8_t*)junk.constData(), (qint64)junk.size());
+    check(empty.isEmpty(),                       "xfig: rejects non-fig input");
+}
+{
+    // Hand-built minimal binary CGM:
+    //   BEGIN METAFILE (class0,id1,len0)
+    //   VDC EXTENT     (class2,id6,len8): (0,0)-(100,100)
+    //   POLYLINE       (class4,id1,len12): (10,10)(90,20)(50,80)
+    //   END METAFILE   (class0,id2,len0)
+    const unsigned char cgm[] = {
+        0x00,0x20,                                              // BEGIN METAFILE
+        0x20,0xC8, 0x00,0x00, 0x00,0x00, 0x00,0x64, 0x00,0x64,  // VDC EXTENT (0,0)-(100,100)
+        0x40,0x2C, 0x00,0x0A, 0x00,0x0A, 0x00,0x5A, 0x00,0x14, 0x00,0x32, 0x00,0x50, // POLYLINE
+        0x00,0x40                                               // END METAFILE
+    };
+    QString svg = xara::cgmToSvg((const uint8_t*)cgm, (qint64)sizeof(cgm));
+    check(svg.contains("<svg"), "cgm: svg root emitted");
+    check(svg.contains("<polyline"), "cgm: polyline element emitted");
+    // VDC Y-up flipped to SVG Y-down: flipY(y) = 0+100-y
+    check(svg.contains("10.000,90.000"), "cgm: point (10,10) Y-flipped to (10,90)");
+    check(svg.contains("90.000,80.000"), "cgm: point (90,20) Y-flipped to (90,80)");
+    check(svg.contains("50.000,20.000"), "cgm: point (50,80) Y-flipped to (50,20)");
+    check(svg.contains("viewBox='0.000 0.000 100.000 100.000'"), "cgm: viewBox from VDC EXTENT");
+
+    // Non-CGM input (does not begin with BEGIN METAFILE) must be rejected.
+    const unsigned char bad[] = { 0x12,0x34,0x56,0x78 };
+    check(xara::cgmToSvg((const uint8_t*)bad, (qint64)sizeof(bad)).isEmpty(), "cgm: rejects non-CGM magic");
+
+    // Truncated buffer must not crash and must return empty.
+    check(xara::cgmToSvg((const uint8_t*)cgm, (qint64)3).isEmpty(), "cgm: truncated header rejected");
+}
+// --- SVGZ importer selftest -------------------------------------------------
+// Build a tiny SVG, gzip it in-memory with zlib, feed the bytes to svgzToSvg,
+// and assert we recover the original SVG text intact.
+{
+    QByteArray svg =
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>"
+        "<rect x='1' y='2' width='3' height='4' fill='#abc'/></svg>";
+
+    // gzip-compress `svg` using zlib's deflateInit2 with the gzip wrapper.
+    QByteArray gz;
+    {
+        z_stream ds;
+        std::memset(&ds, 0, sizeof(ds));
+        int rc = deflateInit2(&ds, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                              15 + 16, 8, Z_DEFAULT_STRATEGY);
+        check(rc == Z_OK, "svgz: deflateInit2 ok");
+        ds.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(svg.data()));
+        ds.avail_in = (uInt)svg.size();
+        char obuf[4096];
+        int r;
+        do {
+            ds.next_out  = reinterpret_cast<Bytef*>(obuf);
+            ds.avail_out = sizeof(obuf);
+            r = deflate(&ds, Z_FINISH);
+            gz.append(obuf, (int)(sizeof(obuf) - ds.avail_out));
+        } while (r != Z_STREAM_END);
+        deflateEnd(&ds);
+    }
+
+    check(gz.size() >= 18, "svgz: produced a gzip stream");
+    check((unsigned char)gz[0] == 0x1f && (unsigned char)gz[1] == 0x8b, "svgz: gzip magic present");
+
+    QString outSvg = xara::svgzToSvg(reinterpret_cast<const uint8_t*>(gz.constData()),
+                               (qint64)gz.size());
+
+    check(!outSvg.isEmpty(), "svgz: inflated non-empty");
+    check(outSvg.contains("<svg"), "svgz: has <svg root");
+    check(outSvg.contains("viewBox='0 0 10 10'"), "svgz: viewBox roundtrip");
+    check(outSvg.contains("<rect"), "svgz: rect roundtrip");
+    check(outSvg.contains("fill='#abc'"), "svgz: fill roundtrip");
+    check(outSvg == QString::fromUtf8(svg), "svgz: exact byte roundtrip");
+
+    // Negative: plain (non-gzip) bytes must be rejected as "not our format".
+    QByteArray plain = "<svg/>";
+    QString none = xara::svgzToSvg(reinterpret_cast<const uint8_t*>(plain.constData()),
+                             (qint64)plain.size());
+    check(none.isEmpty(), "svgz: rejects non-gzip input");
+
+    // Negative: truncated gzip stream must fail cleanly (empty), not crash.
+    QByteArray trunc = gz.left(gz.size() / 2);
+    QString bad = xara::svgzToSvg(reinterpret_cast<const uint8_t*>(trunc.constData()),
+                            (qint64)trunc.size());
+    check(bad.isEmpty(), "svgz: rejects truncated stream");
+}
+
+      // ---- End-to-end: the Canvas dispatch wiring (file → importXxx → editable shapes) ----
+      // GPX (text): one track-seg + one route → two stroke-only polylines.
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.gpx";
+        writeF(p,QByteArray(
+          "<?xml version='1.0'?><gpx version='1.1' xmlns='http://www.topografix.com/GPX/1/1'>"
+          "<trk><trkseg><trkpt lat='0' lon='0'/><trkpt lat='10' lon='5'/></trkseg></trk>"
+          "<rte><rtept lat='5' lon='1'/><rtept lat='8' lon='4'/></rte></gpx>"));
+        check(c->importGpx(p), "GPX imports end-to-end");
+        check(c->doc().shapes.size()>b, "GPX → editable shapes"); }
+      // SVGZ (gzip): a rect inside a gzipped SVG → one editable shape.
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.svgz";
+        const QByteArray plain=QByteArray(
+          "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'>"
+          "<rect x='2' y='3' width='6' height='7' fill='#3366cc'/></svg>");
+        QByteArray gz; { z_stream ds; std::memset(&ds,0,sizeof(ds));
+          deflateInit2(&ds,Z_DEFAULT_COMPRESSION,Z_DEFLATED,15+16,8,Z_DEFAULT_STRATEGY);
+          ds.next_in=reinterpret_cast<Bytef*>(const_cast<char*>(plain.data())); ds.avail_in=(uInt)plain.size();
+          char ob[4096]; int r; do{ ds.next_out=reinterpret_cast<Bytef*>(ob); ds.avail_out=sizeof(ob);
+            r=deflate(&ds,Z_FINISH); gz.append(ob,(int)(sizeof(ob)-ds.avail_out)); }while(r!=Z_STREAM_END);
+          deflateEnd(&ds); }
+        writeF(p,gz);
+        check(c->importSvgz(p), "SVGZ imports end-to-end (gzip → SVG parser)");
+        check(c->doc().shapes.size()>b, "SVGZ → editable shape"); }
+      // Shapefile (binary): 100-byte header + one PolyLine record → editable path.
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.shp";
+        QByteArray f; auto BE=[&](qint32 v){ for(int s=24;s>=0;s-=8) f.append(char((v>>s)&0xff)); };
+        auto LE=[&](qint32 v){ for(int s=0;s<32;s+=8) f.append(char((v>>s)&0xff)); };
+        auto LD=[&](double d){ quint64 v; std::memcpy(&v,&d,8); for(int i=0;i<8;i++) f.append(char((v>>(8*i))&0xff)); };
+        BE(9994); for(int i=0;i<5;i++) BE(0); BE(0); LE(1000); LE(3);
+        LD(10);LD(20);LD(30);LD(40); LD(0);LD(0);LD(0);LD(0);              // header bbox + z/m
+        BE(1); BE(40); LE(3); LD(10);LD(20);LD(30);LD(40); LE(1); LE(2); LE(0);
+        LD(10);LD(20); LD(30);LD(40);                                      // 2 points
+        writeF(p,f);
+        check(c->importShapefile(p), "Shapefile imports end-to-end");
+        check(c->doc().shapes.size()>b, "Shapefile → editable shape"); }
+      // Reject-safety through the Canvas layer.
+      { const QString p="/tmp/xq_t.shp"; writeF(p,QByteArray("nope")); check(!c->importShapefile(p), "Shapefile rejects junk safely"); }
+      { const QString p="/tmp/xq_t.svgz"; writeF(p,QByteArray("<svg/>")); check(!c->importSvgz(p), "SVGZ rejects non-gzip safely"); }
+      { const QString p="/tmp/xq_t.cgm"; writeF(p,QByteArray("\x12\x34\x56\x78",4)); check(!c->importCgm(p), "CGM rejects non-metafile safely"); }
+      { const QString p="/tmp/xq_t.fig"; writeF(p,QByteArray("not a fig")); check(!c->importXfig(p), "Xfig rejects non-fig safely"); }
+      { const QString p="/tmp/xq_t.cmx"; writeF(p,QByteArray("not a cmx file")); check(!c->importCmx(p), "CMX rejects a non-CMX file safely"); }
+
+      // ---- Fleet 13 native vector decoders (Gerber/Excellon/Lottie/Sketch) — hermetic ----
+{
+    // Hand-built minimal Gerber RS-274X: FSLAX23 (int=2,dec=3 => value/1000),
+    // MM units, a 0.5mm circle aperture (D10) and a 0.6x0.8 rect (D11).
+    // Draw a trace (0,0)->(1,0), flash the circle at (1,1), flash rect at (2,2).
+    const char* g =
+        "%FSLAX23Y23*%\n"
+        "%MOMM*%\n"
+        "%ADD10C,0.5*%\n"
+        "%ADD11R,0.6X0.8*%\n"
+        "D10*\n"
+        "X0Y0D02*\n"
+        "X1000Y0D01*\n"
+        "X1000Y1000D03*\n"
+        "D11*\n"
+        "X2000Y2000D03*\n"
+        "M02*\n";
+    QByteArray b(g);
+    QString svg = xara::gerberToSvg((const uint8_t*)b.constData(), (qint64)b.size());
+    check(svg.contains("<svg"), "gerber svg root");
+    check(svg.contains("viewBox="), "gerber viewBox");
+    check(svg.contains("<path"), "gerber trace path");
+    check(svg.contains("stroke-width='0.5000'"), "gerber stroke width = aperture dia");
+    check(svg.contains("stroke-linecap='round'"), "gerber round linecap");
+    check(svg.contains("<circle"), "gerber circle flash");
+    check(svg.contains("r='0.2500'"), "gerber circle flash radius = dia/2");
+    check(svg.contains("<rect"), "gerber rect flash");
+    check(svg.contains("width='0.6000'"), "gerber rect width");
+    check(svg.contains("height='0.8000'"), "gerber rect height");
+    check(svg.contains("1.0000"), "gerber scaled coord (FSLAX23 => integer/1000)");
+    // Garbage input must fall through as empty QString.
+    const char* junk = "this is not gerber at all, no commands here.";
+    QByteArray jb(junk);
+    QString jsvg = xara::gerberToSvg((const uint8_t*)jb.constData(), (qint64)jb.size());
+    check(jsvg.isEmpty(), "non-gerber input -> empty QString");
+}
+{
+    // Metric drill, explicit decimals. Two tools.
+    const char* d1 =
+        "M48\nMETRIC,TZ\nFMAT,2\nT01C0.800\nT02C1.000\n%\nG90\nG05\n"
+        "T01\nX10.0Y20.0\nX30.0Y20.0\nT02\nX50.0Y40.0\nM30\n";
+    QString s = xara::excellonToSvg((const uint8_t*)d1, (qint64)strlen(d1));
+    check(s.contains("<svg"), "excellon: has svg root");
+    check(s.contains("<circle"), "excellon: emits circles");
+    check(s.contains("cx='10.0000'"), "excellon: hole1 cx");
+    check(s.contains("cy='40.1000'"), "excellon: hole1 cy (Y-flipped)");
+    check(s.contains("r='0.4000'"), "excellon: tool1 radius (dia/2)");
+    check(s.contains("r='0.5000'"), "excellon: tool2 radius (dia/2)");
+    check(s.contains("fill='#333333'"), "excellon: hole fill colour");
+    check(s.contains("viewBox='9.6000 19.6000 40.9000 20.9000'"), "excellon: data-bounds viewBox");
+
+    // Inch drill -> normalised to mm (x25.4).
+    const char* d2 = "M48\nINCH\nT01C0.040\n%\nT01\nX1.0Y1.0\nM30\n";
+    QString s2 = xara::excellonToSvg((const uint8_t*)d2, (qint64)strlen(d2));
+    check(s2.contains("cx='25.4000'"), "excellon: inch->mm cx");
+    check(s2.contains("r='0.5080'"), "excellon: inch->mm radius");
+
+    // Non-drill input must be rejected (empty -> caller falls through).
+    const char* d3 = "hello world, just some plain text here\n";
+    QString s3 = xara::excellonToSvg((const uint8_t*)d3, (qint64)strlen(d3));
+    check(s3.isEmpty(), "excellon: rejects non-drill input");
+
+    // Truncated / empty must not crash.
+    QString s4 = xara::excellonToSvg((const uint8_t*)"M4", (qint64)2);
+    check(s4.isEmpty(), "excellon: tiny input safe");
+}
+{
+    // Minimal hand-built Lottie: 100x100 comp, one shape layer with a group
+    // containing a red rect (center [50,50], size [40,20]) + fill [1,0,0].
+    QByteArray j = R"J({"v":"5.7.0","w":100,"h":100,"fr":30,"ip":0,"op":60,"layers":[
+      {"ty":4,"ks":{"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]}},"shapes":[
+        {"ty":"gr","it":[
+          {"ty":"rc","p":{"a":0,"k":[50,50]},"s":{"a":0,"k":[40,20]},"r":{"a":0,"k":0}},
+          {"ty":"fl","c":{"a":0,"k":[1,0,0]}},
+          {"ty":"tr","p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]}}
+        ]}
+      ]}
+    ]})J";
+    QString svg = xara::lottieToSvg((const uint8_t*)j.constData(), (qint64)j.size());
+    check(svg.contains("<svg"), "lottie: emits <svg>");
+    check(svg.contains("viewBox='0 0 100.000 100.000'"), "lottie: viewBox from w/h");
+    check(svg.contains("<rect"), "lottie: emits rect for 'rc' item");
+    check(svg.contains("#ff0000"), "lottie: resolves [1,0,0] fill -> #ff0000");
+    // rect x = 50 - 40/2 = 30 ; y = 50 - 20/2 = 40
+    check(svg.contains("x='30.000'") && svg.contains("y='40.000'"),
+          "lottie: rect x/y from center minus half-size");
+    check(svg.contains("width='40.000'") && svg.contains("height='20.000'"),
+          "lottie: rect width/height");
+
+    // Ellipse + closed bezier path, plus animated fill (a:1 -> first keyframe .s).
+    QByteArray j2 = R"J({"v":"5.7.0","w":50,"h":50,"layers":[
+      {"ty":4,"ks":{"p":{"a":0,"k":[0,0]},"a":{"a":0,"k":[0,0]}},"shapes":[
+        {"ty":"gr","it":[
+          {"ty":"el","p":{"a":0,"k":[10,10]},"s":{"a":0,"k":[20,20]}},
+          {"ty":"sh","ks":{"a":0,"k":{"v":[[0,0],[10,0],[10,10]],"i":[[0,0],[0,0],[0,0]],"o":[[0,0],[0,0],[0,0]],"c":true}}},
+          {"ty":"fl","c":{"a":1,"k":[{"t":0,"s":[0,1,0,1]}]}}
+        ]}
+      ]}
+    ]})J";
+    QString svg2 = xara::lottieToSvg((const uint8_t*)j2.constData(), (qint64)j2.size());
+    check(svg2.contains("<ellipse"), "lottie: emits ellipse for 'el'");
+    check(svg2.contains("cx='10.000'") && svg2.contains("rx='10.000'"),
+          "lottie: ellipse cx from p, rx from s/2");
+    check(svg2.contains("<path") && svg2.contains(" Z"),
+          "lottie: emits closed path for 'sh'");
+    check(svg2.contains("#00ff00"), "lottie: animated fill uses first keyframe start value");
+
+    // Rejections: non-JSON, JSON without layers, empty layers.
+    check(xara::lottieToSvg((const uint8_t*)"not json here", (qint64)13).isEmpty(),
+          "lottie: rejects non-JSON");
+    QByteArray j3 = "{\"w\":10,\"h\":10}";
+    check(xara::lottieToSvg((const uint8_t*)j3.constData(), (qint64)j3.size()).isEmpty(),
+          "lottie: rejects object without layers");
+    QByteArray j4 = "{\"w\":10,\"h\":10,\"layers\":[]}";
+    check(xara::lottieToSvg((const uint8_t*)j4.constData(), (qint64)j4.size()).isEmpty(),
+          "lottie: rejects empty layers");
+}
+// ---- Sketch (.sketch) -> SVG importer selftest ----------------------------
+// Build a minimal STORED (uncompressed) ZIP with a "pages/*.json" entry and
+// assert the emitted SVG contains the expected rect/ellipse/text/path.
+{
+    // CRC32 (needed because the real xqUnzip may validate stored-entry CRCs).
+    auto skCrc32 = [](const unsigned char* d, size_t len)->uint32_t{
+        static uint32_t tbl[256]; static bool init=false;
+        if(!init){ for(uint32_t i=0;i<256;i++){ uint32_t v=i; for(int k=0;k<8;k++) v=(v&1)?(0xEDB88320u^(v>>1)):(v>>1); tbl[i]=v; } init=true; }
+        uint32_t v=0xffffffffu; for(size_t i=0;i<len;i++) v=tbl[(v^d[i])&0xff]^(v>>8); return v^0xffffffffu;
+    };
+    QByteArray z;
+    auto p16=[&](unsigned v){ z.append(char(v&0xff)); z.append(char((v>>8)&0xff)); };
+    auto p32=[&](unsigned v){ z.append(char(v&0xff)); z.append(char((v>>8)&0xff)); z.append(char((v>>16)&0xff)); z.append(char((v>>24)&0xff)); };
+
+    struct SkEnt{ QByteArray name; QByteArray data; };
+    QByteArray page =
+      "{\"_class\":\"page\",\"frame\":{\"x\":0,\"y\":0,\"width\":100,\"height\":100},\"layers\":["
+        "{\"_class\":\"rectangle\",\"frame\":{\"x\":10,\"y\":20,\"width\":30,\"height\":40},"
+          "\"style\":{\"fills\":[{\"color\":{\"red\":1,\"green\":0,\"blue\":0,\"alpha\":1}}]}},"
+        "{\"_class\":\"oval\",\"frame\":{\"x\":50,\"y\":50,\"width\":20,\"height\":20},"
+          "\"style\":{\"fills\":[{\"color\":{\"red\":0,\"green\":0,\"blue\":1,\"alpha\":1}}]}},"
+        "{\"_class\":\"text\",\"frame\":{\"x\":5,\"y\":5,\"width\":50,\"height\":10},"
+          "\"attributedString\":{\"string\":\"Hi <you>\"}},"
+        "{\"_class\":\"shapePath\",\"frame\":{\"x\":0,\"y\":0,\"width\":100,\"height\":100},\"isClosed\":true,"
+          "\"points\":[{\"point\":\"{0, 0}\"},{\"point\":\"{1, 0}\"},{\"point\":\"{0.5, 1}\"}]}"
+      "]}";
+    QVector<SkEnt> ents;
+    ents.push_back({QByteArray("document.json"), QByteArray("{\"_class\":\"document\"}")});
+    ents.push_back({QByteArray("pages/ABC-123.json"), page});
+    ents.push_back({QByteArray("meta.json"), QByteArray("{}")});
+
+    QVector<unsigned> offs, crcs;
+    for(const SkEnt& e : ents){
+        offs.push_back((unsigned)z.size());
+        unsigned crc=skCrc32((const unsigned char*)e.data.constData(), e.data.size());
+        crcs.push_back(crc);
+        p32(0x04034b50); p16(20); p16(0); p16(0); p16(0); p16(0);
+        p32(crc); p32(e.data.size()); p32(e.data.size());
+        p16(e.name.size()); p16(0); z.append(e.name); z.append(e.data);
+    }
+    unsigned cdStart=(unsigned)z.size();
+    for(int i=0;i<ents.size();i++){
+        p32(0x02014b50); p16(20); p16(20); p16(0); p16(0); p16(0); p16(0);
+        p32(crcs[i]); p32(ents[i].data.size()); p32(ents[i].data.size());
+        p16(ents[i].name.size()); p16(0); p16(0); p16(0); p16(0); p32(0); p32(offs[i]);
+        z.append(ents[i].name);
+    }
+    unsigned cdSize=(unsigned)z.size()-cdStart;
+    p32(0x06054b50); p16(0); p16(0); p16(ents.size()); p16(ents.size());
+    p32(cdSize); p32(cdStart); p16(0);
+
+    QString svg = xara::sketchToSvg((const uint8_t*)z.constData(), (qint64)z.size());
+    check(!svg.isEmpty(), "sketch: non-empty SVG");
+    check(svg.contains("<svg"), "sketch: has <svg>");
+    check(svg.contains("viewBox='0.000 0.000 100.000 100.000'"), "sketch: union viewBox");
+    check(svg.contains("<rect x='10.000' y='20.000' width='30.000' height='40.000'"), "sketch: rect at frame");
+    check(svg.contains("fill='#ff0000'"), "sketch: red rect fill");
+    check(svg.contains("<ellipse cx='60.000' cy='60.000' rx='10.000' ry='10.000'"), "sketch: oval->ellipse");
+    check(svg.contains("fill='#0000ff'"), "sketch: blue oval fill");
+    check(svg.contains("<text"), "sketch: has <text>");
+    check(svg.contains("Hi &lt;you&gt;"), "sketch: XML-escaped text");
+    check(svg.contains("<path"), "sketch: shapePath->path");
+    check(svg.contains("M 0.000 0.000 L 100.000 0.000 L 50.000 100.000 Z"), "sketch: normalised points denormalised+closed");
+
+    // Negatives: junk / null / a zip with no pages/ entry -> empty QString().
+    QByteArray junk("not a zip at all, just noise bytes here");
+    check(xara::sketchToSvg((const uint8_t*)junk.constData(), (qint64)junk.size()).isEmpty(), "sketch: junk -> empty");
+    check(xara::sketchToSvg((const uint8_t*)nullptr, 0).isEmpty(), "sketch: null -> empty");
+}
+
+      // ---- Fleet 13 end-to-end (Canvas dispatch → editable shapes) + reject-safety ----
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.gbr";
+        writeF(p,QByteArray("%FSLAX23Y23*%\n%MOMM*%\n%ADD10C,0.5*%\nD10*\nX0Y0D02*\nX1000Y0D01*\nX1000Y1000D03*\nM02*\n"));
+        check(c->importGerber(p), "Gerber imports end-to-end");
+        check(c->doc().shapes.size()>b, "Gerber → editable shapes"); }
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.drl";
+        writeF(p,QByteArray("M48\nMETRIC\nT01C0.8\n%\nT01\nX1.0Y1.0\nX2.0Y2.0\nM30\n"));
+        check(c->importExcellon(p), "Excellon imports end-to-end");
+        check(c->doc().shapes.size()>b, "Excellon → editable holes"); }
+      { c->newDocument(); const int b=c->doc().shapes.size(); const QString p="/tmp/xq_t.json";
+        writeF(p,QByteArray("{\"v\":\"5.7.0\",\"w\":100,\"h\":100,\"fr\":30,\"ip\":0,\"op\":60,\"layers\":["
+          "{\"ty\":4,\"shapes\":[{\"ty\":\"gr\",\"it\":["
+          "{\"ty\":\"rc\",\"p\":{\"a\":0,\"k\":[50,50]},\"s\":{\"a\":0,\"k\":[40,30]}},"
+          "{\"ty\":\"fl\",\"c\":{\"a\":0,\"k\":[1,0,0]}}]}]}]}"));
+        check(c->importLottie(p), "Lottie imports end-to-end (raw JSON)");
+        check(c->doc().shapes.size()>b, "Lottie → editable shape"); }
+      { const QString p="/tmp/xq_t.gbr"; writeF(p,QByteArray("not gerber")); check(!c->importGerber(p), "Gerber rejects junk safely"); }
+      { const QString p="/tmp/xq_t.drl"; writeF(p,QByteArray("not a drill")); check(!c->importExcellon(p), "Excellon rejects junk safely"); }
+      { const QString p="/tmp/xq_t.sketch"; writeF(p,QByteArray("not a zip")); check(!c->importSketch(p), "Sketch rejects a non-archive safely"); }
+      { const QString p="/tmp/xq_t.json"; writeF(p,QByteArray("{\"not\":\"lottie\"}")); check(!c->importLottie(p), "Lottie rejects non-Lottie JSON safely"); }
+      // DLP library importers (libpagemaker/libzmf/libqxp/libstaroffice/libetonyek/libmwaw): reject junk safely.
+      { const QString p="/tmp/xq_t.pmd"; writeF(p,QByteArray("not pagemaker"));  check(!c->importPageMaker(p),  "PageMaker rejects junk safely"); }
+      { const QString p="/tmp/xq_t.zmf"; writeF(p,QByteArray("not zoner"));      check(!c->importZmf(p),        "Zoner Draw rejects junk safely"); }
+      { const QString p="/tmp/xq_t.qxp"; writeF(p,QByteArray("not quark"));      check(!c->importQxp(p),        "QuarkXPress rejects junk safely"); }
+      { const QString p="/tmp/xq_t.sda"; writeF(p,QByteArray("not staroffice")); check(!c->importStarOffice(p),  "StarOffice rejects junk safely"); }
+      { const QString p="/tmp/xq_t.key"; writeF(p,QByteArray("not keynote"));    check(!c->importIWork(p),      "Keynote rejects junk safely"); }
+      { const QString p="/tmp/xq_t.cwk"; writeF(p,QByteArray("not a mac doc"));  check(!c->importMwaw(p),       "legacy Mac rejects junk safely"); }
+      // StarOffice real-file regression: a real StarDraw 3.1 document (LibreOffice writerperfect QA
+      // corpus, zlib-compressed) reports the format's built-in "supported encryption" flag, so its
+      // isFileFormatSupported confidence is SUPPORTED_ENCRYPTION, not EXCELLENT. The binding must accept
+      // it (parse() is the real gate) — guards against regressing the confidence check back to ==EXCELLENT.
+      { static const char* kStarDrawSda =
+          "AABaAHja7TwLdFzFdfe9mf1oJfvpZ1uSZbM2tp+xjS1L/tsF2cjG4J+CjL0hJM1au7YWJK26Wn/rEi"
+          "WhLacnSYGWHsg5gA3mZ8BAMMF8AoYkPUB7UtIkhIaclqaF8DE/lwTzs3rn9356T9pd4BR6PDr37dOd"
+          "mfuZuXNn7sx779l/qXpx/30N/wmetBQInBwsg7ADpyGcof6pBNAl7uTg4KBCD55KX6j0sfxlfUix/0"
+          "IIExEiCFGEMoQYQjlCBcIohNEIhjABqEKoRqhBqEUYgzAWYRxCHUI9QgPCeIRGhAnSXhjE8X4SwmSE"
+          "0xGmIExFmIZgIkyXZWfg70x5fyp9uukCyOJfHuKwEnrxNwe7oZg0Fi3GSa+QOicLLFdoOsW/dP6aYz"
+          "xSx30p41/VdY7/U2P285007CESEzb04sHKe3ruH195XZLqjdCns75vy3Zu70n35nlHd+STubZccqeF"
+          "/ORJE8uIklNVlQ7CmrVlaJHMNNFeN51zTrY3n8t29zPjpcBmmtkiC626CW+WWf+14835JfN3CF+zEI"
+          "eFWWR9Azq27lLteV7v1mxI0BwNye5sb3823p3cnsOsuDflbmjR4N2nRy7YjwVXV1yNNOPDJ0WxDPLp"
+          "/vy5uWRfV7ykNCKnz5zAFz39nzdAGJgtxptGlkqWnFtwyeaCS7aMXJINIWa3A79/Gu+eXfyzwXBx42"
+          "80zJ3VNKdpzqL58+csaF4wq9jxf3KQ+TDNz6/Bi3954/H3N3RV3nlVFGaa9/8b8zuHHWvrVmC+CSCB"
+          "wMTuk3l75Tr8CgSC8PfSz+yTa3M297oH/fB4JZ3fvcN/3jkeKmsYJwMSG7bnU+kd5+XTPe3ZbDccF0"
+          "5UhxqNVXuFGJS8Ql4lr5HXyTHyBnmTvEXeJu+Q4+R/yLvkD+SP5D1ygrxPPiAfko/Ix7ScVtBRdDQ1"
+          "aCWtotW0htbSMXQsHUfraD1toONpo45Uz/CnatEhJ2mYRmiUltFYITTpBDqNmnQ6PYPOoDPpLHomnU"
+          "3n0Ca6gC6ki+hiuoQupRfSTXQzTdAv04voV+jF9Kt8fZNC+E4DnyziMBOjl4fMVwjvjums81rx7ku8"
+          "LaO8+0fzLgojJPA2gZFQAqOeh81XCe/a90SdMKzWlXGoxZrGwyZxFXfOXMINQuehkMHv3HWbrWszL6"
+          "3jQm1tphf99+7udHxuUEGK986CzXbBdzV1ZRDyFGxRBXXJ8AO87mI2zNTG0ZPAqTTRhXAVwsMAj5iv"
+          "EW7ls1WzfY83QViOkhD8g1SrWVHB5WMCzfNR83XR4GtUzZd0NeNyKQbAohGCFd3JzkudaJ0PLSEuJ4"
+          "u+IoEz9I/MY0Kg7yqyl7Ex5ijNSFIkuTyXy+5kKCLXwM40Uf7WOu7tzim0BhcMw+JEB8Bj5htC3+8r"
+          "waYwmbgnsAUrloPOzbLjz7Ync+lBucZ3ppjnPuaTZ0m5HuBx801h0quElCHopcJQZ2lCvkd11RLCIP"
+          "eEWeMSuFJz928Cw/wEWsVR8y3CtVwiKFI4IvVWFJUejBKj6EfpCfNtwm2jUVBBd0KlnTESGi+P3u1J"
+          "8x3CB2CNKIfmHZLlEnzxeFxk16rsmSqb5x82PxDCLlPqd8p8xmUUFzTE1aXcAsvwzukRuBWiuA+YH4"
+          "pm7FZ0XgiBnBakFR9lfw5vwOx6AAZ0J2YQ/hmuI3ySYBgDOUaGWj2OrEQbAq50f2h+RNiAgbcV31+H"
+          "vR7JDinFfTMfmjDENwWX04ctF8O/FHewxCqngxi3UnKddcBE/BPlmLuKAa5IUxm2wm0ZuQbXfQHC1x"
+          "D+CuEQwIPmx6LNf6q88YGIn+61w2rrr19K/ro0Ymlgl8yh1kDWpOQs8HhS+tgIrE7mO7uEI/YW4Mrg"
+          "DJBYgXAxwg6EKwGOmCexM1GhgZgcOYuqvQqtWLdACrBD7qi1StBA+oKoPeIrbUU1rK8NAv6yokyoQU"
+          "Z4UBsYGNCOHj2Kv6ChPSIgHnEoMxOcMdeuOJVOpc84DQSsyK38nb6pz8rv863umx+6UKSgfBDZ7Z78"
+          "rSIVkB9S5EvMB0XeL7+lpWm4/BZMTSFJfmh+J8tvGSkfJPmh+Ty7pckvnyeZH7oQPlE+tAfkEyHfiP"
+          "mB/S/ID2Mfzmwoyb5Kyh/JvkcYH6fSqfRZJefSybs7ojl2Iew7zXV1/zmXY+BT3ktvCD+5UIQBsQxl"
+          "y7corMjke5J98XmfVyntZf3nUTq+Jr06CommMkg8x04KBj2BU6paxZAisGLLTWf+5Tw/IvOXTm+g7v"
+          "jt9moZ7WtsVa3iN4Dxgk5c0Xm+2hUlD4g/wbNR0JysaOo1zlhVh6ccew4AEzylm4YtvZhyrlYcvKNG"
+          "tFRmhWjnceUiUHjuDBEWTJ8OPCi8epZ/HIwBMHVHprfUSM2EMq2eBvypzNZk/kpP/kuu/NvXv0/48f"
+          "wzOs+vhexYu7N1GdWwvb2HTI3HrxqPhUXwzugYVm6Yl4/gNcYxAK+RR/D6OnkUc4+RH+H9G+QxvL5J"
+          "Hjd1eIscRfzb5AnEvEOeNEFSjvIghFHQ4VXyMJZhdDROR8fYWXfl6q7cGI+0be4KzzgSzpHtheko5d"
+          "AyTEKdS6i5yldweViuxnMFNcpzCUb3wfpqDn1FefDRd/SIFNwch1IwCmxzCJShku/o2a1KSqRTxa3G"
+          "Safag6FoyW5MyL0XMk3uTSyS+xNs6/A7CAcRcKwljrFtJ7TeJQh7ER5DYDusqxEuQujW4bb1YcofLv"
+          "mNsOrxsLjeadUafEgeMAm/0+EDcthUGMK3lBiGwEfkh6bGLV5gdDhJjpjMvqISA7wWRcsPuzBsFLDx"
+          "4cQMSttm+0BD8SLqLuPWK3iJXMZRc5WJOeQv567DlpbZKpEYCh+TB022+0RdGB3tTZOy6VJ+xoXwkU"
+          "x98IOWhYQCc4VsVfyn2ipJpRaMr7tkjW8Z6ipTa7W8kDyEfkpJTqUMotZYS3I3XlAb5+FFfXjVWf2u"
+          "cuutWkRKyFrYrUWDJaFof2pbsnOHbZPc/N7DJkeEexF+ifAiwnEEihY8FmE2wlqEPoQdCN+X1v0swi"
+          "sIYbTuGQjLEL7OfG095TtXzWqL9Bf1bt9N+TXE93K8+40A0zy1qxqKqb1Q1F6tJrpkg1pK3GzMNHXH"
+          "7AF8/1HhQxzP6Tl2PhN8k/BCyvedDgqaETDGq333xVRNhWLGE/Oa4KfzXE3m6hZGlxhiYYjEUAtDJS"
+          "bEKQlMmM9hTi7WMcZZYr80sQUhjzAgn3tZwYqipt9AeA4hizqOQUPZhnA3wq8Q3kWoRXIXI/wS4Vmc"
+          "wvdjC55ZBbAOoQfhGoQnEN5CmIArmCzC9xAOIfwM4QDO1H9TB/AUQhg7+6J6x+MKD2FrabujUDmWaV"
+          "oNK1OZ/MrebZnetHVid0Cc2BHob2QtdqNxj2HcaOwz9hs3GTcbB4xbjFuN24zbjTuMg8adxl3G3cZ9"
+          "xg90LHf/SOUOIal7jR9gwcMErjcOG8b1xg0+dbw17hN1jAd4O7JdSbZxsT3Cz9gq4Qh7AhDpsfkNXh"
+          "Z2EYPNE8QicVcoJXdZU3jPfMO1URtzbVRHzJFyG3OknHn450fbmOdHMz99osrGnKgKIaZujI2pGxNG"
+          "zKI6G7OoLsJ28MfbmMT4KGJ2TXTIM5Ht8l87ySHPpCF7707PwOa4G4R3WDb9BoN3bK/S+OcT1HmDJi"
+          "2c/REO4kwhxOeOMD/YifAVDpulonxOKfM9beAWrWbas4REsek3Gqw8jBMzZxmcOE2MmDCAZ+8gBGqn"
+          "mD0BtCKZ70fp7uVDcdLkNaCGbnEV16yxzulK4kiKrrh8jbUTX1zF3BpQriNsxUb2kz+iyhZnlSmySr"
+          "iQKhfwyGnKn4gqkUKqPMrjoilL18isSMFVZCNwMzlXOLbEQ3J6molTz9cQrkL4iQat5j40kVE4z2vc"
+          "RCogNknNiCkHiAlADg89JU/r2H9PWWVYb7kHMUWMexCzBZN7EIcR4x7EbLnlHsRRxLgHcRk7CXEN4h"
+          "hi3IOYLajcg7jQIZt4Ukzqy839Bj9DWaLOa/Oe1mHtkpJ/bLAe0FLwr4z7aHsBPNe8yeAdV6/Ctv2S"
+          "CtJQAedM82aDHw1PVayemSRPbriDYI9sEBUhJ3DGmGTeYnBDaFBUT0wSyzZl9qz0OPNWUapZRbzNk0"
+          "UpwjzMxkxPmhmOOAe2/ud8MG49zbzN4A8+3Cpqj4Ijk8XycT0Rus/TU9wSjHCKP8jwR5riLuzPEc+c"
+          "2JvYHqyHX8DyrF+vwd8oLtCi+BtDCr/F33J2BIu/LDRjtjUKS16upXwjaH7gx9zbKnFWzXuQHQDiRJ"
+          "NAB1tv3mG49xgqThf6hlhHRlULTjQPGu5IfI4sx9lOMO/0ZK93ZteZd3m45FQ27yzFpdG820PmGieZ"
+          "BvOQJ/uwM5tPoix7D8L1aBqPML+DTmwawmaEv0B4BKEHHcM1CIcRfoHwIUJDRFptO/bLjCnKXpRFOH"
+          "tf9PIG7AHOcaw4RCS5cnG03lzJNE2V88XGeGidw6j255O9qWQu5bzXYfBsYXmTZPjKAkJnEAsFBZ/O"
+          "gIotxEU4IcInVIwunS52iMTej9jTAVzWxBC/z2jFMvuN5Xi9yZiLV7ZQBbjFmITXW41xeL3NOA2vdx"
+          "j1eD1oTMTrncYEvN5l1OH1bqMRr4eMBusxzyrYsOWSdGc+vjOT74on2SMjttI+mXY7DN2YALkRwHTX"
+          "HLqrvbhqF7n+rmTKycwv1+ZGedtoPm0jH1511s5uz8e3Zrq7beK+2TZ1TYbWitfG9K68XVn8b5fW5T"
+          "aSs04ZLxPfkk3ttis6kHZt4qrN+stuH6t4/JLt/fmtmXTK2T5Dc4OoMrtQVMc46vGmzfSm0r0O9QIK"
+          "BNFmVqhZi46NmXx32qYlEcNpq6b3sCg6166sMHbtMkdtMWq0IXagcTtQQZuwfxeH5iEcmm0OMW6/Yq"
+          "NAD6TNdNb5yHPyIdYyZXU6merG8MXmZOOcNuxsC0bNLW+ZVWeu04YspE0pFECJ8pGvDaHX7EfP0Qrh"
+          "AHohSY95D0W1ziJ12dqNl53bjWaYzm3v3RafO1zeyXvUwyYV3JuJNiUBHixchAcL5NkcLE1wHVtOwu"
+          "XUuZyUSxUZiWNLCbK0eDkSzjHksozA2vNKkGWezVFoF+a8oiPxml+CFPO9vCKF8VpQghQLvLyihfFa"
+          "WIIUC728ygrjtagEKRZ5ecUK47W4BCkWe3mVu3hVueqhL013+yJtKobLszi3qpitU+lNveOfFDH+a1"
+          "zs12fzmT3p3gC0LVe5S65PsoKa6GK0OtObT+e2YWOmsrjiuDSfHrmELRUNXAGKNC6I0jBZzh4dum7h"
+          "q+KPELoQgzEzVOL83IZwBcK/IyzBWW4HwvNE7GdegfA8ex4a1+aPITThMvomBIxsYQ/CywgXoL08hj"
+          "CjDH8RzsII7GAMBr6B4Vsn0JvPYbuxemrpg4ODSzfz+8TAf2Aexjmbb6FnbT5S8/Debx+djeYBy7+l"
+          "L9t3Gej7aKhrL4HW1m/ps7BcdOO+6LK9RD/k914Ai/esV4DgVPr/nNpy61IVMAOjyjjC+dn0uosQ2y"
+          "Rfq2n8/dOgE9DVO2TsnuH3lj3D78Fa8avHSPnTqz7vwwhea3dX8DfEccG0Nrkb44iHpgokO87QYrAi"
+          "2XnptlwWR90/ygy2baFXOzLiWR6I9MOlogB70ZREQb3v92Ost669Ag5o6h2DaZrQi1k2zaOcFwA8G3"
+          "EDb4e1FfwNV3a/YUsFf0OwY1NbrpG/j35PmSg5oQW9y1TXe3+a0FdswPnVfblV1N14yXB1SSDfY7ME"
+          "34XnB9UNBfJldRnf4LoRrJvgWwr2Ivfr4jBF0+rtx0M0+b63/8xHHc+O6PK9JR38sby1sY/qQqqPbq"
+          "Kl9dHlUl/C9VUl5+Gkuuh81xMtUt+ZHoscxumzzfBKL0U7UUuGl6UMtVyGJgP/G4VRPU4pmTrvy61M"
+          "jqm83dmOJOU7yr7T/1+zU1EvLYtKl2zSXZvmrZgLHXh3pjgsmApt2e1butOd3ZnOS+P5bDydyuTj+a"
+          "50PM/itv741myuJ5n3ZanD9XwP6AZj2fShWuJo51qOsbRc1SAkG9/mp2Wj3AUO8Z0+3bUTdBc7M/OS"
+          "sCp/VxdvnQvlunSpXBmYgcqhI2EBmVJvuChKaKlxLTV+9NyR7syiW9kgaHSnd6S748PFN4KCzinofP"
+          "20sSuTK5RAiyJAOAHCRViV3Z7LdxVIYZ6iQDkFykVYldlaMIH5ikCIEwhxAh2ZXQUTWKAIhDmBMN8k"
+          "6cA6vQWTWKhIRDiJCJdhZWZbwQQWKQJRTiDKCazPFC7BYkWgjBMok+cYRB4PRfiBmhoBXv+YUP6xtl"
+          "D/SDyeUPhCJ8b2i1/VlV98yzF3MZ/IfGMhfvHXLp90I2ZNLccl6kqAtS0j+yTi75PYmyy1XloWlS+7"
+          "fFKb7ZPGwjlqwPZkd6T5gO1LbkuX4IR+J9Wq5Grdh6I0LwTYiqL8uNNPLdP1ICQNimm+yVy9l5pFZ4"
+          "tLsXW2YhMC/VFvFpfPAcyGaqgFGFl70Uamux7g1D0G1pZr31YBj1svXzLFCp10F8nFzbq2CphV0Iee"
+          "mD6j+PJiNYqKHrq1aHXsw0xb/NuwrS7iwiTrozUMtCK+AXE85vwGBP+oifVQxehydpZQepNoBTQJM+"
+          "LtrjXLXjS755CzOUU81jE0NfIhQPlMyk68nTMpX6QEk7BHzt9Kpjpn+hu0wKW1AP+FffL0tCCmFexg"
+          "LIipNTwGcMWPsCfifAu1QRpgGGOK69G5PHg2wLYxtn9yt8Hq83AJgL12LAmwoDG4DWqDxQkmEdQG46"
+          "pRRHQQj84B+MrcIKZVxbTBvWG/NjiBjPagub0wG+B3JgSI83e4vmucD3AdlrpqaZA41cWIUx/yEyeP"
+          "oda9SwCOnInmPj9InKsW4IDA1fKV6O9emh8kTk0x4pSX+YmTQ5dLkcE9a3G2mxlkIRM3AMw+HWv8Kc"
+          "DB+cEW0hAsTjAJ5X1F75XmpsDjpn5lhZ/ZIqZwr0vRC3Qp7rAvaIr2D1V/Hjin/qTT76MW7jk1FDSn"
+          "9nnnVCc17UuuOXWZPafWeefUZCo17HTqnUJFo1tT55hPa+pMJP5JFzTVWxRaW27TTlx2aeLDWKwNB/"
+          "jT2eJefNaO3WmcOQqjsS9IvELsdqiWJZZb+yEzrN5QSdXRlBqaxsPGsbIk+y7Tb62RfprExv22YDSL"
+          "4ekWrlximuzbuaCp2xb7dh5olfK2VSqostr4xxRY/41krsV8yczf3Fc7Vrr+97gw0wi05zAW2Jhtb1"
+          "tV2r7YJ61fyIevYDV7qBYbLkXq1O8gv/LOc+Yys0s5jFMzDW8Pt/eltor30EmdngrkW4Yj5ZsQxSnm"
+          "7CXvgfZpfv+Pf/PG8w0xvzpsBLSGVTOcg/x7oA824IL0kqKbsVo+a0Y9L+SPlFZY3bABuiFdcjfGpJ"
+          "MmRfDXHR8Z2IT6t/M+6C6J/2jPJFFIHeL44lkf6p6DfsggMCtI89boQWDW0D8ircl8j8fx4YoCUgjE"
+          "d0JZ6oCtsAvDxSx04pyv+J6H162IGznF+ZN1tucohD8rv4k4+W9G/Xtx8GRhZwE6u+1ftH+kCP1rHc"
+          "sjwb8Ddd7NW74DuvCaLqjtxVqq+P5n+t81R/VFB2/3Hkjysa9aPscxeWyXLHs2OTBN51tzxbU/6/v/"
+          "tvTPc85tCElsfa8ltIxAa0oJ+rNJ8g81n54r/yJ///N/AQjv0SQ=";
+        QByteArray sda = qUncompress(QByteArray::fromBase64(kStarDrawSda));
+        if(!sda.isEmpty()){
+          const QString p=QDir::tempPath()+"/xq_stardraw31.sda"; writeF(p, sda);
+          Canvas sc; sc.newDocument();
+          check(!xara::starofficeVectorAvailable() || (sc.importStarOffice(p) && !sc.doc().shapes.isEmpty()),
+                "StarOffice: real StarDraw 3.1 (SUPPORTED_ENCRYPTION confidence) imports shapes"); } }
+
+      // ---- GDAL/OGR + Graphviz (gisvector.cpp) — real functional + reject tests ----
+// --- GDAL/OGR vector import selftest (hermetic; writes tiny files to the temp dir) ---
+// namespace xara { QString ogrToSvg(const QString&); bool ogrAvailable(); }
+// NOTE: GDAL is a GIS *vector* binding — there is no DOT/graphviz path here (the generic
+// "digraph{a->b}" probe does not apply to GDAL). The equivalent "tiny valid" input is a
+// trivially-constructible OGR vector document; GeoJSON is used because it can be written as
+// plain text without needing a writable driver, and GDAL sniffs it by content regardless of
+// the file extension we advertise for routing.
+{
+    using xara::ogrToSvg; using xara::ogrAvailable;
+    if(ogrAvailable()){
+        auto writeTmp = [](const QString& name, const QByteArray& bytes)->QString{
+            QString p = QDir::tempPath() + "/" + name;
+            QFile f(p); if(f.open(QIODevice::WriteOnly)){ f.write(bytes); f.close(); }
+            return p;
+        };
+        // 1) empty path -> empty
+        check(ogrToSvg(QString()).isEmpty(), "ogr: empty path rejected");
+        // 2) junk bytes -> empty (GDAL finds no vector driver; every path frees + returns {})
+        QString jp = writeTmp("xq_ogr_junk.bin",
+                              QByteArray("\x00\x01\x02not a vector file at all", 30));
+        check(ogrToSvg(jp).isEmpty(), "ogr: junk rejected -> empty");
+        // 3) tiny VALID GeoJSON: point + line + polygon-with-hole
+        QByteArray gj =
+            "{\"type\":\"FeatureCollection\",\"features\":["
+            "{\"type\":\"Feature\",\"properties\":{},\"geometry\":"
+            "{\"type\":\"Point\",\"coordinates\":[10,20]}},"
+            "{\"type\":\"Feature\",\"properties\":{},\"geometry\":"
+            "{\"type\":\"LineString\",\"coordinates\":[[0,0],[30,40]]}},"
+            "{\"type\":\"Feature\",\"properties\":{},\"geometry\":"
+            "{\"type\":\"Polygon\",\"coordinates\":[[[0,0],[50,0],[50,50],[0,50],[0,0]],"
+            "[[10,10],[20,10],[20,20],[10,20],[10,10]]]}}"
+            "]}";
+        QString gp = writeTmp("xq_ogr_test.geojson", gj);
+        QString svg = ogrToSvg(gp);
+        check(svg.contains("<svg"),      "ogr: valid geojson -> has <svg");
+        check(svg.contains("viewBox="),  "ogr: valid geojson -> data-bounds viewBox");
+        check(svg.contains("<circle"),   "ogr: point -> <circle> node");
+        check(svg.contains("<polyline"), "ogr: line -> <polyline> node");
+        check(svg.contains("<path"),     "ogr: polygon -> <path> node");
+        // Y-flip: point (10,20), overall maxY=50 -> cy = 50-20 = 30
+        check(svg.contains("cy='30'"),   "ogr: Y-flip maps point cy correctly");
+        // Regression (adversarial review): coordinates near DBL_MAX must not overflow bbox/Y-flip to "inf".
+        QByteArray big =
+            "{\"type\":\"FeatureCollection\",\"features\":["
+            "{\"type\":\"Feature\",\"properties\":{},\"geometry\":{\"type\":\"Point\",\"coordinates\":[5,6]}},"
+            "{\"type\":\"Feature\",\"properties\":{},\"geometry\":{\"type\":\"MultiPoint\",\"coordinates\":[[1e308,-1e308],[-1e308,1e308]]}}"
+            "]}";
+        QString bp = writeTmp("xq_ogr_big.geojson", big);
+        QString bsvg = ogrToSvg(bp);
+        check(!bsvg.contains("inf") && !bsvg.contains("nan"), "ogr: huge coords don't overflow to inf/nan in SVG");
+    } else {
+        check(ogrToSvg(QString("x")).isEmpty(), "ogr: stub returns empty");
+    }
+}
+// --- Graphviz DOT->SVG selftest ---------------------------------------------
+// Available in both builds via the stub; only asserts real output when present.
+{
+    if (xara::dotAvailable()) {
+        // 1) Junk / non-DOT input must yield an empty string, not a crash.
+        QString j1 = xara::dotToSvg(QByteArray("this is not a graph {{{"));
+        check(j1.isEmpty(), "graphviz rejects junk");
+
+        QString j2 = xara::dotToSvg(QByteArray());
+        check(j2.isEmpty(), "graphviz rejects empty");
+
+        QString j3 = xara::dotToSvg(QByteArray("digraph { a -> "));  // truncated
+        check(j3.isEmpty(), "graphviz rejects truncated dot");
+
+        // 2) A tiny valid digraph must render an SVG that mentions the nodes.
+        QString ok = xara::dotToSvg(QByteArray("digraph{a->b}"));
+        check(ok.contains("<svg"), "graphviz emits <svg");
+        check(ok.contains(QStringLiteral(">a<")) ||
+                       ok.contains(QStringLiteral("class=\"node\"")), "graphviz svg has node a");
+        check(ok.contains(QStringLiteral("class=\"edge\"")) ||
+                       ok.contains(QStringLiteral("<path")), "graphviz svg has an edge");
+    } else {
+        // Stub build: must be inert and empty.
+        check(xara::dotToSvg(QByteArray("digraph{a->b}")).isEmpty(), "graphviz stub empty");
+    }
+}
+      // Regression (adversarial review): a huge aperture modifier in inch units overflows to inf;
+      // the emitted SVG must NOT contain the literal "inf" (fmt() + md() are isfinite-guarded).
+      { QByteArray g = "%FSLAX46Y46*%\n%MOIN*%\n%ADD10C,1*%\n%ADD11C,1e308*%\nD10*\nX0Y0D03*\nD11*\nX1000000Y0D03*\nM02*\n";
+        QString svg=xara::gerberToSvg((const uint8_t*)g.constData(),(qint64)g.size());
+        check(!svg.contains("inf") && !svg.contains("nan"), "gerber: overflowing aperture not emitted as inf/nan"); }
+
+      // ---- Fleet 16 native vector decoders (TGS/TopoJSON/VML/XPS/Scribus) — hermetic ----
+// ---- TGS importer ---------------------------------------------------------
+// Build a minimal Bodymovin JSON, gzip it in-memory, feed it to tgsToSvg, and
+// assert the delegated Lottie render produced an <svg> with the right bounds.
+{
+    // A minimal but valid Lottie doc: 100x100 canvas, one solid-fill layer.
+    QByteArray json =
+        "{\"v\":\"5.5.2\",\"fr\":60,\"ip\":0,\"op\":60,\"w\":100,\"h\":100,"
+        "\"layers\":[{\"ty\":4,\"ks\":{},\"shapes\":[{\"ty\":\"gr\",\"it\":["
+        "{\"ty\":\"rc\",\"p\":{\"a\":0,\"k\":[50,50]},\"s\":{\"a\":0,\"k\":[80,80]}},"
+        "{\"ty\":\"fl\",\"c\":{\"a\":0,\"k\":[1,0,0,1]},\"o\":{\"a\":0,\"k\":100}}"
+        "]}]}]}";
+
+    // gzip-compress `json` into `gz` using zlib (gzip window = 15+16).
+    QByteArray gz;
+    {
+        z_stream s; std::memset(&s, 0, sizeof(s));
+        int r = deflateInit2(&s, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                             15 + 16, 8, Z_DEFAULT_STRATEGY);
+        check(r == Z_OK, "tgs selftest: deflateInit2 ok");
+        if (r == Z_OK) {
+            s.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(json.constData()));
+            s.avail_in = (uInt)json.size();
+            char obuf[4096];
+            do {
+                s.next_out  = reinterpret_cast<Bytef*>(obuf);
+                s.avail_out = sizeof(obuf);
+                r = deflate(&s, Z_FINISH);
+                gz.append(obuf, (int)(sizeof(obuf) - s.avail_out));
+            } while (r == Z_OK);
+            deflateEnd(&s);
+            check(r == Z_STREAM_END, "tgs selftest: deflate finished");
+        }
+    }
+
+    // Sanity: our synthetic file carries the gzip magic tgsToSvg looks for.
+    check(gz.size() > 2 && (quint8)gz[0] == 0x1f && (quint8)gz[1] == 0x8b,
+          "tgs selftest: has gzip magic");
+
+    QString svg = xara::tgsToSvg(reinterpret_cast<const uint8_t*>(gz.constData()),
+                                 (qint64)gz.size());
+    check(!svg.isEmpty(),               "tgs: gzipped Lottie -> non-empty SVG");
+    check(svg.contains("<svg"),         "tgs: output is an SVG document");
+    check(svg.contains("viewBox"),      "tgs: SVG has a data-bounds viewBox");
+    check(svg.contains("100"),          "tgs: 100x100 canvas bounds propagated");
+
+    // Non-gzip input must be rejected (fall-through contract).
+    QByteArray plain = json;
+    check(xara::tgsToSvg(reinterpret_cast<const uint8_t*>(plain.constData()),
+                         (qint64)plain.size()).isEmpty(),
+          "tgs: non-gzip input rejected");
+
+    // Truncated gzip (header only) must not crash and must return empty.
+    check(xara::tgsToSvg(reinterpret_cast<const uint8_t*>(gz.constData()),
+                         (qint64)qMin<qint64>(12, gz.size())).isEmpty(),
+          "tgs: truncated stream rejected");
+
+    // Too-short / null inputs.
+    check(xara::tgsToSvg(nullptr, 0).isEmpty(), "tgs: null input rejected");
+}
+{
+    // Minimal TopoJSON: identity transform, one square arc, a Polygon + a Point.
+    // Arc deltas accumulate to (0,0)->(0,10)->(10,10)->(10,0)->(0,0); bbox 0..10.
+    const char* tj =
+        "{\"type\":\"Topology\","
+        "\"transform\":{\"scale\":[1,1],\"translate\":[0,0]},"
+        "\"arcs\":[[[0,0],[0,10],[10,0],[0,-10],[-10,0]]],"
+        "\"objects\":{"
+            "\"sq\":{\"type\":\"Polygon\",\"arcs\":[[0]]},"
+            "\"pt\":{\"type\":\"Point\",\"coordinates\":[5,5]}"
+        "}}";
+    QByteArray b(tj);
+    QString svg = xara::topojsonToSvg((const uint8_t*)b.constData(), (qint64)b.size());
+    check(!svg.isEmpty(), "topojson: parses minimal topology");
+    check(svg.contains("viewBox='0 0 10 10'"), "topojson: data-bounds viewBox");
+    check(svg.contains("<path"), "topojson: polygon -> <path>");
+    check(svg.contains("fill-rule='evenodd'"), "topojson: polygon uses evenodd");
+    check(svg.contains("<circle"), "topojson: point -> <circle>");
+    check(svg.contains("cy='5'"), "topojson: point y-flip (maxY-y = 5)");
+    check(svg.contains("Z"), "topojson: ring is closed");
+    // Y-flip check: the ring's node at real y=10 must map to screen y=0,
+    // and a node at real y=0 must map to screen y=10.
+    check(svg.contains("M0,10") || svg.contains("L0,10"), "topojson: y-flip node at bottom");
+    check(svg.contains(",0 ") || svg.contains(",0'"), "topojson: y-flip node at top");
+
+    // Fall-through: not JSON at all.
+    check(xara::topojsonToSvg((const uint8_t*)"not a topojson", (qint64)14).isEmpty(),
+          "topojson: garbage falls through");
+    // Fall-through: valid JSON but a GeoJSON FeatureCollection (no "Topology").
+    const char* geo = "{\"type\":\"FeatureCollection\",\"features\":[]}";
+    QByteArray gb(geo);
+    check(xara::topojsonToSvg((const uint8_t*)gb.constData(), (qint64)gb.size()).isEmpty(),
+          "topojson: geojson (non-Topology) falls through");
+
+    // Transform-less absolute-coordinate topology with a LineString.
+    const char* lt =
+        "{\"type\":\"Topology\","
+        "\"arcs\":[[[0,0],[4,0],[4,3]]],"
+        "\"objects\":{\"ln\":{\"type\":\"LineString\",\"arcs\":[0]}}}";
+    QByteArray lb(lt);
+    QString lsvg = xara::topojsonToSvg((const uint8_t*)lb.constData(), (qint64)lb.size());
+    check(lsvg.contains("<polyline"), "topojson: LineString -> <polyline>");
+    check(lsvg.contains("viewBox='0 0 4 3'"), "topojson: absolute (no-transform) bbox");
+}
+{
+    // Hand-built minimal VML document exercising rect/oval/line/polyline/shape-path.
+    QByteArray vml =
+      "<xml xmlns:v='urn:schemas-microsoft-com:vml'>"
+      "<v:rect left='10' top='20' width='100' height='50' fillcolor='#ff0000' strokecolor='blue'/>"
+      "<v:oval style='left:200;top:20;width:80;height:40' fillcolor='lime'/>"
+      "<v:line from='0,0' to='300,300' strokecolor='#00ff00'/>"
+      "<v:polyline points='10,10 20,30 40,10'/>"
+      "<v:shape path='m 400 400 l 500 400 500 500 c 520 520 540 540 560 560 x e' fillcolor='#123456'/>"
+      "</xml>";
+    QString svg = xara::vmlToSvg((const uint8_t*)vml.constData(), (qint64)vml.size());
+    check(svg.contains("<svg"),           "vml: svg root emitted");
+    check(svg.contains("viewBox="),       "vml: viewBox present");
+    check(svg.contains("<rect"),          "vml: <rect>");
+    check(svg.contains("#ff0000"),        "vml: rect fillcolor hex");
+    check(svg.contains("stroke='blue'"),  "vml: keyword strokecolor validated");
+    check(svg.contains("<ellipse"),       "vml: <oval> -> <ellipse>");
+    check(svg.contains("<line"),          "vml: <line from/to>");
+    check(svg.contains("<polyline"),      "vml: <polyline points>");
+    check(svg.contains("<path"),          "vml: <shape path> -> <path>");
+    check(svg.contains("M400"),           "vml: path moveto abs");
+    check(svg.contains("C520"),           "vml: path cubic abs");
+
+    // A real SVG document (root <svg>) must be rejected so the importer falls through.
+    QByteArray asvg = "<svg xmlns='http://www.w3.org/2000/svg'><rect x='0' y='0' width='1' height='1'/></svg>";
+    check(xara::vmlToSvg((const uint8_t*)asvg.constData(),(qint64)asvg.size()).isEmpty(), "vml: reject SVG root");
+
+    // Garbage / non-XML -> empty.
+    QByteArray junk = "not xml at all really";
+    check(xara::vmlToSvg((const uint8_t*)junk.constData(),(qint64)junk.size()).isEmpty(), "vml: garbage -> empty");
+
+    // Hostile fillcolor cannot break out of the attribute; falls back to default fill.
+    QByteArray hv = "<xml><rect left='0' top='0' width='5' height='5' fillcolor=\"red' onload=x\"/></xml>";
+    QString hs = xara::vmlToSvg((const uint8_t*)hv.constData(),(qint64)hv.size());
+    check(!hs.contains("onload"),         "vml: hostile colour stripped");
+    check(hs.contains("fill='#ffffff'"),  "vml: invalid colour -> default white fill");
+}
+{
+    // Hand-build a minimal XPS package: a STORED (method 0) ZIP holding one
+    // "*.fpage" FixedPage part, then assert xpsToSvg translates it.
+    auto p16=[](std::vector<unsigned char>& v, unsigned x){ v.push_back(x&0xff); v.push_back((x>>8)&0xff); };
+    auto p32=[](std::vector<unsigned char>& v, unsigned long x){ for(int i=0;i<4;i++) v.push_back((x>>(8*i))&0xff); };
+    auto ps =[](std::vector<unsigned char>& v, const char* s){ for(;*s;s++) v.push_back((unsigned char)*s); };
+
+    const char* xpsName = "Documents/1/Pages/1.fpage";
+    const char* xpsData =
+      "<FixedPage xmlns=\"http://schemas.microsoft.com/xps/2005/06\" Width=\"200\" Height=\"100\">"
+      "<Path Data=\"F1 M 10,10 L 90,10 L 90,90 Z\" Fill=\"#ff0000\"/>"
+      "<Glyphs OriginX=\"20\" OriginY=\"50\" FontRenderingEmSize=\"12\" UnicodeString=\"Hi &amp; bye\" Fill=\"#0000ff\"/>"
+      "</FixedPage>";
+    unsigned xpsNl = (unsigned)strlen(xpsName), xpsDl = (unsigned)strlen(xpsData);
+    std::vector<unsigned char> z;
+    // local file header @0
+    p32(z,0x04034b50); p16(z,20); p16(z,0); p16(z,0); p16(z,0); p16(z,0);
+    p32(z,0); p32(z,xpsDl); p32(z,xpsDl); p16(z,xpsNl); p16(z,0); ps(z,xpsName);
+    ps(z,xpsData);
+    unsigned xpsCdOff = (unsigned)z.size();
+    // central directory record
+    p32(z,0x02014b50); p16(z,20); p16(z,20); p16(z,0); p16(z,0); p16(z,0); p16(z,0);
+    p32(z,0); p32(z,xpsDl); p32(z,xpsDl); p16(z,xpsNl); p16(z,0); p16(z,0); p16(z,0); p16(z,0);
+    p32(z,0); p32(z,0 /*localOff*/); ps(z,xpsName);
+    unsigned xpsCdSize = (unsigned)z.size() - xpsCdOff;
+    // end of central directory
+    p32(z,0x06054b50); p16(z,0); p16(z,0); p16(z,1); p16(z,1);
+    p32(z,xpsCdSize); p32(z,xpsCdOff); p16(z,0);
+
+    QString xpsSvg = xara::xpsToSvg((const uint8_t*)z.data(), (qint64)z.size());
+    check(!xpsSvg.isEmpty(), "XPS: non-empty SVG produced");
+    check(xpsSvg.contains("viewBox='0 0 200 100'"), "XPS: FixedPage W/H -> viewBox");
+    check(xpsSvg.contains("<path d='M 10,10 L 90,10 L 90,90 Z'"), "XPS: Path Data F1 token stripped + passed through");
+    check(xpsSvg.contains("fill='#ff0000'"), "XPS: Path Fill colour");
+    check(xpsSvg.contains("<text x='20' y='50' font-size='12' fill='#0000ff'"), "XPS: Glyphs -> text");
+    check(xpsSvg.contains("Hi &amp; bye</text>"), "XPS: UnicodeString XML-escaped");
+    check(xara::xpsToSvg((const uint8_t*)"notazip", (qint64)7).isEmpty(), "XPS: reject non-ZIP input");
+    check(xara::xpsToSvg((const uint8_t*)nullptr, (qint64)0).isEmpty(), "XPS: reject null/empty");
+}
+// ---- Scribus .sla importer selftest ----
+{
+    const char* sla =
+        "<?xml version=\"1.0\"?>\n"
+        "<SCRIBUSUTF8NEW><DOCUMENT>\n"
+        "<COLOR NAME=\"Red\" RGB=\"#ff0000\"/>\n"
+        "<COLOR NAME=\"Blue\" RGB=\"0 0 255\"/>\n"
+        "<COLOR NAME=\"Cy\" CMYK=\"#ff000000\"/>\n"
+        "<PAGEOBJECT PTYPE=\"6\" XPOS=\"10\" YPOS=\"20\" WIDTH=\"30\" HEIGHT=\"40\""
+        " FCOLOR=\"Red\" PCOLOR=\"Blue\" PWIDTH=\"2\""
+        " path=\"M 0 0 L 30 0 L 30 40 L 0 40 Z\"/>\n"
+        "<PAGEOBJECT PTYPE=\"7\" XPOS=\"100\" YPOS=\"5\" WIDTH=\"50\" HEIGHT=\"50\""
+        " FCOLOR=\"None\" PCOLOR=\"Cy\" PWIDTH=\"1\""
+        " POCOOR=\"0 0 0 0 10 10 10 10 20 0 20 0\"/>\n"
+        "<PAGEOBJECT PTYPE=\"2\" XPOS=\"5\" YPOS=\"5\" WIDTH=\"12\" HEIGHT=\"8\""
+        " FCOLOR=\"Blue\" PCOLOR=\"None\"/>\n"
+        "</DOCUMENT></SCRIBUSUTF8NEW>\n";
+    QString svg = xara::scribusToSvg((const uint8_t*)sla, (qint64)strlen(sla));
+    check(!svg.isEmpty(),                         "scribus: non-empty SVG");
+    check(svg.startsWith("<svg"),                 "scribus: svg root");
+    check(svg.contains("viewBox="),               "scribus: has viewBox");
+    check(svg.contains("#ff0000"),                "scribus: RGB #hex colour");
+    check(svg.contains("#0000ff"),                "scribus: RGB triple -> #hex");
+    check(svg.contains("#00ffff"),                "scribus: CMYK -> #hex (cyan)");
+    check(svg.contains("translate(10 20)"),       "scribus: object XPOS/YPOS translate");
+    check(svg.contains("M 0 0 L 30 0"),           "scribus: local path preserved");
+    check(svg.contains("fill=\"none\""),          "scribus: FCOLOR None -> none");
+    check(svg.contains("M 0 0 L 10 10 L 20 0"),   "scribus: POCOOR every-2nd-pair polyline");
+    check(svg.contains("<rect"),                  "scribus: no-path object -> bounding rect");
+
+    // Non-Scribus input falls through (empty).
+    const char* junk = "just some random bytes not a scribus doc at all!!";
+    check(xara::scribusToSvg((const uint8_t*)junk, (qint64)strlen(junk)).isEmpty(),
+          "scribus: rejects non-Scribus input");
+
+    // Hostile path attribute must not break out of the d="" attribute.
+    const char* bad =
+        "<SCRIBUSUTF8NEW><PAGEOBJECT XPOS=\"0\" YPOS=\"0\" WIDTH=\"5\" HEIGHT=\"5\""
+        " FCOLOR=\"x\" path=\"M0 0&quot;/&gt;&lt;script&gt;\"/></SCRIBUSUTF8NEW>";
+    QString s2 = xara::scribusToSvg((const uint8_t*)bad, (qint64)strlen(bad));
+    check(!s2.contains("<script"),                "scribus: no path-attr injection");
+}
+// ---- Serif Affinity (.afdesign/.afphoto/.afpub) vector importer ----
+// The fixture is BUILT HERE, byte by byte, from the documented layout — no sample file is vendored,
+// so the test is hermetic and also doubles as a spec of the encoding. It exercises: the v9 "#FAT"
+// container with a zlib chunk, the CRC32 gate, the tagged object tree (shareable classes, an empty
+// 0x32 array whose class header is still present, a positional 0x30 struct, bit-packed bool arrays,
+// enums, strings, fixed structs), a DAG link that shares one fill between two shapes, ShNR rounded
+// rectangles, PCrv cubic geometry checked against its own stored CvsB, and the "Thmb" preview.
+{
+    // -------- tiny writers for the two encodings --------
+    auto u8v =[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); };
+    auto u16v=[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    auto u32v=[](QByteArray& b, quint32 v){ for(int i=0;i<4;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto u64v=[](QByteArray& b, quint64 v){ for(int i=0;i<8;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto f32v=[&](QByteArray& b, float v){ quint32 r; memcpy(&r,&v,4); u32v(b,r); };
+    auto f64v=[&](QByteArray& b, double v){ quint64 r; memcpy(&r,&v,8); u64v(b,r); };
+    // Object-tree 4CCs are stored byte-REVERSED; container tags ("#Inf", "#FAT", "#Fil") are not.
+    auto tag =[&](QByteArray& b, const char* s){ for(int i=3;i>=0;--i) b.append(s[i]); };
+    // field header: type byte (|0x80 = array) + the reversed 4CC
+    auto fld =[&](QByteArray& b, unsigned type, const char* name){ u8v(b,type); tag(b,name); };
+
+    QByteArray t;                                   // the object tree ("doc.dat" payload)
+    t.append('\x00'); t.append('\xff'); t.append('K'); t.append('S');
+    u16v(t,1); tag(t,"Pers"); u16v(t,1);            // file_ver 1 → no trailing version word
+
+    fld(t,0x31,"DocR");                             // shareable class: flag 1, id, chain, fields
+      u8v(t,1); u32v(t,1); u8v(t,1); tag(t,"DocN");
+      fld(t,0x2b,"Desc"); u32v(t,4); t.append("page");
+      fld(t,0xa9,"TstB"); u32v(t,10); u8v(t,0x95); u8v(t,0x02);   // bit-packed bool[10] = 1,0,1,0,1,0,0,1,0,1
+      fld(t,0xb2,"Objs"); u32v(t,0); tag(t,"OSty"); u16v(t,1);    // EMPTY 0x32 array still carries tag+id
+      fld(t,0x31,"Chld");                           // one spread — written as a single (non-array) child
+        u8v(t,1); u32v(t,2); u8v(t,1); tag(t,"Sprd");
+        fld(t,0x26,"SprB"); f64v(t,0); f64v(t,0); f64v(t,180); f64v(t,180);
+        fld(t,0xb1,"Chld"); u32v(t,2);              // array of 2 shareable classes
+          // -- 1: a rounded rectangle with a red fill (registered as id 5 and shared below) --
+          u8v(t,1); u32v(t,3); u8v(t,1); tag(t,"ShpN");
+            fld(t,0x2b,"Desc"); u32v(t,9); t.append("Red panel");   // the layer's name in Affinity
+            fld(t,0x26,"ShpB"); f64v(t,10); f64v(t,20); f64v(t,110); f64v(t,70);
+            fld(t,0x28,"Xfrm"); f64v(t,1); f64v(t,0); f64v(t,5); f64v(t,0); f64v(t,1); f64v(t,7);
+            fld(t,0x31,"Shpe");
+              u8v(t,1); u32v(t,4); u8v(t,1); tag(t,"ShNR");
+              fld(t,0x21,"ShCR"); f32v(t,0.5f); f32v(t,0.5f); f32v(t,0.5f); f32v(t,0.5f);
+              fld(t,0xaa,"CTyp"); u32v(t,4); u16v(t,0); for(int i=0;i<4;i++) u16v(t,0);
+              u8v(t,0);
+            fld(t,0x31,"BFil");
+              u8v(t,1); u32v(t,5); u8v(t,1); tag(t,"FilS");
+              fld(t,0x31,"Colr");
+                u8v(t,1); u32v(t,6); u8v(t,1); tag(t,"RGBA");
+                fld(t,0x44,"_col"); f32v(t,1.0f); f32v(t,0.0f); f32v(t,0.0f); f32v(t,1.0f);
+                u8v(t,0);
+              u8v(t,0);
+            u8v(t,0);
+          // -- 2: an open cubic path, stroked blue, filled by a LINK back to the shared red fill --
+          u8v(t,1); u32v(t,7); u8v(t,1); tag(t,"PCrv");
+            fld(t,0x31,"BFil"); u8v(t,2); u32v(t,5);             // class31 flag 2 = link to id 5
+            fld(t,0x31,"PFil");
+              u8v(t,1); u32v(t,8); u8v(t,1); tag(t,"FilS");
+              fld(t,0x31,"Colr");
+                u8v(t,1); u32v(t,9); u8v(t,1); tag(t,"RGBA");
+                fld(t,0x44,"_col"); f32v(t,0.0f); f32v(t,0.0f); f32v(t,1.0f); f32v(t,1.0f);
+                u8v(t,0);
+              u8v(t,0);
+            fld(t,0x31,"LSty");
+              u8v(t,1); u32v(t,10); u8v(t,1); tag(t,"LSty");
+              fld(t,0x0a,"Wght"); f64v(t,3.0);
+              u8v(t,0);
+            fld(t,0x32,"Crvs");                                   // plain class, header read inline
+              u8v(t,1); tag(t,"PCvD"); u16v(t,1);
+              fld(t,0x30,"Data");                                 // positional: u8, u32 count, then per subpath
+                u8v(t,0x01); u8v(t,0);
+                u8v(t,0x03); u32v(t,1);
+                u8v(t,0x29); u8v(t,0);                            // not closed
+                u8v(t,0xac); u32v(t,4); u16v(t,18);               // 0x2c array, 4 records of 18 bytes
+                  f64v(t,0);  f64v(t,0);  u8v(t,1); u8v(t,0);     // anchor
+                  f64v(t,0);  f64v(t,0);  u8v(t,0); u8v(t,1);     // out handle
+                  f64v(t,40); f64v(t,60); u8v(t,0); u8v(t,2);     // in handle
+                  f64v(t,40); f64v(t,60); u8v(t,1); u8v(t,0);     // anchor
+                u8v(t,0);
+              u8v(t,0);
+            fld(t,0x26,"CvsB"); f64v(t,0); f64v(t,0); f64v(t,40); f64v(t,60);
+            u8v(t,0);
+        u8v(t,0);                                   // end Sprd
+      u8v(t,0);                                     // end DocN
+    u8v(t,0);                                       // end root
+
+    // -------- wrap the tree in a v9 "#FAT" container with a zlib chunk and a Thmb preview --------
+    const QByteArray comp = qCompress(t,9).mid(4);  // qCompress prepends a 4-byte size; Affinity stores raw zlib
+    const quint32 crc = (quint32)crc32(crc32(0,nullptr,0), (const Bytef*)t.constData(), (uInt)t.size());
+    QImage thumb(6,4,QImage::Format_ARGB32); thumb.fill(QColor(180,60,220));
+    QByteArray png; { QBuffer bf(&png); bf.open(QIODevice::WriteOnly); thumb.save(&bf,"PNG"); }
+
+    auto buildFile=[&](const QByteArray& payload, quint32 useCrc, bool withThumb)->QByteArray{
+        QByteArray f;
+        f.append('\x00'); f.append('\xff'); f.append('K'); f.append('A');
+        u16v(f,9); u16v(f,0); tag(f,"Prsn");
+        f.append("#Inf",4);
+        const quint64 chunkOff = 72;
+        const quint64 fatOff = chunkOff + 4 + quint64(payload.size()) + 4;
+        const quint64 thmbOff = fatOff + 59 + 36 + 7;              // header + one named entry ("doc.dat")
+        u64v(f,fatOff); u64v(f,thmbOff); u64v(f,(quint64)payload.size()); u64v(f,0); u64v(f,0);
+        u32v(f,1); u32v(f,2);
+        f.append("Prot",4); u32v(f,3);                              // present when version > 7
+        f.append("#Fil",4); f.append(payload); u32v(f,0xFFFFFFFFu); // every chunk has its own terminator
+        f.append("#FAT",4);
+        u64v(f,0); u64v(f,1000); u64v(f,thmbOff); u64v(f,(quint64)payload.size()); u64v(f,0);
+        u32v(f,1); u32v(f,0); u32v(f,36+7); u16v(f,0); u8v(f,0);
+        u32v(f,1); u8v(f,0);                                        // id 1, flag 0 (named)
+        u64v(f,chunkOff); u64v(f,(quint64)t.size()); u64v(f,(quint64)payload.size());
+        u32v(f,useCrc); u8v(f,1);                                   // #FAT compression INDEX 1 → zlib
+        u16v(f,7); f.append("doc.dat",7);
+        if(withThumb){
+            u32v(f,0xFFFFFFFFu); f.append("Thmb",4); u32v(f,1);
+            u32v(f,(quint32)(png.size()+13)); u32v(f,29); u32v(f,0); u32v(f,(quint32)png.size()); u8v(f,1);
+            f.append(png);
+        }
+        return f;
+    };
+
+    const QByteArray good = buildFile(comp, crc, true);
+    check(xara::affinityIsContainer(good), "Affinity: container signature recognised");
+    int sOk=0, sBad=0;
+    check(xara::affinityVerifyStreams(good,&sOk,&sBad) && sOk==1 && sBad==0,
+          "Affinity: every chunk decompresses and matches its stored CRC32");
+
+    xara::AffinityStats st;
+    const QStringList pages = xara::affinityToSvgPages(good,&st);
+    check(pages.size()==1 && st.pages==1,         "Affinity: one SVG page per spread");
+    check(st.exactParse && st.treeConsumed==st.treeBytes,
+          "Affinity: the object tree parses to the exact last byte of doc.dat");
+    check(st.shapes==2,                           "Affinity: both drawables converted");
+    const QString svg = pages.isEmpty()? QString() : pages[0];
+    check(svg.contains("viewBox=\"0 0 180 180\""), "Affinity: SprB becomes the page viewBox");
+    check(svg.contains("inkscape:label=\"Red panel\""), "Affinity: a layer's Desc is carried out as its name");
+    check(svg.contains("transform=\"matrix(1,0,0,1,5,7)\""),
+          "Affinity: Xfrm rows (m0,m1,m2,m3,m4,m5) map to SVG matrix(m0,m3,m1,m4,m2,m5)");
+    check(svg.contains("<rect x=\"10\" y=\"20\" width=\"100\" height=\"50\""),
+          "Affinity: ShpN ShpB becomes the rectangle box");
+    // ShCR is a fraction of the FULL shorter side (domain [0, 0.5]; 0.5 = fully rounded, the
+    // geometric maximum). This assertion previously encoded a further halving, which drew every
+    // rounded rectangle at half its corner radius. Pinned by measuring shape_test.afdesign's 45x45
+    // rounded rectangle (ShCR = 0.24449) against that document's own 512px preview: the radius comes
+    // out at ~11 units = ShCR * min(w,h), not the ~5.5 the halved formula gives.
+    check(svg.contains("rx=\"25\""),              "Affinity: ShNR ShCR = fraction of the shorter side (not of half of it)");
+    check(svg.contains("fill=\"#ff0000\"") && svg.count("fill=\"#ff0000\"")==2,
+          "Affinity: a class-31 LINK resolves, so one shared fill colours both shapes");
+    check(svg.contains("stroke=\"#0000ff\"") && svg.contains("stroke-width=\"3\""),
+          "Affinity: PFil is the STROKE colour and LSty Wght its width");
+    check(svg.contains("<path d=\"M0 0C0 0 40 60 40 60\""),
+          "Affinity: PCrv 18-byte records become a cubic Bezier chain");
+    check(st.bboxOk==1 && st.bboxBad==0,
+          "Affinity: the computed cubic bounds reproduce the file's own stored CvsB");
+
+    // The preview is located from the header, not by scanning for a PNG signature.
+    QImage prev; prev.loadFromData(xara::affinityPreviewPng(good),"PNG");
+    check(!prev.isNull() && prev.size()==QSize(6,4) && prev.pixelColor(0,0)==QColor(180,60,220),
+          "Affinity: Thmb preview extracted exactly from thmb_offset");
+
+    // ---- hostile / damaged input must decline cleanly, never hang, over-read or half-decode ----
+    check(xara::affinityToSvgPages(buildFile(comp, crc ^ 0x5A5A5A5Au, true)).isEmpty(),
+          "Affinity: a chunk whose CRC32 does not match is rejected outright");
+    for(int cut : {0, 40, 79, 100, 200}){
+        const QByteArray trunc = good.left(cut);
+        check(xara::affinityToSvgPages(trunc).isEmpty(), "Affinity: truncated file declines");
+    }
+    { QByteArray flip = good; flip[6] = char(1);                    // flag bits 0-1 = a variant we do not read
+      check(xara::affinityToSvgPages(flip).isEmpty(), "Affinity: reserved container flag bits rejected"); }
+    { QByteArray notAff = "\x00\xffKAnope"; notAff.append(200,'\0');
+      check(!xara::affinityIsContainer(notAff) && xara::affinityToSvgPages(notAff).isEmpty(),
+            "Affinity: a file without the #Inf header is not claimed"); }
+    { // A tree whose array count claims 0xFFFFFFFF elements must not be believed (no huge allocation).
+      QByteArray bomb; bomb.append('\x00'); bomb.append('\xff'); bomb.append('K'); bomb.append('S');
+      u16v(bomb,1); tag(bomb,"Pers"); u16v(bomb,1);
+      fld(bomb,0x8a,"Bomb"); u32v(bomb,0xFFFFFFFFu);                // double[] with an absurd count
+      const QByteArray bz = qCompress(bomb,9).mid(4);
+      const quint32 bcrc = (quint32)crc32(crc32(0,nullptr,0), (const Bytef*)bomb.constData(), (uInt)bomb.size());
+      QByteArray save = t; t = bomb;                                // buildFile reports t.size() as the raw size
+      check(xara::affinityToSvgPages(buildFile(bz, bcrc, false)).isEmpty(),
+            "Affinity: an absurd array count is rejected instead of allocated");
+      t = save; }
+    { // An unknown field type (0x76/0x77 are genuinely undocumented) must abort rather than guess a length.
+      QByteArray bad; bad.append('\x00'); bad.append('\xff'); bad.append('K'); bad.append('S');
+      u16v(bad,1); tag(bad,"Pers"); u16v(bad,1);
+      fld(bad,0x77,"Unkn");
+      const QByteArray bz = qCompress(bad,9).mid(4);
+      const quint32 bcrc = (quint32)crc32(crc32(0,nullptr,0), (const Bytef*)bad.constData(), (uInt)bad.size());
+      QByteArray save = t; t = bad;
+      check(xara::affinityToSvgPages(buildFile(bz, bcrc, false)).isEmpty(),
+            "Affinity: an unknown field type declines rather than guessing its length");
+      t = save; }
+    { // Regression (adversarial review): the FAT/thumbnail/chunk offsets are file-derived u64s, so a
+      // bounds check written as "off + k > size" WRAPS on 0xFFFF…FF and hands a wild pointer to memcmp
+      // (ASan: heap-buffer-overflow). Every such comparison must be done by subtraction.
+      for(quint64 fo : { quint64(0xFFFFFFFFFFFFFFFFull), quint64(0xFFFFFFFFFFFFFFC5ull), quint64(1ull)<<62 }){
+          QByteArray f;
+          f.append('\x00'); f.append('\xff'); f.append('K'); f.append('A');
+          u16v(f,9); u16v(f,0); tag(f,"Prsn"); f.append("#Inf",4);
+          u64v(f,fo); u64v(f,0xFFFFFFFFFFFFFFFFull); u64v(f,0); u64v(f,0); u64v(f,0); u32v(f,1); u32v(f,2);
+          f.append("Prot",4); u32v(f,3);
+          f.append(300,'\0');
+          int o=0, b=0;
+          const bool clean = xara::affinityToSvgPages(f).isEmpty()
+                          && !xara::affinityVerifyStreams(f,&o,&b)
+                          && xara::affinityPreviewPng(f).isEmpty();
+          check(clean, "Affinity: an out-of-range u64 offset is rejected, not wrapped into a wild read");
+      } }
+    { // Regression (adversarial review): field payloads AMPLIFY. A bool array is bit-packed 8-per-byte in
+      // the file but 8 bytes each in memory (64x), so ~4 MB of crafted tree can ask for ~240 MB. The tree
+      // reader charges every allocation against one budget and must decline rather than honour it.
+      QByteArray bomb;
+      bomb.append('\x00'); bomb.append('\xff'); bomb.append('K'); bomb.append('S');
+      u16v(bomb,1); tag(bomb,"Pers"); u16v(bomb,1);
+      const int nbools = 30000000;
+      fld(bomb,0xa9,"Bomb"); u32v(bomb,nbools); bomb.append((nbools+7)/8, '\0');
+      const QByteArray bz = qCompress(bomb,1).mid(4);
+      const quint32 bcrc = (quint32)crc32(crc32(0,nullptr,0), (const Bytef*)bomb.constData(), (uInt)bomb.size());
+      QByteArray save = t; t = bomb;
+      check(xara::affinityToSvgPages(buildFile(bz, bcrc, false)).isEmpty(),
+            "Affinity: a bit-packed bool array that would amplify to hundreds of MB is refused");
+      t = save; }
+    check(xara::affinityToSvgPages(QByteArray()).isEmpty(), "Affinity: empty input declines");
+}
+// ---- SVG presentation attributes the bridge used to swallow ----
+// Every vector importer that routes through parseSvg (Affinity, CDR, Visio, PageMaker, ODF, AI/EPS…)
+// inherits these, so each one was a silent loss in a dozen formats at once.
+{
+    // fill-opacity is PER-PAINT: it must not fade the stroke too. They shared one slot before.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<rect x='0' y='0' width='10' height='10' fill='#ff0000' fill-opacity='0.5'"
+          " stroke='#00ff00' stroke-width='2'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && qAbs(v[0].fill.color.alphaF()-0.5)<0.02,
+            "svg: fill-opacity fades the fill");
+      check(v.size()==1 && v[0].stroke.color.alphaF()>0.99 && v[0].stroke.transp<0.01,
+            "svg: fill-opacity leaves the STROKE opaque");
+      check(v.size()==1 && v[0].opacity>0.99,
+            "svg: fill-opacity is not whole-shape opacity"); }
+
+    // stroke-opacity was emitted by importers and read by nobody.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<rect x='0' y='0' width='10' height='10' stroke='#000' stroke-width='2' stroke-opacity='0.25'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && qAbs(v[0].stroke.transp-0.75)<0.02, "svg: stroke-opacity reaches the stroke"); }
+
+    // Nested opacity multiplies; it used to be a plain assignment inherited by children.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'><g opacity='0.5'><g opacity='0.5'>"
+          "<rect x='0' y='0' width='10' height='10' fill='#000'/></g></g></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      Shape r; for(const Shape& x : v) if(x.type!=ShapeType::Group) r=x;
+      check(qAbs(r.opacity-0.25)<0.02, "svg: nested group opacity compounds (0.5 x 0.5 = 0.25)"); }
+
+    // Cap / join / dashes: the model has always had them; the parser never filled them in.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<path d='M0 0L10 0' stroke='#000' stroke-width='2' stroke-linecap='round'"
+          " stroke-linejoin='bevel' stroke-dasharray='4 2'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && v[0].stroke.cap==Qt::RoundCap,   "svg: stroke-linecap is honoured");
+      check(v.size()==1 && v[0].stroke.join==Qt::BevelJoin, "svg: stroke-linejoin is honoured");
+      check(v.size()==1 && v[0].stroke.dashes.size()==2,    "svg: stroke-dasharray is honoured"); }
+
+    // An odd dash count repeats, per the SVG spec.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<path d='M0 0L10 0' stroke='#000' stroke-dasharray='3'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && v[0].stroke.dashes.size()==2, "svg: an odd stroke-dasharray count repeats"); }
+
+    // fill-rule: SVG's default is nonzero. XarQ's Shape default is even-odd, so the parser has to say so.
+    { const QByteArray a = "<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0L9 0L9 9L0 9Z' fill='#000'/></svg>";
+      const QByteArray b = "<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0L9 0L9 9L0 9Z' fill='#000' fill-rule='evenodd'/></svg>";
+      const QVector<Shape> va = parseSvg(a, nullptr, QString()), vb = parseSvg(b, nullptr, QString());
+      check(va.size()==1 && va[0].fillRule==Qt::WindingFill, "svg: fill-rule defaults to nonzero, per the spec");
+      check(vb.size()==1 && vb[0].fillRule==Qt::OddEvenFill, "svg: an explicit fill-rule=evenodd is honoured"); }
+
+    // A layer's name must survive: inherited from the group onto the drawable inside it.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' xmlns:inkscape='http://www.inkscape.org/namespaces/inkscape'>"
+          "<g inkscape:label='Signal logo'><rect x='0' y='0' width='10' height='10' fill='#000'/></g></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      bool named=false; for(const Shape& x : v) if(x.type!=ShapeType::Group && x.name=="Signal logo") named=true;
+      check(named, "svg: inkscape:label names the drawable, inherited from its group"); }
+
+    // Affinity's "Add" is CSS plus-lighter, which Qt does have (CompositionMode_Plus).
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<rect x='0' y='0' width='10' height='10' fill='#fff' style='mix-blend-mode:plus-lighter'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && v[0].blend==QPainter::CompositionMode_Plus,
+            "svg: mix-blend-mode:plus-lighter maps to the additive composition mode"); }
+
+    // Regression (adversarial review): opacity MULTIPLIES down the tree but the cascade WITHIN one
+    // element must let the winning declaration replace the others — CSS says the inline style wins.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<rect x='0' y='0' width='10' height='10' fill='red' opacity='.5' style='opacity:.5'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && qAbs(v[0].opacity-0.5)<0.02,
+            "svg: an inline style opacity REPLACES the presentation attribute (it does not multiply with it)"); }
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<style>.a{opacity:0.5} rect{opacity:0.5}</style>"
+          "<rect class='a' x='0' y='0' width='10' height='10' fill='red'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && qAbs(v[0].opacity-0.5)<0.02,
+            "svg: two CSS rules both setting opacity do not compound within one element"); }
+
+    // fill-opacity has to survive a GRADIENT fill and a <text> fill, both of which bypass styleShape.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'><defs>"
+          "<linearGradient id='lg'><stop offset='0' stop-color='#f00'/><stop offset='1' stop-color='#00f'/>"
+          "</linearGradient></defs>"
+          "<rect x='0' y='0' width='10' height='10' fill='url(#lg)' fill-opacity='0.5'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && v[0].fill.type==FillType::Linear && !v[0].fill.stops.isEmpty()
+            && qAbs(v[0].fill.stops[0].color.alphaF()-0.5)<0.02,
+            "svg: fill-opacity reaches the STOPS of a gradient fill"); }
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<text x='0' y='10' fill='#000' fill-opacity='0.5'>hello</text></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      bool faded=false; for(const Shape& x : v) if(x.type==ShapeType::Text && qAbs(x.fill.color.alphaF()-0.5)<0.02) faded=true;
+      check(faded, "svg: fill-opacity reaches a <text> fill"); }
+
+    // SVG dash lengths are user units; QPen scales its pattern by the pen width.
+    { const QByteArray a = "<svg xmlns='http://www.w3.org/2000/svg'>"
+          "<path d='M0 0L100 0' stroke='#000' stroke-width='10' stroke-dasharray='10 10'/></svg>";
+      const QVector<Shape> v = parseSvg(a, nullptr, QString());
+      check(v.size()==1 && v[0].stroke.dashes.size()==2 && qAbs(v[0].stroke.dashes[0]-1.0)<0.01,
+            "svg: stroke-dasharray is converted from user units into QPen's pen-width units"); }
+
+    // An Inkscape LAYER label names the layer, not every object inside it.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg' xmlns:inkscape='http://www.inkscape.org/namespaces/inkscape'>"
+          "<g inkscape:groupmode='layer' inkscape:label='Layer 1'>"
+          "<rect x='0' y='0' width='5' height='5' fill='#000'/><circle cx='8' cy='8' r='2' fill='#000'/></g></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      int stamped=0; for(const Shape& x : v) if(x.type!=ShapeType::Group && x.name=="Layer 1") ++stamped;
+      check(stamped==0, "svg: an inkscape LAYER label is not stamped onto every object inside it"); }
+
+    // A radial gradient whose geometry lives ENTIRELY in gradientTransform (Affinity writes exactly
+    // this: cx=0 cy=0 r=1). Mapping only the centre left a one-unit gradient — a flat slab.
+    { const QByteArray svg = "<svg xmlns='http://www.w3.org/2000/svg'><defs>"
+          "<radialGradient id='g' gradientUnits='userSpaceOnUse' cx='0' cy='0' r='1'"
+          " gradientTransform='matrix(80,0,0,40,100,50)'>"
+          "<stop offset='0' stop-color='#ff0000'/><stop offset='1' stop-color='#0000ff'/>"
+          "</radialGradient></defs>"
+          "<rect x='0' y='0' width='200' height='100' fill='url(#g)'/></svg>";
+      const QVector<Shape> v = parseSvg(svg, nullptr, QString());
+      check(v.size()==1 && v[0].fill.type==FillType::Radial, "svg: the radial gradient resolves");
+      const double rx = QLineF(v[0].fill.p0, v[0].fill.p1).length();
+      const double ry = QLineF(v[0].fill.p0, v[0].fill.p2).length();
+      check(qAbs(v[0].fill.p0.x()-100)<0.5 && qAbs(v[0].fill.p0.y()-50)<0.5,
+            "svg: gradientTransform places the radial centre");
+      check(qAbs(rx-80)<0.5 && qAbs(ry-40)<0.5,
+            "svg: gradientTransform also scales the radial RADII (an 80x40 ellipse, not a 1-unit circle)"); }
+}
+
+// ---- Affinity LIVE SHAPES: heart, cloud, square star and the polygon side count ----
+// These four used to come out as their bounding rectangle (or, for a polygon, as a pentagon no matter
+// what the file said), which is the worst kind of wrong: the page still "reads" so nothing looks
+// broken. The geometry itself was pinned against shape_test.afdesign's own 512px preview.
+{
+    auto u8v =[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); };
+    auto u16v=[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    auto u32v=[](QByteArray& b, quint32 v){ for(int i=0;i<4;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto u64v=[](QByteArray& b, quint64 v){ for(int i=0;i<8;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto f32v=[&](QByteArray& b, float v){ quint32 r; memcpy(&r,&v,4); u32v(b,r); };
+    auto f64v=[&](QByteArray& b, double v){ quint64 r; memcpy(&r,&v,8); u64v(b,r); };
+    auto tag =[&](QByteArray& b, const char* s){ for(int i=3;i>=0;--i) b.append(s[i]); };
+    auto fld =[&](QByteArray& b, unsigned type, const char* name){ u8v(b,type); tag(b,name); };
+
+    QByteArray t;
+    t.append('\x00'); t.append('\xff'); t.append('K'); t.append('S');
+    u16v(t,1); tag(t,"Pers"); u16v(t,1);
+    fld(t,0x31,"DocR");
+      u8v(t,1); u32v(t,1); u8v(t,1); tag(t,"DocN");
+      fld(t,0x31,"Chld");
+        u8v(t,1); u32v(t,2); u8v(t,1); tag(t,"Sprd");
+        fld(t,0x26,"SprB"); f64v(t,0); f64v(t,0); f64v(t,200); f64v(t,200);
+        fld(t,0xb1,"Chld"); u32v(t,4);
+          // heart
+          u8v(t,1); u32v(t,3); u8v(t,1); tag(t,"ShpN");
+            fld(t,0x26,"ShpB"); f64v(t,0); f64v(t,0); f64v(t,100); f64v(t,100);
+            fld(t,0x31,"Shpe"); u8v(t,1); u32v(t,4); u8v(t,1); tag(t,"ShHt");
+              fld(t,0x09,"Sprd"); f32v(t,0.2f);
+              u8v(t,0);
+            u8v(t,0);
+          // cloud: 12 bubbles, valley at 0.8165 of the peak radius
+          u8v(t,1); u32v(t,5); u8v(t,1); tag(t,"ShpN");
+            fld(t,0x26,"ShpB"); f64v(t,100); f64v(t,0); f64v(t,200); f64v(t,100);
+            fld(t,0x31,"Shpe"); u8v(t,1); u32v(t,6); u8v(t,1); tag(t,"ShCl");
+              fld(t,0x02,"Bubl"); u16v(t,12);
+              fld(t,0x09,"IRad"); f32v(t,0.8165f);
+              u8v(t,0);
+            u8v(t,0);
+          // square star: 5 blocky arms
+          u8v(t,1); u32v(t,7); u8v(t,1); tag(t,"ShpN");
+            fld(t,0x26,"ShpB"); f64v(t,0); f64v(t,100); f64v(t,100); f64v(t,200);
+            fld(t,0x31,"Shpe"); u8v(t,1); u32v(t,8); u8v(t,1); tag(t,"ShSS");
+              fld(t,0x02,"Side"); u16v(t,5);
+              fld(t,0x09,"COut"); f32v(t,0.5f);
+              u8v(t,0);
+            u8v(t,0);
+          // polygon: SIX sides, counted in Side (there is no Pnts field on a polygon)
+          u8v(t,1); u32v(t,9); u8v(t,1); tag(t,"ShpN");
+            fld(t,0x26,"ShpB"); f64v(t,100); f64v(t,100); f64v(t,200); f64v(t,200);
+            fld(t,0x31,"Shpe"); u8v(t,1); u32v(t,10); u8v(t,1); tag(t,"ShPy");
+              fld(t,0x02,"Side"); u16v(t,6);
+              u8v(t,0);
+            u8v(t,0);
+        u8v(t,0);
+      u8v(t,0);
+    u8v(t,0);
+
+    const QByteArray comp = qCompress(t,9).mid(4);
+    const quint32 crc = (quint32)crc32(crc32(0,nullptr,0),(const Bytef*)t.constData(),(uInt)t.size());
+    QByteArray f;
+    f.append('\x00'); f.append('\xff'); f.append('K'); f.append('A');
+    u16v(f,9); u16v(f,0); tag(f,"Prsn"); f.append("#Inf",4);
+    const quint64 fatOff = 72 + 4 + quint64(comp.size()) + 4;
+    u64v(f,fatOff); u64v(f,0); u64v(f,0); u64v(f,0); u64v(f,0); u32v(f,1); u32v(f,2);
+    f.append("Prot",4); u32v(f,3);
+    f.append("#Fil",4); f.append(comp); u32v(f,0xFFFFFFFFu);
+    f.append("#FAT",4);
+    u64v(f,0); u64v(f,1000); u64v(f,0); u64v(f,0); u64v(f,0);
+    u32v(f,1); u32v(f,0); u32v(f,36+7); u16v(f,0); u8v(f,0);
+    u32v(f,1); u8v(f,0);
+    u64v(f,72); u64v(f,(quint64)t.size()); u64v(f,(quint64)comp.size()); u32v(f,crc); u8v(f,1);
+    u16v(f,7); f.append("doc.dat",7);
+
+    xara::AffinityStats sst;
+    const QStringList sp = xara::affinityToSvgPages(f,&sst);
+    const QString ssvg = sp.value(0);
+    check(sp.size()==1 && sst.shapes==4 && sst.skippedShape==0,
+          "Affinity shapes: heart, cloud, square star and polygon all convert (none falls back to its box)");
+    check(!ssvg.contains("<rect"),
+          "Affinity shapes: none of the four degrades into a bounding rectangle");
+    // A heart is cubics; a cloud is arcs; the two star/polygon forms are straight-line polygons.
+    check(ssvg.count("<path")==4,                 "Affinity shapes: each emits one path");
+    check(ssvg.contains("C"),                     "Affinity shapes: the heart is built from cubic segments");
+    check(ssvg.contains("A"),                     "Affinity shapes: the cloud is built from arc segments");
+    // The polygon must honour Side: six sides = one M plus five L before the close.
+    const int lastPath = ssvg.lastIndexOf("<path");
+    const QString polyD = ssvg.mid(lastPath, ssvg.indexOf("/>", lastPath) - lastPath);
+    check(polyD.count('L')==5,                    "Affinity shapes: a polygon with Side=6 has six sides, not five");
+    // The square star's 5 arms contribute 3 vertices each (two tip corners + the inner meet).
+    const int ssIdx = ssvg.indexOf("<path", ssvg.indexOf("<path", ssvg.indexOf("<path")+1)+1);
+    const QString ssD = ssvg.mid(ssIdx, ssvg.indexOf("/>", ssIdx) - ssIdx);
+    check(ssD.count('L')==14,                     "Affinity shapes: a 5-arm square star has 15 vertices");
+}
+
+// ---- PSD layers: small files written here, one feature each ----
+{
+    auto be16=[](QByteArray& b,int v){ b.append(char(v>>8)); b.append(char(v)); };
+    auto be32=[](QByteArray& b,qint64 v){ for(int i=3;i>=0;--i) b.append(char((v>>(8*i))&0xff)); };
+    // A layer record plus its raw channels. `extra` is the tagged blocks, `maskData` the mask block body.
+    struct L { int t,l,b,r; QVector<QPair<int,QByteArray>> ch; QByteArray blend, name, extra, maskData; int op; bool clip; };
+    int chComp=0;
+    auto psd=[&](int W,int H,const QVector<L>& ls)->QByteArray{
+        QByteArray d("8BPS"); be16(d,1); d.append(QByteArray(6,0)); be16(d,3); be32(d,H); be32(d,W); be16(d,8); be16(d,3);
+        be32(d,0); be32(d,0);
+        QByteArray li; be16(li,ls.size()); QByteArray px;
+        for(const L& x:ls){
+            be32(li,x.t); be32(li,x.l); be32(li,x.b); be32(li,x.r); be16(li,x.ch.size());
+            for(const auto& c:x.ch){ be16(li,c.first); be32(li,c.second.size()+2); QByteArray v; be16(v,chComp); px+=v+c.second; }
+            li+="8BIM"; li+=x.blend; li.append(char(x.op)); li.append(char(x.clip?1:0)); li.append(char(0)); li.append(char(0));
+            QByteArray nm; nm.append(char(x.name.size())); nm+=x.name; while(nm.size()%4) nm.append(char(0));
+            QByteArray ex; be32(ex,x.maskData.size()); ex+=x.maskData; be32(ex,0); ex+=nm; ex+=x.extra;
+            be32(li,ex.size()); li+=ex;
+        }
+        QByteArray body=li+px; if(body.size()&1) body.append(char(0));
+        QByteArray lm; be32(lm,body.size()); lm+=body; be32(lm,0);
+        be32(d,lm.size()); d+=lm;
+        be16(d,0); d.append(QByteArray(qint64(W)*H*3,char(127)));
+        return d; };
+    auto plane=[](int n,int v){ return QByteArray(n,char(v)); };
+    auto pix=[&](int t,int l,int b,int r,int R,int G,int B,const QByteArray& blend="norm",int op=255,bool clip=false){
+        const int n=(b-t)*(r-l); L x{t,l,b,r,{{0,plane(n,R)},{1,plane(n,G)},{2,plane(n,B)},{-1,plane(n,255)}},blend,"px",{},{},op,clip}; return x; };
+    auto block=[&](const char* key,const QByteArray& body){ QByteArray b("8BIM"); b+=key; be32(b,body.size()); b+=body; return b; };
+
+    { Document pd=importPsdDocument(psd(4,4,{pix(0,0,4,4,255,0,0),pix(1,1,3,3,0,255,0,"mul ",128)}));
+      check(pd.shapes.size()==2 && pd.pageSize==QSizeF(4,4), "PSD layers: two pixel layers, the file's page");
+      check(pd.shapes[1].blend==QPainter::CompositionMode_Multiply && qAbs(pd.shapes[1].opacity-128/255.0)<0.01, "PSD layers: blend mode and opacity");
+      check(pd.shapes[1].transform.dx()==1 && pd.shapes[1].fill.image.width()==2, "PSD layers: a layer sits at its own rectangle"); }
+
+    { // A divider opens the group and the folder record closes it, bottom layer first.
+      L open=pix(0,0,0,0,0,0,0); open.ch.clear(); open.name="sep"; { QByteArray v; be32(v,3); open.extra=block("lsct",v); }
+      L close=open; close.name="Folder"; { QByteArray v; be32(v,1); v+="8BIM"; v+="norm"; close.extra=block("lsct",v); }
+      Document pd=importPsdDocument(psd(4,4,{open,pix(0,0,2,2,1,2,3),close}));
+      check(pd.shapes.size()==1 && pd.shapes[0].type==ShapeType::Group && pd.shapes[0].name=="Folder" && pd.shapes[0].children.size()==1, "PSD layers: section dividers build a named group"); }
+
+    { // A clipped layer only shows where its base has coverage.
+      Document pd=importPsdDocument(psd(4,4,{pix(0,0,2,4,255,0,0),pix(0,0,4,4,0,0,255,"norm",255,true)}));
+      const QImage im=pd.shapes[1].fill.image;
+      check(qAlpha(im.pixel(0,1))==255 && qAlpha(im.pixel(0,3))==0, "PSD layers: clipping cuts to the base's coverage"); }
+
+    { // A user mask with a default outside its rectangle.
+      L x=pix(0,0,4,4,9,9,9);
+      QByteArray md; be32(md,0); be32(md,0); be32(md,2); be32(md,2); md.append(char(0)); md.append(char(0)); md.append(QByteArray(2,0));
+      x.maskData=md; x.ch.push_back({-2,plane(4,255)});
+      Document pd=importPsdDocument(psd(4,4,{x}));
+      const QImage im=pd.shapes[0].fill.image;
+      check(qAlpha(im.pixel(0,0))==255 && qAlpha(im.pixel(3,3))==0, "PSD layers: a mask applies, with its default outside"); }
+
+    { // Invert has no data of its own and changes what is beneath.
+      L adj=pix(0,0,0,0,0,0,0); adj.ch.clear(); adj.extra=block("nvrt",QByteArray());
+      Document pd=importPsdDocument(psd(2,2,{pix(0,0,2,2,10,20,30),adj}));
+      check(pd.shapes.size()==1 && QColor(pd.shapes[0].fill.image.pixel(0,0))==QColor(245,235,225), "PSD layers: an adjustment bakes into the layers beneath"); }
+
+    { // ZIP channels used to come out black.
+      const QByteArray z=qCompress(QByteArray(4,char(200)),9).mid(4);
+      L x{0,0,2,2,{{0,z},{1,z},{2,z}},"norm","z",{},{},255,false};
+      chComp=2; const QByteArray d=psd(2,2,{x}); chComp=0;
+      const Document pd=importPsdDocument(d);
+      check(pd.shapes.size()==1 && QColor(pd.shapes[0].fill.image.pixel(1,1))==QColor(200,200,200), "PSD layers: ZIP channels decode"); }
+
+    // Adjustments: one flat pixel layer, one adjustment block, the resulting pixel compared by hand.
+    auto adjusted=[&](int R,int G,int B,const char* key,const QByteArray& body)->QColor{
+        L adj=pix(0,0,0,0,0,0,0); adj.ch.clear(); adj.extra=block(key,body);
+        const Document pd=importPsdDocument(psd(2,2,{pix(0,0,2,2,R,G,B),adj}));
+        return pd.shapes.isEmpty()?QColor():QColor(pd.shapes[0].fill.image.pixel(0,0)); };
+    auto near=[](const QColor& a,const QColor& b,int t=2){ return qAbs(a.red()-b.red())<=t && qAbs(a.green()-b.green())<=t && qAbs(a.blue()-b.blue())<=t; };
+
+    { // Channel mixer: red out of green, 50 % of blue into green. Five shorts per output: R, G, B, unused, constant.
+      QByteArray b; be16(b,1); be16(b,0);
+      for(int v: {0,100,0,0,0,  0,0,50,0,0,  0,0,100,0,0,  0,0,0,100,0}) be16(b,v);
+      check(near(adjusted(10,200,100,"mixr",b),QColor(200,50,100)), "PSD adjustments: channel mixer outputs");
+      QByteArray m; be16(m,1); be16(m,1);
+      for(int v: {0,100,0,0,0,  0,0,0,0,0,  0,0,0,0,0,  0,0,0,0,0}) be16(m,v);
+      check(near(adjusted(10,200,100,"mixr",m),QColor(200,200,200)), "PSD adjustments: monochrome mixer uses one row for all"); }
+
+    { // Selective colour, absolute: all the cyan it can add, on the reds only.
+      QByteArray b; be16(b,1); be16(b,1);
+      for(int rec=0;rec<10;++rec) for(int c=0;c<4;++c) be16(b,(rec==1&&c==0)?100:0);
+      const QColor red=adjusted(255,0,0,"selc",b), green=adjusted(0,255,0,"selc",b);
+      check(near(red,QColor(0,0,0)), "PSD adjustments: selective colour moves its own family");
+      check(near(green,QColor(0,255,0)), "PSD adjustments: selective colour leaves other families"); }
+
+    { // Gradient map: black to red, by luminance.
+      QByteArray b; be16(b,1); b.append(char(0)); b.append(char(0)); be32(b,0); be16(b,2);
+      auto stop=[&](int loc,int R,int G,int Bl){ be32(b,loc); be32(b,50); be16(b,0); be16(b,R); be16(b,G); be16(b,Bl); be16(b,0); be16(b,0); };
+      stop(0,0,0,0); stop(4096,65535,0,0);
+      be16(b,0); b.append(QByteArray(16,0));
+      check(near(adjusted(255,255,255,"grdm",b),QColor(255,0,0)) && near(adjusted(0,0,0,"grdm",b),QColor(0,0,0)), "PSD adjustments: gradient map follows luminance");
+      check(near(adjusted(128,128,128,"grdm",b),QColor(128,0,0),3), "PSD adjustments: gradient map interpolates"); }
+
+    { // A colour lookup table, as .cube text inside its descriptor: a 2-point cube that inverts.
+      QByteArray cube="LUT_3D_SIZE 2\n1 1 1\n0 1 1\n1 0 1\n0 0 1\n1 1 0\n0 1 0\n1 0 0\n0 0 0\n";
+      QByteArray b; be16(b,1); be32(b,16); be32(b,1); be16(b,0); be32(b,0); b+="null"; be32(b,1); be32(b,0); b+="LUT3DFileData"; b.remove(b.size()-13,13); b.chop(4);
+      be32(b,13); b+="LUT3DFileData"; b+="tdta"; be32(b,cube.size()); b+=cube;
+      check(near(adjusted(10,200,100,"clrL",b),QColor(245,55,155)), "PSD adjustments: a .cube colour lookup applies"); }
+
+    { // Hue/saturation: range lightness at +100 sends every channel to the pixel's maximum.
+      QByteArray b; be16(b,2); be16(b,0); for(int i=0;i<6;++i) be16(b,0);
+      for(int r=0;r<6;++r){ for(int v: {0,0,359,359}) be16(b,v); for(int v: {0,0,r==0?100:0}) be16(b,v); }
+      check(near(adjusted(200,100,50,"hue2",b),QColor(200,200,200)), "PSD adjustments: a range's lightness goes to the pixel's own maximum"); }
+
+    { // Curves run channel first, then composite: red 0-255 halved, composite inverted.
+      QByteArray b; b.append(char(0)); be16(b,1); be32(b,3);
+      be16(b,2); be16(b,255); be16(b,0); be16(b,0); be16(b,255);
+      be16(b,2); be16(b,0); be16(b,0); be16(b,128); be16(b,255);
+      check(near(adjusted(255,0,0,"curv",b),QColor(127,255,255),2), "PSD adjustments: channel curves apply before the composite"); }
+
+    check(importPsdDocument(QByteArray("8BPSjunk")).shapes.isEmpty(), "PSD layers: a truncated header yields nothing");
+}
+
+// ---- PDF through poppler: the expected output is stated against a file this test writes itself ----
+if(xara::pdfVectorAvailable()){
+    QTemporaryDir dir; const QString path=dir.filePath("t.pdf");
+    const QByteArray content="1 0 0 rg 10 10 50 50 re f\n0 0 1 RG 2 w 100 100 m 150 100 l S\nq 200 200 50 50 re W n /S1 sh Q\nq 300 300 10 10 re W n 400 400 20 20 re f Q\n";
+    QByteArray f="%PDF-1.4\n"; QVector<int> off;
+    const QList<QByteArray> objs={
+        "<</Type/Catalog/Pages 2 0 R>>",
+        "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        "<</Type/Page/Parent 2 0 R/MediaBox[0 0 500 600]/Contents 4 0 R/Resources<</Shading<</S1<</ShadingType 2/ColorSpace/DeviceRGB/Coords[200 0 250 0]/Function<</FunctionType 2/Domain[0 1]/C0[1 0 0]/C1[0 0 1]/N 1>>>>>>>>>>",
+        "<</Length "+QByteArray::number(content.size())+">>stream\n"+content+"endstream" };
+    for(int i=0;i<objs.size();++i){ off.push_back(f.size()); f+=QByteArray::number(i+1)+" 0 obj\n"+objs[i]+"\nendobj\n"; }
+    const int xr=f.size(); f+="xref\n0 5\n0000000000 65535 f \n";
+    for(int o:off) f+=QByteArray::number(o).rightJustified(10,'0')+" 00000 n \n";
+    f+="trailer<</Size 5/Root 1 0 R>>\nstartxref\n"+QByteArray::number(xr)+"\n%%EOF\n";
+    { QFile w(path); w.open(QIODevice::WriteOnly); w.write(f); }
+    xara::PdfVectorStats st;
+    const QStringList pg=xara::pdfToSvgPages(path,&st);
+    check(pg.size()==1 && st.totalPages==1, "PDF: one page in, one SVG out");
+    const QString v=pg.value(0);
+    check(v.contains("viewBox=\"0 0 500 600\""), "PDF: the page box becomes the viewBox");
+    check(v.contains("fill=\"#ff0000\"") && v.contains("M10 590"), "PDF: a fill lands at its position with y flipped");
+    check(v.contains("stroke=\"#0000ff\"") && v.contains("stroke-width=\"2\""), "PDF: a stroke keeps its colour and width");
+    check(v.contains("<linearGradient") && v.contains("x1=\"200\""), "PDF: an axial shading becomes a real gradient");
+    check(!v.contains("M400 "), "PDF: content wholly outside its clip is dropped, not left unclipped");
+    { xara::PdfVectorStats bad; const QString junk=dir.filePath("junk.pdf"); QFile w(junk); w.open(QIODevice::WriteOnly); w.write("not a pdf"); w.close();
+      check(xara::pdfToSvgPages(junk,&bad).isEmpty(), "PDF: a file that isn't one yields no pages"); }
+}
+
+// ---- Affinity appearance model: paint stacks, inheritance, adjustments, document colour spaces ----
+// Each case builds a one-spread document from a small tree writer, so the expected output is stated
+// against bytes this test wrote itself rather than against a vendored sample.
+{
+    auto u8v =[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); };
+    auto u16v=[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    auto u32v=[](QByteArray& b, quint32 v){ for(int i=0;i<4;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto u64v=[](QByteArray& b, quint64 v){ for(int i=0;i<8;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto f32v=[&](QByteArray& b, float v){ quint32 r; memcpy(&r,&v,4); u32v(b,r); };
+    auto f64v=[&](QByteArray& b, double v){ quint64 r; memcpy(&r,&v,8); u64v(b,r); };
+    auto tag =[&](QByteArray& b, const char* s){ for(int i=3;i>=0;--i) b.append(s[i]); };
+    auto fld =[&](QByteArray& b, unsigned type, const char* name){ u8v(b,type); tag(b,name); };
+    quint32 nextId=100;
+    auto cls =[&](QByteArray& b, const char* c){ u8v(b,1); u32v(b,nextId++); u8v(b,1); tag(b,c); };
+    auto solid=[&](QByteArray& b, float r, float g, float a=1.f, float bl=0.f){       // an FDsc holding a FilS
+        cls(b,"FDsc"); fld(b,0x31,"FDeF"); cls(b,"FilS"); fld(b,0x31,"Colr"); cls(b,"RGBA");
+        fld(b,0x44,"_col"); f32v(b,r); f32v(b,g); f32v(b,bl); f32v(b,a); u8v(b,0); u8v(b,0); u8v(b,0); };
+    auto line=[&](QByteArray& b, double w, unsigned style, double align){              // an LDsc holding an LSty
+        cls(b,"LDsc"); fld(b,0x31,"LDeL"); cls(b,"LSty");
+        fld(b,0x2c,"Data"); u16v(b,12); f64v(b,2.0); u8v(b,0); u8v(b,2); u8v(b,style); u8v(b,0);
+        fld(b,0x0a,"Wght"); f64v(b,w); u8v(b,0); fld(b,0x07,"LDSa"); u32v(b,quint32(align)); u8v(b,0); };
+    auto box =[&](QByteArray& b){ fld(b,0x26,"ShpB"); f64v(b,10); f64v(b,10); f64v(b,110); f64v(b,110); };
+    auto doc =[&](const QByteArray& kids, int count, int ddrf, const QByteArray& spreadFields=QByteArray())->QByteArray{
+        QByteArray t; t.append('\x00'); t.append('\xff'); t.append('K'); t.append('S');
+        u16v(t,1); tag(t,"Pers"); u16v(t,1);
+        fld(t,0x2a,"DDRF"); u16v(t,ddrf); u16v(t,0);
+        fld(t,0x31,"DocR"); u8v(t,1); u32v(t,1); u8v(t,1); tag(t,"DocN");
+        fld(t,0x31,"Chld"); u8v(t,1); u32v(t,2); u8v(t,1); tag(t,"Sprd");
+        fld(t,0x26,"SprB"); f64v(t,0); f64v(t,0); f64v(t,200); f64v(t,200);
+        t.append(spreadFields);
+        fld(t,0xb1,"Chld"); u32v(t,quint32(count)); t.append(kids);
+        u8v(t,0); u8v(t,0); u8v(t,0);
+        const QByteArray comp=qCompress(t,9).mid(4);
+        const quint32 crc=(quint32)crc32(crc32(0,nullptr,0),(const Bytef*)t.constData(),(uInt)t.size());
+        QByteArray f; f.append('\x00'); f.append('\xff'); f.append('K'); f.append('A');
+        u16v(f,12); u16v(f,0); tag(f,"Prsn"); f.append("#Inf",4);
+        u64v(f,72+4+quint64(comp.size())+4); u64v(f,0); u64v(f,0); u64v(f,0); u64v(f,0); u32v(f,1); u32v(f,2);
+        f.append("Prot",4); u32v(f,3); f.append("#Fil",4); f.append(comp); u32v(f,0xFFFFFFFFu);
+        f.append("#FAT",4); u64v(f,0); u64v(f,1000); u64v(f,0); u64v(f,0); u64v(f,0);
+        u32v(f,1); u32v(f,0); u32v(f,36+7); u16v(f,0); u8v(f,0); u32v(f,1); u8v(f,0);
+        u64v(f,72); u64v(f,(quint64)t.size()); u64v(f,(quint64)comp.size()); u32v(f,crc); u8v(f,1);
+        u16v(f,7); f.append("doc.dat",7);
+        return f; };
+    auto rectBody=[&](QByteArray& k){ box(k); fld(k,0x31,"Shpe"); cls(k,"ShNR"); u8v(k,0); };
+
+    { // FiEf lists every effect type; only an enabled one applies, with its offset from Offs and Angl.
+      auto shaded=[&](unsigned on){ QByteArray k; cls(k,"ShpN"); rectBody(k);
+        fld(k,0xb1,"FiEf"); u32v(k,1); cls(k,"Shad"); fld(k,0x29,"Enab"); u8v(k,on);
+        fld(k,0x0a,"Radi"); f64v(k,20.0); fld(k,0x0a,"Offs"); f64v(k,6.0); fld(k,0x0a,"Angl"); f64v(k,0.0); u8v(k,0);
+        fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0); return k; };
+      const QString v=xara::affinityToSvgPages(doc(shaded(1),1,0)).value(0);
+      check(v.contains("xarq:shadow=\"6 0 20 "), "Affinity effects: an enabled shadow carries its offset and radius");
+      check(!xara::affinityToSvgPages(doc(shaded(0),1,0)).value(0).contains("xarq:shadow"), "Affinity effects: a disabled shadow stays off");
+      QByteArray g; cls(g,"ShpN"); rectBody(g);
+      fld(g,0xb1,"FiEf"); u32v(g,1); cls(g,"Gaus"); fld(g,0x29,"Enab"); u8v(g,1); fld(g,0x0a,"Radi"); f64v(g,25.0); u8v(g,0);
+      fld(g,0xb1,"BFFl"); u32v(g,1); solid(g,1,0); u8v(g,0);
+      check(xara::affinityToSvgPages(doc(g,1,0)).value(0).contains("xarq:blur=\"18\""), "Affinity effects: Gaussian radius converts to the model's blur");
+      QByteArray c; cls(c,"ShpN"); rectBody(c);
+      fld(c,0xb1,"FiEf"); u32v(c,1); cls(c,"InnG"); fld(c,0x29,"Enab"); u8v(c,1); fld(c,0x0a,"Radi"); f64v(c,10.0); u8v(c,0);
+      fld(c,0xb1,"BFFl"); u32v(c,1); solid(c,1,0); u8v(c,0);
+      const QString ig=xara::affinityToSvgPages(doc(c,1,0)).value(0);
+      check(ig.contains("clip-path") && ig.contains("fill-rule=\"evenodd\""), "Affinity effects: an inner glow is a blurred inverse clipped to the outline"); }
+
+    { // Intensity scales a glow's falloff: at Comp 0.5 the edge is at full strength, not half.
+      QByteArray g; cls(g,"ShpN"); rectBody(g);
+      fld(g,0xb1,"FiEf"); u32v(g,1); cls(g,"OutG"); fld(g,0x29,"Enab"); u8v(g,1); fld(g,0x0a,"Radi"); f64v(g,25.0); fld(g,0x0a,"Comp"); f64v(g,0.5); u8v(g,0);
+      fld(g,0xb1,"BFFl"); u32v(g,1); solid(g,1,0); u8v(g,0);
+      const QVector<xara::Shape> sh=xara::parseSvg(xara::affinityToSvgPages(doc(g,1,0)).value(0).toUtf8());
+      check(!sh.isEmpty() && sh[0].blur>0 && qAbs(sh[0].blurGain-2.0)<1e-6, "Affinity effects: glow intensity becomes the blur's gain"); }
+
+    { // Blend modes the painter lacks. Linear Light adds: neutral grey leaves the backdrop alone.
+      QImage bd(4,4,QImage::Format_ARGB32_Premultiplied); bd.fill(QColor(100,150,200));
+      xara::Shape s; s.type=xara::ShapeType::Rect; s.rect=QRectF(0,0,4,4); s.fill.type=xara::FillType::Solid; s.fill.color=QColor(128,128,128); s.stroke.enabled=false; s.transp.type=47;
+      { QPainter g(&bd); xara::paintShape(g,s); }
+      const QColor c=bd.pixelColor(1,1);
+      check(qAbs(c.red()-100)<=2 && qAbs(c.green()-150)<=2 && qAbs(c.blue()-200)<=2, "Blend modes: Linear Light with neutral grey changes nothing");
+      QImage b2(4,4,QImage::Format_ARGB32_Premultiplied); b2.fill(QColor(100,150,200)); s.transp.type=52; s.fill.color=QColor(0,0,0);
+      { QPainter g(&b2); xara::paintShape(g,s); }
+      check(b2.pixelColor(1,1)==QColor(0,0,0), "Blend modes: Darker Colour takes the darker whole colour"); }
+
+    { // A compound: two rectangles side by side, the second subtracted where it overlaps.
+      auto oper=[&](QByteArray& k,double x0,double x1,unsigned op){ cls(k,"ShpN"); fld(k,0x26,"ShpB"); f64v(k,x0); f64v(k,0); f64v(k,x1); f64v(k,100);
+        fld(k,0x31,"Shpe"); cls(k,"ShNR"); u8v(k,0); fld(k,0x2a,"ComO"); u16v(k,op); u16v(k,0); u8v(k,0); };
+      auto comp=[&](unsigned op){ QByteArray ch; oper(ch,0,100,0); oper(ch,50,150,op);
+        QByteArray k; cls(k,"Comp"); fld(k,0xb1,"Chld"); u32v(k,2); k.append(ch); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0); return k; };
+      auto bounds=[&](unsigned op){ const QVector<xara::Shape> sh=xara::parseSvg(xara::affinityToSvgPages(doc(comp(op),1,0)).value(0).toUtf8()); return sh.size()==1?sh[0].docBounds():QRectF(); };
+      const QRectF add=bounds(0), sub=bounds(2), isect=bounds(1);
+      check(qAbs(add.width()-150)<1, "Affinity compounds: add unites the operands");
+      check(qAbs(sub.width()-50)<1 && sub.left()<1, "Affinity compounds: subtract cuts the later operand away");
+      check(qAbs(isect.width()-50)<1 && qAbs(isect.left()-50)<1, "Affinity compounds: intersect keeps the overlap"); }
+
+    { // A fill layer paints its bitmap's area.
+      QByteArray k; cls(k,"FRst"); fld(k,0x31,"Bitm"); cls(k,"DyBm"); fld(k,0x07,"BmpW"); u32v(k,120); fld(k,0x07,"BmpH"); u32v(k,90); u8v(k,0);
+      fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,0,1); u8v(k,0);
+      const QVector<xara::Shape> sh=xara::parseSvg(xara::affinityToSvgPages(doc(k,1,0)).value(0).toUtf8());
+      check(sh.size()==1 && qAbs(sh[0].docBounds().width()-120)<1 && qAbs(sh[0].docBounds().height()-90)<1, "Affinity fill layers: the bitmap's area, filled"); }
+
+    { // Adjustments: a layer below, one adjustment above. Unknown kinds are reported rather than dropped quietly.
+      auto over=[&](const char* cl, const std::function<void(QByteArray&)>& params, float r, float g, float bl, xara::AffinityStats* st=nullptr){
+        QByteArray k; cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,r,g,1.f,bl); u8v(k,0);
+        cls(k,cl); fld(k,0x31,"AdjP"); cls(k,"Prm "); params(k); u8v(k,0); u8v(k,0);
+        const QVector<xara::Shape> sh=xara::parseSvg(xara::affinityToSvgPages(doc(k,2,0),st).value(0).toUtf8());
+        return sh.isEmpty()?QColor():sh[0].fill.color; };
+      const QColor thr=over("ThRA",[&](QByteArray& b){ fld(b,0x09,"Thre"); f32v(b,0.5f); fld(b,0x09,"True"); f32v(b,1.f); fld(b,0x09,"Fals"); f32v(b,0.f); },0.9f,0.9f,0.9f);
+      check(thr==QColor(255,255,255), "Affinity adjustments: threshold");
+      const QColor pos=over("PoRA",[&](QByteArray& b){ fld(b,0x07,"Post"); u32v(b,2); },0.2f,0.8f,0.2f);
+      check(pos==QColor(0,255,0), "Affinity adjustments: posterize");
+      const QColor exq=over("ExRA",[&](QByteArray& b){ fld(b,0x09,"Expo"); f32v(b,1.f); },0.5f,0.5f,0.5f);
+      check(qAbs(exq.red()-175)<=2, "Affinity adjustments: exposure is stops of linear light");
+      xara::AffinityStats st;
+      over("ZzRA",[&](QByteArray&){ },0.5f,0.5f,0.5f,&st);
+      check(st.ignoredAdjustments==1, "Affinity adjustments: an unknown kind is counted for the status line"); }
+
+    { // Artboards become pages of their own, all the size of the largest, each starting at its own corner.
+      auto board=[&](QByteArray& k, double x, double w, float r, float g){ cls(k,"ShpN"); fld(k,0x26,"ShpB"); f64v(k,0); f64v(k,0); f64v(k,w); f64v(k,80);
+        fld(k,0x28,"Xfrm"); f64v(k,1); f64v(k,0); f64v(k,x); f64v(k,0); f64v(k,1); f64v(k,0);
+        fld(k,0x29,"ABEn"); u8v(k,1); fld(k,0x31,"Shpe"); cls(k,"ShNR"); u8v(k,0);
+        fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,r,g); u8v(k,0); };
+      QByteArray k; board(k,0,60,1,0); board(k,300,120,0,1);
+      xara::AffinityStats st;
+      const QStringList pg=xara::affinityToSvgPages(doc(k,2,0),&st);
+      check(pg.size()==2 && st.artboards==2, "Affinity artboards: each one is a page");
+      check(pg.value(1).contains("viewBox=\"300 0 120 80\"") && pg.value(0).contains("viewBox=\"0 0 120 80\""), "Affinity artboards: pages share the largest size, from each board's corner"); }
+
+    { // Guides and margins come back in page coordinates; bleed as the largest edge.
+      QByteArray sf; fld(sf,0x8a,"GdsH"); u32v(sf,2); f64v(sf,30); f64v(sf,70); fld(sf,0x8a,"GdsV"); u32v(sf,1); f64v(sf,90);
+      fld(sf,0x26,"Mrgn"); f64v(sf,5); f64v(sf,7); f64v(sf,6); f64v(sf,8);
+      fld(sf,0x26,"bled"); f64v(sf,3); f64v(sf,3); f64v(sf,9); f64v(sf,3);
+      QByteArray k; cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0);
+      xara::AffinityStats st;
+      xara::affinityToSvgPages(doc(k,1,0,sf),&st);
+      check(st.pageInfo.size()==1 && st.pageInfo[0].guidesH==QVector<double>({30,70}) && st.pageInfo[0].guidesV==QVector<double>({90}), "Affinity page settings: guides");
+      check(st.pageInfo.size()==1 && st.pageInfo[0].marginL==5 && st.pageInfo[0].marginT==7 && st.pageInfo[0].marginR==6 && st.pageInfo[0].marginB==8, "Affinity page settings: margins are left, top, right, bottom");
+      check(st.bleed==9, "Affinity page settings: bleed"); }
+
+    { // A pixel mask attached to a layer: states 2 (white) in one cell. Format 6 is one 8-bit plane.
+      auto masked=[&](unsigned frmt, unsigned state){ QByteArray k; cls(k,"ShpN"); rectBody(k);
+        fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0);
+        fld(k,0xb1,"AdCh"); u32v(k,1); cls(k,"MRst"); fld(k,0x31,"Bitm"); cls(k,"DyBm");
+        fld(k,0x2a,"Frmt"); u16v(k,frmt); u16v(k,0); fld(k,0x07,"BmpW"); u32v(k,4); fld(k,0x07,"BmpH"); u32v(k,4);
+        fld(k,0x81,"Sta1"); u32v(k,1); u8v(k,state); u8v(k,0); u8v(k,0); u8v(k,0); return k; };
+      xara::AffinityStats st;
+      const QString v=xara::affinityToSvgPages(doc(masked(6,2),1,0),&st).value(0);
+      check(st.pixelMasks==1 && v.contains("xarq:pmask="), "Affinity masks: an attached MRst becomes a pixel mask");
+      const QVector<xara::Shape> sh=xara::parseSvg(v.toUtf8());
+      check(sh.size()==1 && sh[0].transp.geom==4 && !sh[0].transp.maskBmp.isNull(), "Affinity masks: the import carries it to the object");
+      xara::AffinityStats bad;
+      const QString v2=xara::affinityToSvgPages(doc(masked(3,2),1,0),&bad).value(0);
+      check(bad.pixelMasks==0 && bad.skippedRaster==1 && !v2.contains("xarq:pmask"), "Affinity masks: a format not understood is reported, not guessed"); }
+
+    { // DrwO is the stack: fill 0, fill 1, a HIDDEN fill, then a line. BFCr selects, it does not choose.
+      QByteArray k; cls(k,"ShpN"); rectBody(k);
+      fld(k,0x03,"BFCr"); u32v(k,1);
+      fld(k,0xb1,"BFFl"); u32v(k,3); solid(k,1,0); solid(k,0,1); solid(k,0,0,1,1);
+      fld(k,0xb1,"LIFl"); u32v(k,1); solid(k,0,0,1,0);
+      fld(k,0xb1,"LILn"); u32v(k,1); line(k,4,1,0);
+      fld(k,0xaa,"DrwO"); u32v(k,4); u16v(k,0); u16v(k,0); u16v(k,0); u16v(k,2); u16v(k,1);
+      u8v(k,0);
+      const QString v=xara::affinityToSvgPages(doc(k,1,0)).value(0);
+      check(v.contains("fill=\"#ff0000\"") && v.contains("fill=\"#00ff00\""), "Affinity paints: every fill in DrwO is drawn, not just the selected one");
+      check(!v.contains("fill=\"#0000ff\""), "Affinity paints: DrwO 2 skips a hidden fill");
+      check(v.indexOf("#ff0000") < v.indexOf("#00ff00"), "Affinity paints: the stack is bottom to top"); }
+
+    { // Line style 0 draws nothing however heavy it says it is; 2 is dashed.
+      QByteArray k; cls(k,"ShpN"); rectBody(k);
+      fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0);
+      fld(k,0xb1,"LIFl"); u32v(k,1); solid(k,0,0,1,0);
+      fld(k,0xb1,"LILn"); u32v(k,1); line(k,9,0,0);
+      fld(k,0xaa,"DrwO"); u32v(k,2); u16v(k,0); u16v(k,0); u16v(k,1); u8v(k,0);
+      check(!xara::affinityToSvgPages(doc(k,1,0)).value(0).contains("stroke="), "Affinity paints: line style 0 is no stroke, whatever its weight");
+      QByteArray d; cls(d,"ShpN"); rectBody(d);
+      fld(d,0xb1,"BFFl"); u32v(d,1); solid(d,1,0);
+      fld(d,0xb1,"LIFl"); u32v(d,1); solid(d,0,0,1,0);
+      fld(d,0xb1,"LILn"); u32v(d,1); line(d,3,2,0);
+      fld(d,0xaa,"DrwO"); u32v(d,2); u16v(d,0); u16v(d,0); u16v(d,1); u8v(d,0);
+      check(xara::affinityToSvgPages(doc(d,1,0)).value(0).contains("stroke-dasharray"), "Affinity paints: line style 2 is dashed"); }
+
+    { // An outside-aligned line becomes geometry that leaves the shape's own area alone.
+      QByteArray k; cls(k,"ShpN"); rectBody(k);
+      fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0);
+      fld(k,0xb1,"LIFl"); u32v(k,1); solid(k,0,0,1,1);
+      fld(k,0xb1,"LILn"); u32v(k,1); line(k,8,1,2);
+      fld(k,0xaa,"DrwO"); u32v(k,2); u16v(k,0); u16v(k,0); u16v(k,1); u8v(k,0);
+      const QVector<Shape> sh=parseSvg(xara::affinityToSvgPages(doc(k,1,0)).value(0).toUtf8(),nullptr,QString());
+      QVector<Shape> leaves; std::function<void(const QVector<Shape>&)> flat=[&](const QVector<Shape>& vs){ for(const Shape& x:vs){ if(x.type==ShapeType::Group) flat(x.children); else leaves.push_back(x); } }; flat(sh);
+      bool ring=false;
+      for(const Shape& x:leaves) if(x.fill.type==FillType::Solid && x.fill.color==QColor(0,0,255)){
+          QPainterPath p=x.transform.map(x.localPath()); p.setFillRule(x.fillRule);
+          ring = p.contains(QPointF(6,60)) && !p.contains(QPointF(60,60)) && p.boundingRect().width()>110; }
+      check(ring, "Affinity paints: an outside stroke covers only the outside of the shape"); }
+
+    { // A symbol instance stores only its overrides; the rest comes through ShpM.
+      QByteArray k; cls(k,"ShpN");
+      fld(k,0x31,"ShpM"); cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0);
+      fld(k,0x28,"Xfrm"); f64v(k,1); f64v(k,0); f64v(k,30); f64v(k,0); f64v(k,1); f64v(k,0);
+      u8v(k,0);
+      const QString v=xara::affinityToSvgPages(doc(k,1,0)).value(0);
+      check(v.contains("<rect") && v.contains("fill=\"#ff0000\""), "Affinity symbols: an instance draws its master's geometry and paint");
+      check(v.contains("matrix(1,0,0,1,30,0)"), "Affinity symbols: the instance keeps its own transform");
+      QByteArray o; cls(o,"ShpN");
+      fld(o,0x31,"ShpM"); cls(o,"ShpN"); rectBody(o); fld(o,0xb1,"BFFl"); u32v(o,1); solid(o,1,0); u8v(o,0);
+      fld(o,0xb1,"BFFl"); u32v(o,1); solid(o,0,1);
+      u8v(o,0);
+      const QString w=xara::affinityToSvgPages(doc(o,1,0)).value(0);
+      check(w.contains("fill=\"#00ff00\"") && !w.contains("fill=\"#ff0000\""), "Affinity symbols: an instance's override wins over the master"); }
+
+    { // A filter under AdCh carries CLiT = 1 too, but it is not a clip, so the layer must still draw.
+      QByteArray k; cls(k,"ShpN"); rectBody(k);
+      fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0);
+      fld(k,0xb1,"AdCh"); u32v(k,1); cls(k,"FlRN"); fld(k,0x2a,"CLiT"); u16v(k,1); u16v(k,0); u8v(k,0);
+      u8v(k,0);
+      check(xara::affinityToSvgPages(doc(k,1,0)).value(0).contains("<rect"), "Affinity: a filter child is not mistaken for an inexpressible clip"); }
+
+    { // An Invert layer changes what lies below it, and only that.
+      QByteArray k;
+      cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0);
+      cls(k,"InRA"); u8v(k,0);
+      cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,0,0,1,1); u8v(k,0);
+      const QString v=xara::affinityToSvgPages(doc(k,3,0)).value(0);
+      check(v.contains("fill=\"#00ffff\""), "Affinity adjustments: Invert bakes into the colour below it");
+      check(v.contains("fill=\"#0000ff\""), "Affinity adjustments: a layer above the adjustment is untouched"); }
+
+    { // The document's format decides how a stored colour shows.
+      auto one=[&](float r, float g, float bl, int ddrf){ QByteArray k; cls(k,"ShpN"); rectBody(k); fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,r,g,1.f,bl); u8v(k,0);
+          return xara::affinityToSvgPages(doc(k,1,ddrf)).value(0); };
+      check(one(1,0,0,2).contains("fill=\"#818181\""), "Affinity colour: in a grey document pure red shows as D50 luminance at gamma 2.2");
+      check(one(0.905f,0.905f,0.905f,9).contains("fill=\"#f4f4f4\""), "Affinity colour: an RGB/32 document stores linear values");
+      check(one(1,0,0,4).contains("fill=\"#ed1e24\""), "Affinity colour: a CMYK document shows red through the print gamut"); }
+
+    { // Every live shape class draws its own outline rather than its box.
+      struct SC { const char* c; std::function<void(QByteArray&)> f; };
+      auto F=[&](QByteArray& b,const char* n,float v){ fld(b,0x09,n); f32v(b,v); };
+      const QVector<SC> shapes={
+        {"ShCg",[&](QByteArray& b){ F(b,"IRad",.8f); F(b,"Hole",.3f); F(b,"TtSz",.3f); F(b,"NtSz",.45f); fld(b,0x02,"Teth"); u16v(b,12); }},
+        {"ShCR",[&](QByteArray& b){ F(b,"TlHg",.2f); F(b,"TlWd",.1f); F(b,"TlRP",.5f); F(b,"TlEP",.4f); }},
+        {"ShCE",[&](QByteArray& b){ F(b,"TlHg",.25f); F(b,"TlEP",.2f); F(b,"TlAn",.26f); }},
+        {"ShDA",[&](QByteArray& b){ F(b,"Thck",.35f); fld(b,0x02,"LSty"); u16v(b,8); fld(b,0x02,"RSty"); u16v(b,10); F(b,"RPr1",.6f); F(b,"RPr2",.4f); F(b,"LPr1",.4f); }},
+        {"ShDS",[&](QByteArray& b){ fld(b,0x02,"Pnts"); u16v(b,5); F(b,"IRad",.6f); F(b,"PRad",.9f); }},
+        {"ShTr",[&](QByteArray& b){ F(b,"Curv",.3f); }},
+        {"ShCr",[&](QByteArray& b){ F(b,"ArcL",-1.f); F(b,"ArcR",-.3f); }},
+        {"ShPi",[&](QByteArray& b){ F(b,"AngS",.7f); F(b,"AngE",-.5f); F(b,"IRad",0.f); }},
+        {"ShSg",[&](QByteArray& b){ F(b,"Angl",1.7f); F(b,"Pos0",.3f); F(b,"Pos1",1.f); }},
+        {"ShpD",[&](QByteArray& b){ F(b,"Pos ",.5f); }},
+        {"ShTz",[&](QByteArray& b){ F(b,"PosL",.3f); F(b,"PosR",.8f); }} };
+      for(const SC& sc : shapes){
+          QByteArray k; cls(k,"ShpN"); box(k); fld(k,0x31,"Shpe"); cls(k,sc.c); sc.f(k); u8v(k,0);
+          fld(k,0xb1,"BFFl"); u32v(k,1); solid(k,1,0); u8v(k,0);
+          xara::AffinityStats st; const QString v=xara::affinityToSvgPages(doc(k,1,0),&st).value(0);
+          check(v.contains("<path") && !v.contains("<rect") && st.skippedShape==0, QStringLiteral("Affinity shapes: %1 draws its own outline").arg(sc.c).toUtf8().constData());
+      } }
+}
+
+// ---- Affinity RASTER layers: 256x256 single-channel planes reassembled into one RGBA image ----
+// A second hermetic fixture for the pixel side of the format. One Rstr layer whose four channels
+// exercise every tile state at once — a stored plane (4), the constant 0xFF (2) and the constant 0x00
+// (1) — which also pins the channel order (R,G,B,A) and the crop back to the pixels that can show.
+{
+    auto u8v =[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); };
+    auto u16v=[](QByteArray& b, unsigned v){ b.append(char(v&0xff)); b.append(char((v>>8)&0xff)); };
+    auto u32v=[](QByteArray& b, quint32 v){ for(int i=0;i<4;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto u64v=[](QByteArray& b, quint64 v){ for(int i=0;i<8;i++) b.append(char((v>>(8*i))&0xff)); };
+    auto f64v=[&](QByteArray& b, double v){ quint64 r; memcpy(&r,&v,8); u64v(b,r); };
+    auto tag =[&](QByteArray& b, const char* s){ for(int i=3;i>=0;--i) b.append(s[i]); };
+    auto fld =[&](QByteArray& b, unsigned type, const char* name){ u8v(b,type); tag(b,name); };
+
+    const int W = 200, H = 150;                       // one 256x256 tile covers the whole layer
+    QByteArray planeR(256*256, '\0'), planeA(256*256, '\0');
+    for(int y = 0; y < 256; ++y)
+        for(int x = 0; x < 256; ++x){
+            planeR[y*256+x] = char(x);                                    // red ramps with x
+            if(x>=20 && x<120 && y>=30 && y<90) planeA[y*256+x] = char(0xFF);
+        }
+
+    QByteArray t;
+    t.append('\x00'); t.append('\xff'); t.append('K'); t.append('S');
+    u16v(t,1); tag(t,"Pers"); u16v(t,1);
+    fld(t,0x31,"DocR");
+      u8v(t,1); u32v(t,1); u8v(t,1); tag(t,"DocN");
+      fld(t,0x31,"Chld");
+        u8v(t,1); u32v(t,2); u8v(t,1); tag(t,"Sprd");
+        fld(t,0x26,"SprB"); f64v(t,0); f64v(t,0); f64v(t,W); f64v(t,H);
+        fld(t,0xb1,"Chld"); u32v(t,1);
+          u8v(t,1); u32v(t,3); u8v(t,1); tag(t,"Rstr");
+            fld(t,0xb1,"AdCh"); u32v(t,1);                              // a vector mask: CLiT = 1 = clip
+              u8v(t,1); u32v(t,7); u8v(t,1); tag(t,"ShpN");
+              fld(t,0x2a,"CLiT"); u16v(t,1); u16v(t,0);
+              fld(t,0x26,"ShpB"); f64v(t,30); f64v(t,40); f64v(t,90); f64v(t,80);
+              u8v(t,0);
+            fld(t,0x31,"Bitm");
+              u8v(t,1); u32v(t,4); u8v(t,1); tag(t,"DyBm");
+              fld(t,0x2a,"Frmt"); u16v(t,0); u16v(t,0);                   // 8-bit RGBA
+              fld(t,0x07,"BmpW"); u32v(t,(quint32)W);
+              fld(t,0x07,"BmpH"); u32v(t,(quint32)H);
+              fld(t,0xb1,"Idx1"); u32v(t,1);
+                u8v(t,1); u32v(t,5); u8v(t,1); tag(t,"Blck");
+                fld(t,0x33,"Data"); tag(t,"DatI"); u32v(t,3); t.append("d/1");
+                u8v(t,0);
+              fld(t,0x81,"Sta1"); u32v(t,1); u8v(t,4);                    // stored plane
+              fld(t,0x81,"Sta2"); u32v(t,1); u8v(t,2);                    // constant 0xFF, no block
+              fld(t,0x81,"Sta3"); u32v(t,1); u8v(t,1);                    // constant 0x00
+              fld(t,0xb1,"Idx4"); u32v(t,1);
+                u8v(t,1); u32v(t,6); u8v(t,1); tag(t,"Blck");
+                fld(t,0x33,"Data"); tag(t,"DatI"); u32v(t,3); t.append("d/2");
+                u8v(t,0);
+              fld(t,0x81,"Sta4"); u32v(t,1); u8v(t,4);
+              u8v(t,0);                                                    // end DyBm
+            u8v(t,0);                                                      // end Rstr
+        u8v(t,0);                                                          // end Sprd
+      u8v(t,0);                                                            // end DocN
+    u8v(t,0);                                                              // end root
+
+    // d/2 is written in the WRAPPED form: the plane inside a one-field object stream whose CLASS is
+    // "Data" and whose FIELD is "DatI". Reading it as a field called "Data" matches nothing, which is
+    // exactly the bug that shipped — it made every wrapped-plane document fall back to its preview
+    // while still reporting success. d/1 stays bare, so one fixture covers both encodings.
+    QByteArray wrappedA;
+    wrappedA.append('\x00'); wrappedA.append('\xff'); wrappedA.append('K'); wrappedA.append('S');
+    u16v(wrappedA,1); tag(wrappedA,"Data"); u16v(wrappedA,1);
+    u8v(wrappedA,0x2d); tag(wrappedA,"DatI"); u32v(wrappedA,(quint32)planeA.size());
+    wrappedA.append(planeA); u8v(wrappedA,0);
+
+    // three zlib chunks laid out back to back, then a #FAT naming all three
+    struct Ent { const char* name; QByteArray raw, comp; quint64 off=0; };
+    Ent ents[3] = { {"doc.dat",t,{}}, {"d/1",planeR,{}}, {"d/2",wrappedA,{}} };
+    QByteArray f;
+    f.append('\x00'); f.append('\xff'); f.append('K'); f.append('A');
+    u16v(f,9); u16v(f,0); tag(f,"Prsn"); f.append("#Inf",4);
+    quint64 at = 72; quint32 tail = 0;
+    for(Ent& e : ents){
+        e.comp = qCompress(e.raw,9).mid(4);
+        e.off  = at;
+        at    += 4 + quint64(e.comp.size()) + 4;
+        tail  += 36 + quint32(qstrlen(e.name));
+    }
+    u64v(f,at); u64v(f,0); u64v(f,0); u64v(f,0); u64v(f,0); u32v(f,1); u32v(f,2);
+    f.append("Prot",4); u32v(f,3);
+    for(const Ent& e : ents){ f.append("#Fil",4); f.append(e.comp); u32v(f,0xFFFFFFFFu); }
+    f.append("#FAT",4);
+    u64v(f,0); u64v(f,1000); u64v(f,0); u64v(f,0); u64v(f,0);
+    u32v(f,3); u32v(f,0); u32v(f,tail); u16v(f,0); u8v(f,0);
+    for(int i = 0; i < 3; ++i){
+        const Ent& e = ents[i];
+        u32v(f,(quint32)(i+1)); u8v(f,0);
+        u64v(f,e.off); u64v(f,(quint64)e.raw.size()); u64v(f,(quint64)e.comp.size());
+        u32v(f,(quint32)crc32(crc32(0,nullptr,0),(const Bytef*)e.raw.constData(),(uInt)e.raw.size()));
+        u8v(f,1);                                                          // #FAT compression INDEX 1 = zlib
+        u16v(f,(unsigned)qstrlen(e.name)); f.append(e.name,(int)qstrlen(e.name));
+    }
+
+    int rOk=0, rBad=0;
+    check(xara::affinityVerifyStreams(f,&rOk,&rBad) && rOk==3 && rBad==0,
+          "Affinity raster: all three chunks (tree + two planes) verify against their CRC32s");
+
+    xara::AffinityStats rst;
+    const QStringList rpages = xara::affinityToSvgPages(f,&rst);
+    check(rpages.size()==1 && rst.rasters==1 && rst.skippedRaster==0,
+          "Affinity raster: the Rstr layer is assembled, not skipped");
+    const QString rsvg = rpages.value(0);
+    // The alpha plane is opaque only over [20,120) x [30,90), so the emitted image is cropped to it —
+    // a layer's tile grid spans the whole canvas even when the paint covers a corner of it.
+    check(rsvg.contains("<image x=\"20\" y=\"30\" width=\"100\" height=\"60\""),
+          "Affinity raster: the image is cropped to the pixels that can actually show");
+
+    const int b64 = rsvg.indexOf("base64,");
+    const QByteArray pngOut = (b64 < 0) ? QByteArray()
+        : QByteArray::fromBase64(rsvg.mid(b64+7, rsvg.indexOf('"', b64) - b64 - 7).toLatin1());
+    QImage got; got.loadFromData(pngOut, "PNG");
+    check(got.size()==QSize(100,60), "Affinity raster: the decoded PNG is the cropped size");
+    // Channel 1 is the stored ramp, 2 the constant 0xFF, 3 the constant 0x00, 4 the stored alpha.
+    check(got.pixelColor(0,0)==QColor(20,255,0,255) && got.pixelColor(99,59)==QColor(119,255,0,255),
+          "Affinity raster: channels 1..4 are R,G,B,A and the two constant states resolve to 0xFF/0x00");
+    // AdCh — the layer's vector mask. It is written as a clipPath around the layer's group, so it
+    // crops the layer's own content and its children alike (Affinity hangs these off vector layers
+    // far more often than off pixel ones).
+    check(rst.masks==1 && rsvg.contains("<clipPath id=\"afclip1\">")
+                       && rsvg.contains("clip-path=\"url(#afclip1)\""),
+          "Affinity: an AdCh CLiT=1 shape becomes a clipPath on the layer");
+    check(rsvg.contains("<rect x=\"30\" y=\"40\" width=\"60\" height=\"40\""),
+          "Affinity: the mask's own geometry (not its bounding box) is what clips");
+}
+// Regression (adversarial review): out-of-range/huge numeric inputs must be handled without UB (UBSan-safe).
+{ QByteArray tj = "{\"type\":\"Topology\",\"arcs\":[[[0,0],[10,10]]],"
+                  "\"objects\":{\"a\":{\"type\":\"LineString\",\"arcs\":[1e19,0]}}}";  // 1e19 index skipped, arc 0 used
+  QString svg=xara::topojsonToSvg((const uint8_t*)tj.constData(),(qint64)tj.size());
+  check(svg.contains("<polyline") && !svg.contains("inf") && !svg.contains("nan"),
+        "topojson: out-of-range arc index skipped, no UB/inf"); }
+{ QByteArray sla = "<SCRIBUSUTF8NEW><DOCUMENT>"
+                   "<COLOR NAME=\"big\" CMYK=\"1e300 0 0 0\"/>"
+                   "<PAGEOBJECT PTYPE=\"6\" XPOS=\"0\" YPOS=\"0\" WIDTH=\"10\" HEIGHT=\"10\" FCOLOR=\"big\"/>"
+                   "</DOCUMENT></SCRIBUSUTF8NEW>";
+  QString svg=xara::scribusToSvg((const uint8_t*)sla.constData(),(qint64)sla.size());
+  check(!svg.contains("inf") && !svg.contains("nan"), "scribus: huge CMYK component clamped, no UB/inf"); }
+
+
+      // ---- Regression: adversarial-review fixes (vecextra) ----
+      // xfig ARC with a NaN middle defining point must NOT leak "nan"/"inf" into the SVG.
+      { QByteArray fig =
+          "#FIG 3.2\nLandscape\nCenter\nInches\nLetter\n100.00\nSingle\n-2\n1200 2\n"
+          "5 1 0 1 0 7 50 0 -1 0.000 0 0 0 0 500 500 100 100 nan 200 300 300\n";
+        QString svg=xara::xfigToSvg((const uint8_t*)fig.constData(),(qint64)fig.size());
+        check(!svg.contains("nan") && !svg.contains("inf"), "xfig: ARC NaN middle point not emitted into SVG"); }
+      // xfig user-colour with an attribute-injection payload must be rejected, not echoed verbatim.
+      { QByteArray fig =
+          "#FIG 3.2\nLandscape\nCenter\nInches\nLetter\n100.00\nSingle\n-2\n1200 2\n"
+          "0 40 #a'/><script>x</script>\n"
+          "2 1 0 1 40 7 50 -1 -1 0.000 0 0 -1 0 0 2\n\t100 100 200 200\n";
+        QString svg=xara::xfigToSvg((const uint8_t*)fig.constData(),(qint64)fig.size());
+        check(!svg.contains("<script") && !svg.contains("#a'"), "xfig: malformed user-colour hex not injected into SVG attributes"); }
+      // gpx tolerates a run of empty <trkseg> segments (polyline-count cap path) and still keeps the real point.
+      { QByteArray g = "<gpx version='1.1' xmlns='http://www.topografix.com/GPX/1/1'>";
+        for(int i=0;i<50;i++) g += "<trk><trkseg></trkseg></trk>";
+        g += "<wpt lat='1' lon='2'/></gpx>";
+        QString svg=xara::gpxToSvg((const uint8_t*)g.constData(),(qint64)g.size());
+        check(!svg.isEmpty() && svg.contains("<circle"), "gpx: empty segments tolerated, real waypoint still emitted"); }
+
+      // Fail-safe: non-archive/non-animation inputs must be rejected, not crash.
+      { const QString p="/tmp/xq_t.cbz"; writeF(p,"not a zip file"); check(!c->importCbz(p), "CBZ rejects a non-archive safely"); }
+      { const QString p="/tmp/xq_t.cbr"; writeF(p,"not an archive");  check(!c->importCbr(p), "CBR rejects a non-archive safely"); }
+      { const QString p="/tmp/xq_t.odg"; writeF(p,"not a zip");       check(!c->importOdg(p), "ODG rejects a non-archive safely"); }
+      // Flat ODF (single-XML, no zip): a .fodg with draw: shapes → vector shapes; a .fodt (text) → text
+      // frame via the fallback. Exercises the generalized importOdg (flat-XML path + text extraction).
+      { const QByteArray fodg="<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"><office:body><office:drawing><draw:page><draw:rect svg:x=\"1cm\" svg:y=\"1cm\" svg:width=\"4cm\" svg:height=\"2cm\"/><draw:ellipse svg:x=\"6cm\" svg:y=\"1cm\" svg:width=\"3cm\" svg:height=\"3cm\"/></draw:page></office:drawing></office:body></office:document>";
+        const QString p=QDir::tempPath()+"/xq_flat.fodg"; writeF(p,fodg);
+        Canvas oc; oc.newDocument(); int before=oc.doc().shapes.size();
+        check(oc.importOdg(p) && oc.doc().shapes.size()>=before+2, "flat ODF (.fodg) imports draw: shapes without a zip container"); }
+      { const QByteArray fodt="<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><office:body><office:text><text:p>Hello from a flat ODT.</text:p><text:p>Second paragraph.</text:p></office:text></office:body></office:document>";
+        const QString p=QDir::tempPath()+"/xq_flat.fodt"; writeF(p,fodt);
+        Canvas oc; oc.newDocument();
+        check(oc.importOdg(p) && !oc.doc().shapes.isEmpty() && oc.doc().shapes.back().type==ShapeType::Text
+              && oc.doc().shapes.back().text.contains("flat ODT"), "flat ODT (.fodt) text falls back to an editable text frame"); }
+      // ODF style fidelity: a shape keeps its REAL fill/stroke colours (draw:style-name → graphic-properties)
+      // and a <draw:path> imports as a curved path — not the old hardcoded pale-blue straight-edged default.
+      { const QByteArray f="<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+          "xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" "
+          "xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"><office:automatic-styles>"
+          "<style:style style:name=\"g1\" style:family=\"graphic\"><style:graphic-properties draw:fill=\"solid\" "
+          "draw:fill-color=\"#cc3333\" draw:stroke=\"solid\" svg:stroke-color=\"#003399\" svg:stroke-width=\"0.1cm\"/></style:style>"
+          "</office:automatic-styles><office:body><office:drawing><draw:page>"
+          "<draw:rect draw:style-name=\"g1\" svg:x=\"1cm\" svg:y=\"1cm\" svg:width=\"5cm\" svg:height=\"3cm\"/>"
+          "<draw:path svg:x=\"1cm\" svg:y=\"6cm\" svg:width=\"6cm\" svg:height=\"4cm\" svg:viewBox=\"0 0 6000 4000\" "
+          "svg:d=\"M 0 2000 C 1500 0 4500 4000 6000 2000 Z\"/></draw:page></office:drawing></office:body></office:document>";
+        const QString p=QDir::tempPath()+"/xq_styled.fodg"; writeF(p,f);
+        Canvas oc; oc.newDocument(); bool ok=oc.importOdg(p);
+        bool red=false, blueStroke=false, curve=false;
+        for(const Shape& s: oc.doc().shapes){
+            if(s.fill.type==FillType::Solid && s.fill.color==QColor("#cc3333")) red=true;
+            if(s.stroke.enabled && s.stroke.color==QColor("#003399")) blueStroke=true;
+            if(pathHasCurve(s.path)) curve=true; }
+        check(ok && red && blueStroke, "ODF: shape keeps its real style fill (#cc3333) + stroke (#003399) colours");
+        check(ok && curve, "ODF: <draw:path svg:d> imports as a curved path"); }
+      // ODF gradient fill: draw:fill="gradient" + a <draw:gradient> ramp → a real Linear/Radial gradient
+      // carrying the document's two colours (was: a flat default fill).
+      { const QByteArray f="<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+          "xmlns:style=\"urn:oasis:names:tc:opendocument:xmlns:style:1.0\" xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" "
+          "xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"><office:automatic-styles>"
+          "<draw:gradient draw:name=\"grad1\" draw:style=\"linear\" draw:start-color=\"#ff0000\" draw:end-color=\"#0000ff\" draw:angle=\"0\"/>"
+          "<style:style style:name=\"g1\" style:family=\"graphic\"><style:graphic-properties draw:fill=\"gradient\" "
+          "draw:fill-gradient-name=\"grad1\"/></style:style></office:automatic-styles><office:body><office:drawing><draw:page>"
+          "<draw:rect draw:style-name=\"g1\" svg:x=\"1cm\" svg:y=\"1cm\" svg:width=\"5cm\" svg:height=\"3cm\"/>"
+          "</draw:page></office:drawing></office:body></office:document>";
+        const QString p=QDir::tempPath()+"/xq_grad.fodg"; writeF(p,f);
+        Canvas oc; oc.newDocument(); bool ok=oc.importOdg(p); bool grad=false;
+        for(const Shape& s: oc.doc().shapes){
+            if(s.fill.type==FillType::Linear||s.fill.type==FillType::Radial){
+                bool r=false,b=false; for(const GradStop& gs: s.fill.stops){ if(gs.color==QColor("#ff0000"))r=true; if(gs.color==QColor("#0000ff"))b=true; }
+                if(r&&b) grad=true; } }
+        check(ok && grad, "ODF: draw:fill=gradient imports as a real gradient fill carrying both stop colours"); }
+      // ODF draw:transform — radians, counter-clockwise on a y-down page, list applied LEFT-TO-RIGHT
+      // (all three diverge from SVG). Pinned against LibreOffice.
+      { auto fodg=[](const QString& xf){ return QString(
+          "<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+          "xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" "
+          "xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"><office:body><office:drawing><draw:page>"
+          "<draw:rect draw:transform=\"%1\" svg:width=\"4cm\" svg:height=\"1cm\"/></draw:page></office:drawing></office:body></office:document>").arg(xf).toUtf8(); };
+        auto firstXf=[&](const QByteArray& doc)->QTransform{
+          const QString p=QDir::tempPath()+"/xq_odfxf.fodg";
+          { QFile w(p); w.open(QIODevice::WriteOnly); w.write(doc); w.close(); }
+          Canvas oc; oc.newDocument(); if(!oc.importOdg(p) || oc.doc().shapes.isEmpty()) return QTransform(1,0,0,1,-1,-1);
+          return oc.doc().shapes.back().transform; };
+        const double cm=96.0/2.54;
+        { const QTransform t=firstXf(fodg("translate (5cm 3cm)"));
+          check(qAbs(t.dx()-5*cm)<0.5 && qAbs(t.dy()-3*cm)<0.5, "ODF draw:transform translate carries real units (cm)"); }
+        { const QTransform t=firstXf(fodg("rotate (1.5707963)"));   // +90 deg CCW on a y-down page
+          check(qAbs(t.m11())<0.01 && t.m12()<-0.99 && t.m21()>0.99,
+                "ODF draw:transform rotate is radians + counter-clockwise (negated for Qt)"); }
+        { // order: rotate-then-translate must differ from translate-then-rotate, and ODF is left-to-right
+          const QTransform a=firstXf(fodg("rotate (1.5707963) translate (5cm 0cm)"));
+          const QTransform b=firstXf(fodg("translate (5cm 0cm) rotate (1.5707963)"));
+          check(qAbs(a.dx()-b.dx())>1.0 || qAbs(a.dy()-b.dy())>1.0, "ODF draw:transform order is significant");
+          check(qAbs(a.dx()-5*cm)<0.5 && qAbs(a.dy())<0.5,
+                "ODF draw:transform applies the list left-to-right (opposite of SVG)"); } }
+      // ODF <draw:g> groups: structure preserved, identity group transform, empties dropped.
+      { const QByteArray g =
+          "<?xml version=\"1.0\"?><office:document xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+          "xmlns:draw=\"urn:oasis:names:tc:opendocument:xmlns:drawing:1.0\" "
+          "xmlns:svg=\"urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0\"><office:body><office:drawing><draw:page>"
+          "<draw:rect svg:x=\"0cm\" svg:y=\"0cm\" svg:width=\"1cm\" svg:height=\"1cm\"/>"
+          "<draw:g draw:name=\"grp\"><draw:rect svg:x=\"2cm\" svg:y=\"0cm\" svg:width=\"1cm\" svg:height=\"1cm\"/>"
+          "<draw:g><draw:ellipse svg:x=\"4cm\" svg:y=\"0cm\" svg:width=\"1cm\" svg:height=\"1cm\"/></draw:g></draw:g>"
+          "<draw:g/></draw:page></office:drawing></office:body></office:document>";
+        const QString p=QDir::tempPath()+"/xq_odfgrp.fodg";
+        { QFile w(p); w.open(QIODevice::WriteOnly); w.write(g); w.close(); }
+        Canvas oc; oc.newDocument(); const bool ok=oc.importOdg(p);
+        const auto& sh=oc.doc().shapes;
+        check(ok && sh.size()==2, "ODF: <draw:g> yields 2 root shapes (loose rect + one group; empty group dropped)");
+        const Shape* grp=nullptr; for(const Shape& x: sh) if(x.type==ShapeType::Group) grp=&x;
+        check(grp && grp->children.size()==2, "ODF: group keeps its 2 children");
+        check(grp && grp->transform.isIdentity(), "ODF: group transform is identity (children hold absolute coords)");
+        check(grp && grp->children.size()==2 && grp->children[1].type==ShapeType::Group, "ODF: nested <draw:g> nests"); }
+      { const QString p="/tmp/xq_t.ora"; writeF(p,"not a zip");       check(!c->importOra(p), "OpenRaster rejects a non-archive safely"); }
+      { const QString p="/tmp/xq_t.kra"; writeF(p,"not a zip");       check(!c->importKra(p), "Krita rejects a non-archive safely"); }
+      { const QString p="/tmp/xq_t.png"; QImage(4,4,QImage::Format_ARGB32).save(p,"PNG");   // plain PNG isn't an animation
+        check(!c->importApng(p), "importApng returns false for a non-animated PNG"); } }
 
     // --- Reorder pages: swap the content of two adjacent pages ---
     { Document d; d.pageSize=QSizeF(100,140); d.pageCount=3;
@@ -5357,6 +11385,59 @@ int runSelfTest() {
       check(c->inGroup(), "descended into group 1 for the structural-op test");
       c->raiseSelection();
       check(!c->inGroup(), "a top-level reorder while descended drops the group descent (no stale m_enterPath)"); }
+
+    { // Double-click auto-selects the natural editing tool for the object under the cursor (Xara-style).
+      auto snd=[&](QEvent::Type t, QPointF v, Qt::MouseButton b, Qt::MouseButtons btns){
+          QMouseEvent e(t,v,c->mapToGlobal(v.toPoint()),b,btns,Qt::NoModifier); QApplication::sendEvent(c,&e); };
+      Document d;
+      Shape rc;  rc.type=ShapeType::Rect;     rc.rect=QRectF(0,0,80,60);  rc.transform=QTransform::fromTranslate(40,40);   rc.fill.type=FillType::Solid; rc.fill.color=QColor(200,80,80);
+      Shape elP; elP.type=ShapeType::Ellipse; elP.rect=QRectF(0,0,80,60); elP.transform=QTransform::fromTranslate(240,40); elP.fill.type=FillType::Solid; elP.fill.color=QColor(80,160,220);   // plain full ellipse (mode 0)
+      Shape elS; elS.type=ShapeType::Ellipse; elS.rect=QRectF(0,0,80,60); elS.transform=QTransform::fromTranslate(440,40); elS.fill.type=FillType::Solid; elS.fill.color=QColor(80,200,160); elS.ellipseMode=1; elS.ellipseSweep=360;  // swept (pie) → has rim handles
+      Shape pg;  pg.type=ShapeType::Polygon;  pg.polySides=5;             pg.rect=QRectF(0,0,90,90);  pg.transform=QTransform::fromTranslate(40,220); pg.fill.type=FillType::Solid; pg.fill.color=QColor(120,200,120);
+      Shape pa;  pa.type=ShapeType::Path;     { QPainterPath p; p.addRect(0,0,70,70); pa.path=p; } pa.transform=QTransform::fromTranslate(260,220); pa.fill.type=FillType::Solid; pa.fill.color=QColor(210,180,60);
+      Shape tx;  tx.type=ShapeType::Text;     tx.text="Edit"; tx.font=QFont("DejaVu Sans",40); tx.transform=QTransform::fromTranslate(460,240); tx.fill.type=FillType::Solid; tx.fill.color=Qt::black;
+      d.shapes={rc,elP,elS,pg,pa,tx}; c->setDocument(d);
+      const int n0=c->doc().shapes.size();
+      auto dblAt=[&](QPointF docPt){ c->setTool(Tool::Select); QPointF v=c->mapToView(docPt);
+          snd(QEvent::MouseButtonPress,   v, Qt::LeftButton, Qt::LeftButton);
+          snd(QEvent::MouseButtonRelease, v, Qt::LeftButton, Qt::NoButton);
+          QMouseEvent e(QEvent::MouseButtonDblClick,v,c->mapToGlobal(v.toPoint()),Qt::LeftButton,Qt::LeftButton,Qt::NoModifier); QApplication::sendEvent(c,&e);
+          snd(QEvent::MouseButtonRelease, v, Qt::LeftButton, Qt::NoButton); };   // trailing release Qt delivers after a dbl-click, now under the switched tool
+      auto ctr=[&](int i){ return c->doc().shapes[i].docBounds().center(); };
+      dblAt(ctr(2)); check(c->tool()==Tool::Ellipse, "double-click a swept ellipse → Ellipse tool (rim handles)");
+      dblAt(ctr(3)); check(c->tool()==Tool::Polygon, "double-click a polygon → Polygon tool");
+      dblAt(ctr(4)); check(c->tool()==Tool::Node,    "double-click a path → Shape editor (Node) tool");
+      dblAt(ctr(0)); check(c->tool()==Tool::Select,  "double-click a rectangle stays in the Selector (its corner/resize handles live there)");
+      dblAt(ctr(1)); check(c->tool()==Tool::Select,  "double-click a plain full ellipse stays in the Selector (no rim handle to switch for)");
+      check(c->doc().shapes.size()==n0, "the trailing release after a tool switch never spawns a stray shape");
+      check(!c->rotateMode(),                        "a double-clicked (re-selected) object is not left in rotate/skew mode");
+      // Text is hit-tested by glyph coverage, so find a point actually inside a glyph to click.
+      { QPainterPath dp=c->doc().shapes[5].transform.map(c->doc().shapes[5].localPath()); QRectF bb=dp.boundingRect();
+        QPointF onGlyph; bool found=false;
+        for(double fy=0.25; fy<=0.75 && !found; fy+=0.05) for(double fx=0.03; fx<=0.97 && !found; fx+=0.02){
+            QPointF p(bb.left()+bb.width()*fx, bb.top()+bb.height()*fy); if(dp.contains(p)){ onGlyph=p; found=true; } }
+        check(found, "found a point inside the text glyphs to click");
+        if(found){ dblAt(onGlyph);
+            check(c->tool()==Tool::Text,   "double-click text → Text tool");
+            check(c->editingText(),        "double-click point text also drops an editing caret"); c->endTextEdit(); } }
+      c->setTool(Tool::Select); }
+
+    { // Ctrl radial ("pie") menu: two-ring build (inner tools + the active tool's outer actions) + ring hit-test.
+      const QSize os=c->size(); c->resize(400,400);   // known geometry so the pie centres at (200,200)
+      c->setTool(Tool::Ellipse); c->openRadialForShot();
+      check(c->radialCount(0)==8, "radial inner ring lists the 8 tools");
+      check(c->radialCount(1)==4, "radial outer ring lists the Ellipse tool's 4 actions (Whole/Pie/Arc/Segment)");
+      int ring=-1;
+      c->radialHitProbe(QPointF(200,200), ring); check(ring==-1, "the pie's centre hole selects nothing (release there = cancel)");
+      c->radialHitProbe(QPointF(200,160), ring); check(ring==0,  "a point in the inner band aims the tools ring");    // dist 40 ∈ (hole 22, tools 66)
+      c->radialHitProbe(QPointF(200,110), ring); check(ring==1,  "a point past the inner band aims the actions ring"); // dist 90 > 66
+      int idxTop=c->radialHitProbe(QPointF(200,150), ring); check(ring==0 && idxTop==0, "aiming straight up hits the first (12-o'clock) tool wedge");
+      c->radialForceClose();
+      check(c->radialCount(0)==0, "closing the radial clears its items");
+      c->setTool(Tool::Select); c->openRadialForShot();
+      check(c->radialCount(1)==6, "the Select tool's radial shows its 6 arrange actions");
+      c->radialForceClose();
+      c->resize(os); c->setTool(Tool::Select); }
 
     { // #4 deleting a named colour reindexes bound colorRefs + tint/shade parent chains
       Document d;
@@ -5727,7 +11808,19 @@ int runSelfTest() {
       const int n0=c->doc().shapes.size();
       check(c->pasteBitmapFromClipboard(), "pasteBitmapFromClipboard succeeds when the OS clipboard holds an image");
       check(c->doc().shapes.size()==n0+1 && c->doc().shapes.back().fill.type==FillType::Bitmap, "a photo (Bitmap-fill) object is created");
-      check(c->doc().shapes.back().fill.image.width()==20, "the pasted photo carries the clipboard image"); }
+      check(c->doc().shapes.back().fill.image.width()==20, "the pasted photo carries the clipboard image");
+      { const Fill& f=c->doc().shapes.back().fill;   // regression: paste must not vertically flip the image
+        check(f.p0==QPointF(0,16) && f.p1==QPointF(20,16) && f.p2==QPointF(0,0),
+              "pasted bitmap uses the upright parallelogram convention (top-left->p2, bottom-left->p0), not flipped"); } }
+    { c->newDocument();   // placeBitmap (shared by paste + drag-drop) drops a new photo centred at a doc point
+      QImage px(30,20,QImage::Format_ARGB32); px.fill(QColor(200,60,40));
+      const int idx=c->placeBitmap(px, QPointF(400,300), "Drop image");
+      check(idx>=0, "placeBitmap creates a photo object (drag-drop of a browser image path)");
+      if(idx>=0){ const Shape& s=c->doc().shapes[idx];
+        check(s.fill.type==FillType::Bitmap && s.fill.image.width()==30, "dropped image carries its bitmap");
+        check(s.fill.p0==QPointF(0,20) && s.fill.p2==QPointF(0,0), "dropped image is upright (not flipped)");
+        check(qFuzzyCompare(s.transform.map(QPointF(15,10)).x(), 400.0) && qFuzzyCompare(s.transform.map(QPointF(15,10)).y(), 300.0),
+              "dropped image is centred on the drop point"); } }
     { c->newDocument();
       Shape r; r.type=ShapeType::Rect; r.rect=QRectF(0,0,60,40); r.transform=QTransform::fromTranslate(50,50); r.fill.type=FillType::Solid; r.fill.color=Qt::red;
       int ir=c->doc().addShape(r); c->select({ir}); QGuiApplication::clipboard()->clear();
@@ -6157,6 +12250,207 @@ int runSelfTest() {
       check(c->exportWebsite("/tmp/selftest_popup0.html"), "publish without pop-ups succeeds");
       { QFile f("/tmp/selftest_popup0.html"); f.open(QIODevice::ReadOnly); QString h=QString::fromUtf8(f.readAll());
         check(!h.contains("data-poptrig"), "no pop-up attributes when nothing is a pop-up"); } }
+
+    // --- Canvas render-cache performance (Phase 1) ---
+    // A busy document with effects; measure one full backdrop render vs one cached blit+overlay.
+    std::printf("[perf] canvas render cache\n");
+    { Document pd; pd.pageSize=QSizeF(800,600);
+      for(int i=0;i<200;++i){ Shape s; s.type=(i%3==0)?ShapeType::Ellipse:ShapeType::Rect;
+        s.rect=QRectF(0,0,40+i%30,30+i%20); s.transform=QTransform::fromTranslate(20+(i*37)%740, 20+(i*53)%540);
+        s.fill.type=FillType::Linear; s.fill.color=QColor((i*7)%255,(i*13)%255,(i*17)%255); s.fill.color2=QColor(30,30,40);
+        s.stroke.enabled=true; s.stroke.width=1.5; if(i%5==0){ s.shadow.on=true; s.shadow.offset=QPointF(5,7); s.shadow.blur=6; }
+        pd.shapes.push_back(s); }
+      c->setDocument(pd); c->resize(1280,860); QApplication::processEvents();
+      // stability: a second grab of a static document must equal the first (cache reuse is faithful)
+      QImage g1=c->grab().toImage(); QImage g2=c->grab().toImage();
+      check(g1==g2, "screen-cache: re-grab of a static document is byte-identical (cache reused faithfully)");
+      auto pr=c->renderProbe(40);
+      check(pr.fullMs>0 && pr.cachedMs>0, "renderProbe produced timings");
+      check(pr.cachedMs < pr.fullMs, "cached blit+overlay is faster than a full document re-render");
+      std::printf("  full=%.2fms  cached=%.2fms  speedup=%.1fx  (200 shapes @1280x860)\n",
+                  pr.fullMs, pr.cachedMs, pr.fullMs/qMax(0.001,pr.cachedMs)); }
+
+    // --- Viewport culling (Phase 2): must drop no VISIBLE content, and speed up a big doc in a small view ---
+    std::printf("[perf] viewport culling\n");
+    { Document pd; pd.pageSize=QSizeF(4000,3000);
+      auto mk=[&](double x,double y,bool sh,bool ct,double fe,double bl){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,60,44);
+        s.transform=QTransform::fromTranslate(x,y); s.fill.type=FillType::Solid; s.fill.color=QColor(40,150,190);
+        s.stroke.enabled=true; s.stroke.width=3; s.stroke.color=QColor(10,20,30);
+        if(sh){ s.shadow.on=true; s.shadow.offset=QPointF(24,24); s.shadow.blur=18; }
+        if(ct){ s.contour.on=true; s.contour.width=30; s.contour.color=QColor(200,60,60); }
+        s.feather=fe; s.blur=bl; return s; };
+      for(int i=0;i<300;++i) pd.shapes.push_back(mk(30+(i*167)%3900, 30+(i*233)%2900, i%4==0, i%5==0, (i%7)?0.0:14.0, (i%11)?0.0:12.0));
+      c->setDocument(pd); c->resize(720,720); c->zoomTo(1.0); QApplication::processEvents();
+      c->setCullEnabled(true);  QImage on =c->grab().toImage();
+      c->setCullEnabled(false); QImage off=c->grab().toImage();
+      check(on==off, "viewport culling drops no visible content (cull vs no-cull byte-identical, effects at the edge included)");
+      c->setCullEnabled(true);  double culled =c->renderProbe(25).fullMs;
+      c->setCullEnabled(false); double uncalled=c->renderProbe(25).fullMs;
+      check(culled <= uncalled*1.05 + 0.05, "culling never slows the full render");
+      std::printf("  full-render: culled=%.2fms  no-cull=%.2fms  (300 shapes, 720x720 view of 4000x3000)\n", culled, uncalled);
+      c->setCullEnabled(true); }
+
+    // --- Drag proxy (dynamic-object layer): a live move of a heavy group composites two cached bitmaps
+    //     instead of re-rasterising the whole document every frame ---
+    std::printf("[perf] drag proxy (dynamic-object layer)\n");
+    { c->newDocument(); c->setTool(Tool::Select); c->doc().pageSize=QSizeF(900,700);
+      for(int i=0;i<120;++i){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,30,24);       // static backdrop clutter
+        s.transform=QTransform::fromTranslate(10+(i*61)%860, 10+(i*97)%660);
+        s.fill.type=FillType::Solid; s.fill.color=QColor(60,70,90); c->doc().addShape(s); }
+      Shape g; g.type=ShapeType::Group; g.name="Group";                                           // one group on TOP
+      for(int i=0;i<100;++i){ Shape k; k.type=(i%2)?ShapeType::Ellipse:ShapeType::Rect; k.rect=QRectF(0,0,18+i%12,14+i%9);
+        k.transform=QTransform::fromTranslate((i%20)*15, (i/20)*15);
+        k.fill.type=FillType::Linear; k.fill.color=QColor((i*9)%255,120,(i*5)%255); k.fill.color2=QColor(20,20,30);
+        k.stroke.enabled=true; k.stroke.width=1.0; g.children.push_back(k); }
+      g.transform=QTransform::fromTranslate(300,240);
+      const int gi=c->doc().addShape(g);
+      c->resize(900,700); c->zoomTo(1.0); QApplication::processEvents();
+      c->select({gi});
+
+      double pm=0, fm=0; const bool built=c->dragProxyProbe(30, pm, fm);
+      check(built, "drag proxy activates for a whole-group move");
+      check(pm>0 && fm>0, "drag proxy probe produced timings");
+      check(pm < fm, "proxy composite is faster than the per-frame full document rebuild");
+      std::printf("  proxy=%.2fms  full-rebuild=%.2fms  speedup=%.1fx  (220-object doc, 100 in the moved group)\n",
+                  pm, fm, fm/qMax(0.001,pm));
+      check(!c->dragProxyActive(), "probe leaves no proxy active");
+      check(c->doc().shapes[gi].transform==QTransform::fromTranslate(300,240), "probe restored the group transform exactly");
+
+      // Extreme zoom / HiDPI: the capture would exceed the old 40 Mpx hard cap. Instead of falling back to a
+      // per-frame full rebuild (the freeze), the build now caps the capture RESOLUTION and still activates.
+      c->zoomTo(45.0); QApplication::processEvents();
+      double zpm=0, zfm=0; const bool zbuilt=c->dragProxyProbe(3, zpm, zfm);
+      check(zbuilt, "drag proxy still builds at extreme zoom (capture resolution capped, not hard-failed)");
+      c->zoomTo(1.0); QApplication::processEvents();
+
+      // Correctness: a real drag's proxy frame must match a full render of the same dropped geometry (top-of-z
+      // group ⇒ float-on-top is the correct z-order; Alt on the move bypasses snapping so no stray guide lines).
+      const QPointF pressV = c->toView(QPointF(450,280));   // inside the 100-child group (doc x[300,615] y[240,323])
+      const QPointF moveV  = pressV + QPointF(80,60);        // integer device-px translation ⇒ no proxy resampling
+      send(c, QEvent::MouseButtonPress, pressV, Qt::LeftButton, Qt::LeftButton);
+      { QMouseEvent mv(QEvent::MouseMove, moveV, c->mapToGlobal(moveV.toPoint()), Qt::NoButton, Qt::LeftButton, Qt::AltModifier);
+        QApplication::sendEvent(c,&mv); }
+      const QImage proxyFrame = c->grab().toImage();         // forces a paint → proxy composite path
+      check(c->dragProxyActive(), "proxy is active mid-drag");
+      send(c, QEvent::MouseButtonRelease, moveV, Qt::LeftButton, Qt::NoButton);
+      check(!c->dragProxyActive(), "release clears the proxy");
+      const QImage fullFrame = c->grab().toImage();          // full vector render of the dropped geometry
+      double sum=0; qint64 n=0; const int W=qMin(proxyFrame.width(),fullFrame.width()), H=qMin(proxyFrame.height(),fullFrame.height());
+      for(int y=0;y<H;y+=2) for(int x=0;x<W;x+=2){ QRgb a=proxyFrame.pixel(x,y), b=fullFrame.pixel(x,y);
+        sum += qAbs(qRed(a)-qRed(b))+qAbs(qGreen(a)-qGreen(b))+qAbs(qBlue(a)-qBlue(b)); n+=3; }
+      const double meanDiff = n ? sum/n : 0;
+      check(meanDiff < 4.0, "mid-drag proxy frame matches a full render of the same moved geometry (mean channel diff < 4)");
+      std::printf("  proxy-vs-full mean channel diff = %.2f levels\n", meanDiff);
+    }
+
+    // Static (non-drag) selection-outline cache: the entered/selected group silhouette is built ONCE per selection/doc
+    // change and reused across repaints, so a passive per-frame repaint (e.g. sweeping the Ctrl+Alt pie over a big
+    // grouped selection) no longer rebuilds the whole group's QPainterPath every frame — the fix for the pie-hover freeze.
+    std::printf("[perf] static selection-outline cache (Ctrl+Alt pie-hover freeze fix)\n");
+    { c->newDocument(); c->setTool(Tool::Select);
+      Shape g; g.type=ShapeType::Group; g.name="Group";
+      for(int i=0;i<60;++i){ Shape k; k.type=ShapeType::Rect; k.rect=QRectF(0,0,20,15); k.transform=QTransform::fromTranslate((i%10)*22,(i/10)*18); g.children.push_back(k); }
+      const int gi=c->doc().addShape(g);
+      c->select({gi});
+      check(!c->selCacheValidForTest(), "selecting invalidates the outline cache");
+      const int e1=c->selOutlineElemsForTest();
+      check(e1>0 && c->selCacheValidForTest(), "the selection outline builds once and warms the cache");
+      check(c->selOutlineElemsForTest()==e1 && c->selCacheValidForTest(), "a repeat draw reuses the cache (no rebuild)");
+      Shape r; r.type=ShapeType::Rect; r.rect=QRectF(0,0,10,10); const int ri=c->doc().addShape(r);
+      c->select({ri});
+      check(!c->selCacheValidForTest(), "changing the selection invalidates the cache");
+      const int e3=c->selOutlineElemsForTest();
+      check(e3>0 && e3<e1, "a single-rect selection has a smaller silhouette than the 60-child group");
+      c->select({gi}); c->selOutlineElemsForTest();
+      c->duplicateSelection();   // a document edit → documentChanged
+      check(!c->selCacheValidForTest(), "a document edit invalidates the outline cache (so it can never go stale)");
+      // A HEAVY selection (> the shape cap) skips the merged/AA-stroked silhouette entirely — the real freeze fix: no
+      // giant QPainterPath is built (per frame OR once), yet a valid selection box still comes from cheap child-rect unions.
+      { Shape big; big.type=ShapeType::Group; big.name="Big";
+        for(int i=0;i<500;++i){ Shape k; k.type=ShapeType::Rect; k.rect=QRectF(0,0,12,10); k.transform=QTransform::fromTranslate((i%25)*14,(i/25)*12); big.children.push_back(k); }
+        const int bi=c->doc().addShape(big); c->select({bi});
+        check(c->selOutlineElemsForTest()==0, "a >400-shape selection skips the merged silhouette (no giant per-frame path build)");
+        check(c->selCacheValidForTest() && !c->selBoundsForTest().isNull(), "…but still yields a valid selection box from cheap child-rect unions"); } }
+
+    // Selection-outline cost during a drag: a group of COMPLEX bezier paths (silhouette well over the stroke cap)
+    // makes stroking the per-frame silhouette genuinely expensive; during the drag we skip that stroke (bbox +
+    // handles + the moving-proxy bitmap convey the selection), so the live overlay is dramatically cheaper.
+    { c->newDocument(); c->setTool(Tool::Select);
+      Shape grp; grp.type=ShapeType::Group; grp.name="Complex";
+      for(int k=0;k<80;++k){ Shape p; p.type=ShapeType::Path; QPainterPath pp; pp.moveTo(0,0);
+        for(int j=0;j<40;++j){ double a=j*0.35; pp.cubicTo(j*3,std::sin(a)*20, j*3+1,std::cos(a)*20, (j+1)*3, std::sin(a*1.3)*15); }
+        p.path=pp; p.transform=QTransform::fromTranslate((k%10)*40,(k/10)*40);
+        p.stroke.enabled=true; p.stroke.width=1.0; p.fill.type=FillType::Solid; p.fill.color=QColor(90,120,200); grp.children.push_back(p); }
+      grp.transform=QTransform::fromTranslate(120,120);
+      const int gi=c->doc().addShape(grp);
+      c->resize(700,560); c->zoomTo(1.0); QApplication::processEvents(); c->select({gi});
+      // This complex group's silhouette is far over the stroke cap (kDragOutlineStrokeCap=1500), so it is NEVER
+      // AA-stroked per frame — not during a drag AND (since the pie-hover fix) not during a static repaint either.
+      // Structural check (robust; no wall-clock): the static path used to stroke this ~9600-element path every frame
+      // (~120ms → the Ctrl+Alt pie-hover freeze); now both overlays draw only the bbox + handles.
+      check(c->selOutlineElemsForTest() > 1500, "the complex group's silhouette exceeds the stroke cap (so it is never stroked per-frame)");
+      double cm=0, rm=0; const bool ok=c->dragOutlineProbe(10, cm, rm);
+      check(ok && cm>0 && rm>0, "outline probe produced timings for both overlays");
+      std::printf("  drawSelection: drag=%.3fms  static=%.3fms  (80 paths x 40 bezier segs; neither strokes the silhouette)\n", cm, rm); }
+
+    // --- snapAdjust must not be O(N·M): a move of a huge multi-selection scans candidates every frame; a
+    //     QVector contains() per object used to make that O(N·M) and freeze a heavy doc (e.g. a flattened
+    //     multi-page SVG / CorelDRAW import). Past kSnapObjectCandidateCap objects it skips object snapping. ---
+    std::printf("[perf] snapAdjust stays cheap for a huge select-all (no O(N*M) move freeze)\n");
+    { c->newDocument(); c->setSnap(true);
+      for(int i=0;i<6000;++i){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,10,10);
+        s.transform=QTransform::fromTranslate((i%100)*12.0,(i/100)*12.0); c->doc().addShape(s); }
+      c->resize(700,560); c->zoomTo(1.0); QApplication::processEvents();
+      QVector<int> all; for(int i=0;i<c->doc().shapes.size();++i) all<<i; c->select(all);
+      const double ms=c->snapAdjustProbeMs(30);
+      check(ms < 12.0, "snapAdjust over a 6000-object select-all is fast (old QVector::contains scan was O(N*M))");
+      std::printf("  snapAdjust(6000 selected) = %.3f ms/frame\n", ms); }
+
+    // --- The select-ONE case the select-all test above MISSED: moving a single object still scans EVERY other
+    //     shape as a snap candidate, and docBounds() rebuilds each shape's QPainterPath per frame. With 2500
+    //     shapes (under kSnapObjectCandidateCap so object-snap runs) this froze on MOVE while SCALE (no snapAdjust)
+    //     stayed smooth. The fix caches the static candidate edges once at drag start. ---
+    std::printf("[perf] snapAdjust stays cheap when moving ONE object in a big doc (all others are candidates)\n");
+    { c->newDocument(); c->setSnap(true);
+      for(int i=0;i<2500;++i){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,10,10);
+        s.transform=QTransform::fromTranslate((i%50)*12.0,(i/50)*12.0); c->doc().addShape(s); }
+      c->resize(700,560); c->zoomTo(1.0); QApplication::processEvents();
+      c->select(QVector<int>{0});
+      const double ms=c->snapAdjustProbeMs(60);
+      check(ms < 3.0, "snapAdjust when moving ONE object among 2500 is fast (per-frame docBounds path-rebuild was the move freeze)");
+      std::printf("  snapAdjust(1 of 2500 selected) = %.3f ms/frame\n", ms); }
+
+    // --- pushUndo must be cheap on a heavy doc. It used to JSON-serialise the WHOLE document on every
+    //     edit; on a 9k-object .cdr that froze the UI ~300ms at EVERY drag-start ("moving hangs"). It now
+    //     stores a copy-on-write Document snapshot (a ref bump; the O(N) detach happens on the next mutate). ---
+    std::printf("[perf] pushUndo stays cheap on a big doc (COW snapshot, not whole-doc JSON serialize)\n");
+    { c->newDocument();
+      for(int i=0;i<3000;++i){ Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,10,10);
+        s.transform=QTransform::fromTranslate((i%60)*12.0,(i/60)*12.0); c->doc().addShape(s); }
+      QElapsedTimer t; t.start(); for(int r=0;r<25;++r){ c->pushUndo("bench"); c->doc().shapes[r].transform.translate(1,1); }
+      const double ms=t.nsecsElapsed()/1e6/25;
+      check(ms < 8.0, "pushUndo on a 3000-object doc is fast (COW snapshot + one lazy detach, not full-doc JSON)");
+      std::printf("  pushUndo(3000 objects, incl. detach) = %.3f ms\n", ms); }
+    // --- The COW snapshot must still round-trip undo/redo exactly (transform + geometry). ---
+    std::printf("[undo] COW-snapshot undo/redo round-trips a move exactly\n");
+    { c->newDocument(); Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,50,40); const int i=c->doc().addShape(s);
+      const QTransform t0=c->doc().shapes[i].transform;
+      c->select(QVector<int>{i}); c->pushUndo("Move");
+      c->doc().shapes[i].transform = t0*QTransform::fromTranslate(33,22);
+      const QTransform t1=c->doc().shapes[i].transform;
+      c->undo(); check(c->doc().shapes[i].transform==t0, "undo restores the pre-move transform");
+      c->redo(); check(c->doc().shapes[i].transform==t1, "redo re-applies the move");
+      // a second, independent edit then undo must not corrupt the first (COW isolation)
+      c->pushUndo("Recolour"); c->doc().shapes[i].fill.color=QColor(200,10,10); c->undo();
+      check(c->doc().shapes[i].transform==t1, "an unrelated undo leaves the earlier move intact (snapshots are isolated)"); }
+
+    // --- Debounced documentChanged: a one-off edit (no live drag) must still forward synchronously so panels
+    //     and the self-test never see a stale gallery ---
+    std::printf("[perf] documentChangedDebounced coalescing\n");
+    { c->newDocument(); Shape s; s.type=ShapeType::Rect; s.name="R"; const int i=c->doc().addShape(s);
+      int cnt=0; QObject ctx; QObject::connect(c,&Canvas::documentChangedDebounced,&ctx,[&]{ ++cnt; });
+      c->renameShape(i,"R2");
+      check(cnt>=1, "a one-off edit forwards documentChangedDebounced synchronously (panels stay in lock-step)"); }
 
     std::printf("\n\033[1m%d passed, %d failed\033[0m\n\n", g_pass, g_fail);
     return g_fail==0 ? 0 : 1;

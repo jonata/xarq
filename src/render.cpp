@@ -1,4 +1,5 @@
 #include "render.h"
+#include <cmath>
 #include <QPainter>
 #include <QImage>
 #include <QPainterPathStroker>
@@ -13,6 +14,64 @@ static bool g_outlineView = false;
 void setOutlineRenderMode(bool on){ g_outlineView = on; }
 static bool g_screenRender = false;   // true only while painting to the on-screen canvas (never during export/print)
 void setScreenRenderMode(bool on){ g_screenRender = on; }
+// Viewport culling (canvas only): skip shapes wholly outside the visible doc rect. The canvas sets this
+// per frame and clears it afterwards, so export / thumbnails (which never set it) always render everything.
+static QRectF g_cullRect;   // invalid ⇒ culling disabled
+void setRenderCullRect(const QRectF& r){ g_cullRect = r; }
+
+// Visible viewport rect (in the painter's DEVICE space — the widget in logical px) for clipping EFFECT buffers
+// (blur/feather/bevel/noise/grad-transp/bitmap-mask). Each of those rasterises the shape into a device buffer
+// sized to the shape's FULL device bounds; at high zoom that buffer (and its per-pixel work) explodes and every
+// zoom step re-renders → the UI freezes. Clipping the buffer to the visible viewport (grown by the effect's
+// spread) makes the cost O(screen), not O(shape). This is stored in the SAME space the effect functions compute
+// their devB in (world-transform mapped, i.e. viewXf·groupXf applied to doc coords) — which for the canvas is
+// always the widget's logical-pixel rect, INDEPENDENT of any group transform on the shape. (An earlier version
+// stored a doc-space rect and re-mapped it through the per-shape painter transform; inside a transformed group
+// that displaced the clip and dropped visible effect pixels.) Set on the canvas paint path only; invalid on
+// export/thumbnail ⇒ effects render at full extent (so those outputs stay byte-identical). See clipEffectToViewport().
+static QRectF g_viewportRect;   // invalid ⇒ no clip (render full extent)
+void setRenderViewport(const QRectF& r){ g_viewportRect = r; }
+
+// Intersect an effect's device-space bounds with the visible viewport, grown by `margin` device px so a
+// blur/feather sampling just past the screen edge still has its source pixels. g_viewportRect is already in the
+// same device space as devB (the widget's logical-pixel rect), so NO per-shape transform is applied here — that
+// keeps the clip correct for shapes nested inside a transformed group. No-op when g_viewportRect is unset
+// (export) so exported/thumbnail renders are unchanged.
+static inline QRect clipEffectToViewport(const QRect& devB, int margin){
+    if(!g_viewportRect.isValid()) return devB;
+    return devB.intersected(g_viewportRect.toRect().adjusted(-margin,-margin,margin,margin));
+}
+// Conservative upper bound (doc px) on how far a shape's rendering can extend beyond its geometry bounds
+// via effects — used as the cull margin. Over-estimating only reduces culling; under-estimating would
+// drop visible pixels, so every extent-adding effect is included and padded.
+static double effectReach(const Shape& s){
+    double r = 2.0;
+    if (s.stroke.enabled)  r = qMax(r, s.stroke.width * 0.5 + 2.0);
+    if (s.shadow.on)       r = qMax(r, std::hypot(s.shadow.offset.x(), s.shadow.offset.y()) + s.shadow.blur * 3.0 + 4.0);
+    if (s.contour.on && s.contour.width > 0) r = qMax(r, s.contour.width + 4.0);
+    if (s.extrude.on)      r = qMax(r, std::abs(s.extrude.depth) * 2.0 + 4.0);
+    r = qMax(r, s.feather * 3.0);
+    r = qMax(r, s.blur * 3.0);
+    return r + 8.0;
+}
+double shapeRenderReach(const Shape& s){ return effectReach(s); }
+static inline bool cullShape(const Shape& s){
+    if (!g_cullRect.isValid()) return false;
+    const double m = qMax(256.0, effectReach(s));   // generous floor covers any small effect not itemised above
+    return !s.docBounds().adjusted(-m, -m, m, m).intersects(g_cullRect);
+}
+
+// Drag-proxy shape filters (canvas only). Address-keyed so no re-indexing is needed. Both empty in every
+// export/print/thumbnail render ⇒ renderFiltered() short-circuits to false ⇒ byte-identical output.
+static QSet<const void*> g_skipSet;   // draw everything except these
+static QSet<const void*> g_onlySet;   // if non-empty, draw ONLY these
+void setRenderSkipSet(const QSet<const void*>& s){ g_skipSet = s; }
+void setRenderOnlySet(const QSet<const void*>& s){ g_onlySet = s; }
+static inline bool renderFiltered(const Shape& s){
+    if (!g_skipSet.isEmpty() && g_skipSet.contains(&s)) return true;
+    if (!g_onlySet.isEmpty() && !g_onlySet.contains(&s)) return true;
+    return false;
+}
 
 // Apply a fill's colour stops to a gradient, plus its repeat-spread. A RAINBOW fill-effect cycles
 // each adjacent stop pair through the HSV hue wheel: short way (rainbow) or long way (alt-rainbow),
@@ -204,8 +263,51 @@ static void boxBlur(QImage& img, int rad) {
 // True separable gaussian blur of total radius `rad` px over a premultiplied-ARGB image (alpha + colour).
 // Smoother, more accurate falloff than the 3-pass box approximation — used for feathered edges. Edges
 // are clamped (the caller leaves a transparent margin >= rad, so this is just replicating transparent).
-static void gaussBlur(QImage& img, int rad) {
-    rad = qBound(0, rad, 96); if (rad < 1) return;
+// One separable box-blur pass (radius br) with clamp-to-edge, via a running sum → O(W·H), INDEPENDENT of radius.
+// Operates on ARGB32 (premultiplied for effect buffers). Horizontal then vertical.
+static void boxBlurPass(QImage& img, int br) {
+    if (br < 1) return;
+    const int w = img.width(), h = img.height();
+    const int win = 2*br + 1;
+    QImage tmp = img;
+    // horizontal
+    for (int y=0; y<h; ++y) {
+        const QRgb* src=(const QRgb*)tmp.constScanLine(y); QRgb* dst=(QRgb*)img.scanLine(y);
+        int sa=0,sr=0,sg=0,sb=0;
+        for (int k=-br;k<=br;++k){ QRgb p=src[qBound(0,k,w-1)]; sa+=qAlpha(p);sr+=qRed(p);sg+=qGreen(p);sb+=qBlue(p); }
+        for (int x=0;x<w;++x){
+            dst[x]=qRgba(sr/win,sg/win,sb/win,sa/win);
+            QRgb pin=src[qBound(0,x+br+1,w-1)], pout=src[qBound(0,x-br,w-1)];
+            sa+=qAlpha(pin)-qAlpha(pout); sr+=qRed(pin)-qRed(pout); sg+=qGreen(pin)-qGreen(pout); sb+=qBlue(pin)-qBlue(pout);
+        }
+    }
+    tmp = img;
+    // vertical
+    for (int x=0; x<w; ++x) {
+        int sa=0,sr=0,sg=0,sb=0;
+        auto at=[&](int yy)->QRgb{ return ((const QRgb*)tmp.constScanLine(qBound(0,yy,h-1)))[x]; };
+        for (int k=-br;k<=br;++k){ QRgb p=at(k); sa+=qAlpha(p);sr+=qRed(p);sg+=qGreen(p);sb+=qBlue(p); }
+        for (int y=0;y<h;++y){
+            ((QRgb*)img.scanLine(y))[x]=qRgba(sr/win,sg/win,sb/win,sa/win);
+            QRgb pin=at(y+br+1), pout=at(y-br);
+            sa+=qAlpha(pin)-qAlpha(pout); sr+=qRed(pin)-qRed(pout); sg+=qGreen(pin)-qGreen(pout); sb+=qBlue(pin)-qBlue(pout);
+        }
+    }
+}
+// Three box passes ≈ a gaussian (central-limit) of the same variance, at O(W·H) regardless of radius. Used ONLY
+// on the interactive canvas for big blurs — the exact gaussian's O(W·H·radius) cost explodes at high zoom (the
+// radius scales with zoom up to the 200px cap), which is what makes zooming into a blurred object slow.
+static void boxBlur3(QImage& img, int rad) {
+    const double sigma = qMax(0.5, rad/2.0);                 // match gaussBlur's spread (sigma = rad/2)
+    const int br = qMax(1, (int)std::lround((std::sqrt(1.0 + 4.0*sigma*sigma) - 1.0) / 2.0));   // 3 boxes, variance br²+br = sigma²
+    boxBlurPass(img, br); boxBlurPass(img, br); boxBlurPass(img, br);
+}
+
+static void gaussBlur(QImage& img, int rad, int maxRad = 96) {
+    rad = qBound(0, rad, maxRad); if (rad < 1) return;
+    // Interactive canvas + a big blur: use the fast box-blur approximation (radius-independent). Export/print
+    // (g_screenRender false) always take the exact gaussian below, so exported/corpus renders are byte-identical.
+    if (g_screenRender && rad > 24) { boxBlur3(img, rad); return; }
     const double sigma = qMax(0.5, rad/2.0);   // Xara's feather spread is ~rad/2 (wider than the rad/3 first cut)
     const int K = qMin(rad, (int)std::ceil(sigma*3.0));
     QVector<float> ker(2*K+1); double sum=0;
@@ -376,6 +478,10 @@ static void paintBevel(QPainter& g, const QPainterPath& dp, const Bevel& b) {
     const double scale = std::sqrt(qAbs(xf.determinant()));
     const double depthPx = qMax(1.5, b.depth*scale);
     QRect devB = xf.mapRect(docB).toRect().adjusted(-2,-2,2,2);
+    // margin ≥ the bevel's device reach; clamp in the DOUBLE domain before the int cast (a file-derived depthPx can be
+    // huge/non-finite via an unclamped JSON bevel depth × a large group scale → int() would be out-of-range UB).
+    const int bevMargin = (int)qBound(0.0, depthPx*2.0 + 4.0, 1e6);
+    devB = clipEffectToViewport(devB, bevMargin);   // high-zoom: bound the effect buffer to the visible viewport
     const int W=devB.width(), H=devB.height();
     if (W<3 || H<3 || (qint64)W*H > (qint64)24e6) return;       // skip degenerate / enormous shapes
     // silhouette mask in device space
@@ -448,12 +554,14 @@ static QPainter::CompositionMode xaraBlend(int type) {
     default: return QPainter::CompositionMode_SourceOver; // Mix(1) / HSL (handled per-pixel) / unsupported
     }
 }
-static inline bool isHslBlend(int type) { return type==16 || type==28 || type==31; }  // Saturation / Luminosity / Hue
+static inline bool isHslBlend(int type) { return type==16 || type==28 || type==31 || (type>=40 && type<=53); }  // Saturation / Luminosity / Hue / Colour + imported modes Qt has no composition for
 
 static void paintFeathered(QPainter& g, const Shape& s);
 static void paintBlurred(QPainter& g, const Shape& s);
 static void paintNoiseMasked(QPainter& g, const Shape& s);
 static void paintBitmapMasked(QPainter& g, const Shape& s);
+static void paintIsolatedGroup(QPainter& g, const Shape& s);
+static void compositeHsl(QPainter& g, const QImage& src, const QRect& devB, int type, double strength);
 static void paintGradTranspFill(QPainter& g, const Shape& s);
 static void paintBrush(QPainter& g, const QPainterPath& dp, const Stroke& st);
 static void paintVarWidth(QPainter& g, const QPainterPath& dp, const Stroke& st);
@@ -593,6 +701,7 @@ static void paintSoftRegion(QPainter& g, const Shape& s) {
     QRectF docB = s.docBounds().intersected(regDoc.boundingRect()); if (docB.isEmpty()) docB=regDoc.boundingRect();
     const int margin=rad+4;
     QRect devB = xf.mapRect(docB).toRect().adjusted(-margin,-margin,margin,margin);
+    devB = clipEffectToViewport(devB, margin);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width()<1 || devB.height()<1 || (qint64)devB.width()*devB.height()>3e7) {   // fall back to a hard clip
         g.save(); g.setClipPath(regDoc, Qt::IntersectClip); paintShape(g, s2); g.restore(); return; }
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied); img.fill(Qt::transparent);
@@ -620,6 +729,7 @@ void paintShape(QPainter& g, const Shape& s) {
         if (s.extrude.on) paintExtrude(g, dpu, s.fill, s.extrude);
         paintContour(g, dpu, s.contour);
     };
+    if (s.isolate && s.type == ShapeType::Group) { paintIsolatedGroup(g, s); return; }
     if (!s.regionPath.isEmpty() && s.regionFeather > 0.4) { paintUnderEffects(); paintSoftRegion(g, s); return; }   // soft-edged region
     if (s.blur > 0.4)    { paintUnderEffects(); paintBlurred(g, s);   return; }   // live blur: render -> gaussian-blur RGBA -> composite
     if (s.feather > 0.4) { paintUnderEffects(); paintFeathered(g, s); return; }   // soft edge: render -> blur alpha -> composite
@@ -867,6 +977,10 @@ static void paintFeathered(QPainter& g, const Shape& s) {
     if (rad < 1) { paintShape(g, s2); return; }
     const int margin = rad + 4;
     QRect devB = xf.mapRect(docB).toRect().adjusted(-margin, -margin, margin, margin);
+    // Clip margin covers BOTH gaussian passes: the alpha/colour blur (rad) AND the final easing blur (rad/3), so a
+    // visible pixel near the screen edge still has every source pixel those two blurs sample (else a thin band by
+    // the edge would render a slightly wrong feather vs the unclipped export).
+    devB = clipEffectToViewport(devB, rad + rad/3 + 4);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width() < 1 || devB.height() < 1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
     const int W = devB.width(), H = devB.height();
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied);
@@ -931,6 +1045,9 @@ static void paintFeathered(QPainter& g, const Shape& s) {
 static void paintBlurred(QPainter& g, const Shape& s) {
     Shape s2 = s; s2.blur = 0;                                 // draw the object sharp, then blur the buffer
     s2.shadow.on=s2.extrude.on=s2.contour.on=false;            // under-effects at full extent (paintShape) — not object-blurred
+    // A clip and a blend mode apply to the blurred result. Clipping inside the buffer would blur the clip's
+    // hard edge outward, and a blend mode there has only transparency to blend with.
+    s2.regionPath = QPainterPath(); s2.blend = QPainter::CompositionMode_SourceOver;
     const QRectF docB = s.docBounds();
     if (docB.isEmpty()) { paintShape(g, s2); return; }
     const QTransform xf = g.transform();
@@ -938,13 +1055,24 @@ static void paintBlurred(QPainter& g, const Shape& s) {
     const int rad = qBound(0, int(s.blur * scale), 200);
     if (rad < 1) { paintShape(g, s2); return; }
     const int margin = rad + 4;
-    const QRect devB = xf.mapRect(docB).toRect().adjusted(-margin,-margin,margin,margin);
+    QRect devB = xf.mapRect(docB).toRect().adjusted(-margin,-margin,margin,margin);
+    devB = clipEffectToViewport(devB, margin);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width()<1 || devB.height()<1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied); img.fill(Qt::transparent);
     { QPainter ip(&img); ip.setRenderHint(QPainter::Antialiasing);
       ip.translate(-devB.topLeft()); ip.setTransform(xf, true); paintShape(ip, s2); }
-    gaussBlur(img, rad);                                       // blur colour + alpha (premultiplied → correct edges)
+    gaussBlur(img, rad, 200);
+    if (s.blurGain != 1.0) {                                   // premultiplied, so scaling all four channels is one step
+        const double gain = s.blurGain;
+        for (int y = 0; y < img.height(); ++y) { QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            for (int x = 0; x < img.width(); ++x) {
+                const QRgb p = row[x]; const int a = qAlpha(p); if (!a) continue;
+                const double k = qMin(gain, 255.0 / a);
+                row[x] = qRgba(int(qRed(p)*k+0.5), int(qGreen(p)*k+0.5), int(qBlue(p)*k+0.5), qMin(255, int(a*k+0.5))); } } }
+    // blur colour + alpha (premultiplied → correct edges); allow a big radius so large SVG blurs at high zoom don't clamp (feather/shadow keep the default 96 cap → corpus unaffected)
     g.save(); const double op = g.opacity() * (s.opacity<0.999 ? s.opacity : 1.0);
+    if (!s.regionPath.isEmpty()) g.setClipPath(s.transform.map(s.regionPath), Qt::IntersectClip);
+    g.setCompositionMode(s.blend);
     g.resetTransform(); g.setOpacity(op); g.drawImage(devB.topLeft(), img); g.restore();
 }
 
@@ -977,6 +1105,7 @@ static void paintNoiseMasked(QPainter& g, const Shape& s) {
     if (docB.isEmpty()) { paintShape(g, s2); return; }
     const QTransform xf = g.transform();
     QRect devB = xf.mapRect(docB).toRect().adjusted(-2, -2, 2, 2);
+    devB = clipEffectToViewport(devB, 4);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width() < 1 || devB.height() < 1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied);
     img.fill(Qt::transparent);
@@ -999,6 +1128,7 @@ static void paintBitmapMasked(QPainter& g, const Shape& s) {
     if (docB.isEmpty() || s.transp.maskBmp.isNull()) { paintShape(g, s2); return; }
     const QTransform xf = g.transform();
     QRect devB = xf.mapRect(docB).toRect().adjusted(-2, -2, 2, 2);
+    devB = clipEffectToViewport(devB, 4);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width() < 1 || devB.height() < 1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied);
     img.fill(Qt::transparent);
@@ -1022,8 +1152,31 @@ static void paintBitmapMasked(QPainter& g, const Shape& s) {
             double v = (0.299*qRed(mp) + 0.587*qGreen(mp) + 0.114*qBlue(mp)) / 255.0;
             double f = o0 + (o1 - o0) * v;                                // luminance-mapped opacity factor
             QRgb p = row[x]; row[x] = qRgba(int(qRed(p)*f+0.5), int(qGreen(p)*f+0.5), int(qBlue(p)*f+0.5), int(qAlpha(p)*f+0.5)); } }
+    if (isHslBlend(s.transp.type)) { compositeHsl(g, img, devB, s.transp.type, g.opacity()); return; }
     g.save(); const double op = g.opacity(); g.resetTransform(); g.setOpacity(op);
-    g.setCompositionMode(xaraBlend(s.transp.type));
+    g.setCompositionMode(s.transp.type > 1 ? xaraBlend(s.transp.type) : s.blend);
+    g.drawImage(devB.topLeft(), img); g.restore();
+}
+
+// A group composited as one object: children blend among themselves on a transparent buffer, then its
+// mask, clip, opacity and blend mode apply to the result (a Photoshop group that isn't pass-through).
+static void paintIsolatedGroup(QPainter& g, const Shape& s) {
+    Shape s2 = s; s2.isolate = false; s2.opacity = 1.0; s2.blend = QPainter::CompositionMode_SourceOver;
+    const int hsl = isHslBlend(s.transp.type) ? s.transp.type : 0;
+    if (hsl) s2.transp.type = s2.transp.geom == 4 ? 1 : 0;
+    const QTransform xf = g.transform();
+    QRect devB = xf.mapRect(s.docBounds()).toRect().adjusted(-2, -2, 2, 2);
+    if (QPaintDevice* dev = g.device()) devB = devB.intersected(QRect(0, 0, dev->width(), dev->height()));
+    if (devB.width() < 1 || devB.height() < 1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
+    QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+    { QPainter ip(&img); ip.setRenderHint(QPainter::Antialiasing); ip.setRenderHint(QPainter::SmoothPixmapTransform);
+      ip.translate(-devB.topLeft()); ip.setTransform(xf, true);
+      if (!s.regionPath.isEmpty()) { ip.setClipPath(s.transform.map(s.regionPath), Qt::IntersectClip); s2.regionPath = QPainterPath(); }
+      paintShape(ip, s2); }
+    if (hsl) { compositeHsl(g, img, devB, hsl, g.opacity() * s.opacity); return; }
+    g.save(); const double op = g.opacity() * s.opacity; g.resetTransform(); g.setOpacity(op);
+    g.setCompositionMode(s.blend);
     g.drawImage(devB.topLeft(), img); g.restore();
 }
 
@@ -1036,6 +1189,7 @@ static void paintGradTranspFill(QPainter& g, const Shape& s) {
     if (docB.isEmpty()) { paintShape(g, s2); return; }
     const QTransform xf = g.transform();
     QRect devB = xf.mapRect(docB).toRect().adjusted(-2, -2, 2, 2);
+    devB = clipEffectToViewport(devB, 4);   // high-zoom: bound the effect buffer to the visible viewport
     if (devB.width() < 1 || devB.height() < 1 || (qint64)devB.width()*devB.height() > 3e7) { paintShape(g, s2); return; }
     QImage img(devB.size(), QImage::Format_ARGB32_Premultiplied);
     img.fill(Qt::transparent);
@@ -1075,10 +1229,61 @@ static void hslSetSat(double& r,double& g,double& b,double s){
 }
 // type 16=Saturation, 28=Luminosity, 31=Hue. Backdrop (br,bg,bb) is overwritten with the blend result.
 static void hslBlend(int type, double& br,double& bg,double& bb, double sr,double sg,double sb){
+    if(type==52 || type==53){      // Darker / Lighter Colour: whichever whole colour has the lower / higher luminance
+        const bool srcWins = type==52 ? hslLum(sr,sg,sb)<hslLum(br,bg,bb) : hslLum(sr,sg,sb)>hslLum(br,bg,bb);
+        if(srcWins){ br=sr; bg=sg; bb=sb; }
+        return;
+    }
+    if(type>=45 && type<=51){      // Linear Burn, Vivid, Linear Light, Pin, Hard Mix, Subtract, Divide (separable)
+        auto burn=[](double b,double s){ return s<=0.0?0.0:qMax(0.0,1.0-(1.0-b)/s); };
+        auto dodge=[](double b,double s){ return s>=1.0?1.0:qMin(1.0,b/(1.0-s)); };
+        auto f=[&](double b,double s)->double{
+            switch(type){
+            case 45: return qMax(0.0,b+s-1.0);
+            case 46: return s<0.5?burn(b,2.0*s):dodge(b,2.0*s-1.0);
+            case 47: return qBound(0.0,b+2.0*s-1.0,1.0);
+            case 48: return s<0.5?qMin(b,2.0*s):qMax(b,2.0*s-1.0);
+            case 49: return (s<0.5?burn(b,2.0*s):dodge(b,2.0*s-1.0))<0.5?0.0:1.0;
+            case 50: return qMax(0.0,b-s);
+            default: return s<=0.0?1.0:qMin(1.0,b/s);
+            } };
+        br=f(br,sr); bg=f(bg,sg); bb=f(bb,sb); return;
+    }
+    if(type>=41 && type<=44){      // Average, Negation, Reflect, Glow (separable; imported from Affinity)
+        auto f=[type](double b,double s){
+            switch(type){
+            case 41: return (b+s)/2.0;
+            case 42: return 1.0-qAbs(1.0-b-s);
+            case 43: return s>=1.0?1.0:qMin(1.0,b*b/(1.0-s));
+            default: return b>=1.0?1.0:qMin(1.0,s*s/(1.0-b));
+            } };
+        br=f(br,sr); bg=f(bg,sg); bb=f(bb,sb); return;
+    }
+    if(type==40){ const double L=hslLum(br,bg,bb); br=sr;bg=sg;bb=sb; hslSetLum(br,bg,bb,L); return; }   // Colour
     if(type==28){ hslSetLum(br,bg,bb, hslLum(sr,sg,sb)); }                                   // Luminosity
     else if(type==16){ double L=hslLum(br,bg,bb),S=hslSat(sr,sg,sb); hslSetSat(br,bg,bb,S); hslSetLum(br,bg,bb,L); } // Saturation
     else { double L=hslLum(br,bg,bb),S=hslSat(br,bg,bb); br=sr;bg=sg;bb=sb; hslSetSat(br,bg,bb,S); hslSetLum(br,bg,bb,L); } // Hue
 }
+// An already rendered buffer through a per-pixel blend mode. Needs the backdrop, so only when painting to an image.
+static void compositeHsl(QPainter& g, const QImage& srcIn, const QRect& devB0, int type, double strength){
+    QPaintDevice* dev = g.device();
+    if(!dev || dev->devType()!=QInternal::Image){ g.save(); g.resetTransform(); g.setOpacity(strength); g.drawImage(devB0.topLeft(), srcIn); g.restore(); return; }
+    QImage* target = static_cast<QImage*>(dev);
+    const QRect devB = devB0.intersected(QRect(0,0,target->width(),target->height()));
+    if(devB.width()<1 || devB.height()<1) return;
+    const QImage src = srcIn.copy(devB.translated(-devB0.topLeft())).convertToFormat(QImage::Format_ARGB32);
+    QImage bd = target->copy(devB).convertToFormat(QImage::Format_ARGB32);
+    for(int y=0;y<devB.height();++y){ const QRgb* sR=(const QRgb*)src.constScanLine(y); QRgb* bR=(QRgb*)bd.scanLine(y);
+        for(int x=0;x<devB.width();++x){ const int sa=qAlpha(sR[x]); if(sa==0) continue;
+            const double br=qRed(bR[x])/255.0, bg=qGreen(bR[x])/255.0, bb=qBlue(bR[x])/255.0;
+            double rr=br,rg=bg,rb=bb; hslBlend(type, rr,rg,rb, qRed(sR[x])/255.0,qGreen(sR[x])/255.0,qBlue(sR[x])/255.0);
+            const double a=(sa/255.0)*strength;
+            bR[x]=qRgba(qBound(0,int((br+(rr-br)*a)*255+0.5),255),qBound(0,int((bg+(rg-bg)*a)*255+0.5),255),qBound(0,int((bb+(rb-bb)*a)*255+0.5),255),qAlpha(bR[x])); } }
+    g.save(); g.resetTransform(); g.setClipping(false); g.setOpacity(1.0);
+    g.setCompositionMode(QPainter::CompositionMode_Source);
+    g.drawImage(devB.topLeft(), bd); g.restore();
+}
+
 // Hue/Saturation/Luminosity transparency: blend the shape's colour with the backdrop per-pixel.
 // Needs the backdrop, which is only available when painting to a QImage (export) — else plain over.
 static void paintHslBlend(QPainter& g, const Shape& s){
@@ -1236,7 +1441,7 @@ void paintDocument(QPainter& g, const Document& d) {
     // byte-identical to the pre-layer renderer, so render fidelity is untouched.
     if (d.layers.size() <= 1) {
         if (d.layers.isEmpty() || (d.layers[0].visible && (d.layers[0].printable || g_screenRender)))
-            for (const Shape& s : d.shapes) paintShape(g, s);
+            for (const Shape& s : d.shapes) { if (cullShape(s) || renderFiltered(s)) continue; paintShape(g, s); }
         return;
     }
     // Multi-layer: paint bottom layer first; skip hidden layers; preserve z-order within each layer.
@@ -1246,11 +1451,11 @@ void paintDocument(QPainter& g, const Document& d) {
         if (!d.layers[L].visible) continue;
         if (!d.layers[L].printable && !g_screenRender) continue;   // non-printing layer: on screen only, not in print/export
         if (d.layers[L].master && d.pageCount > 1) {           // master page: draw each object on EVERY page
-            for (const Shape& s : d.shapes) { if (qBound(0, s.layer, nL-1) != L) continue;
+            for (const Shape& s : d.shapes) { if (qBound(0, s.layer, nL-1) != L || renderFiltered(s)) continue;
                 int home = qBound(0, int(s.docBounds().center().y()/adv), d.pageCount-1);
                 for (int pg = 0; pg < d.pageCount; ++pg) { g.save(); g.translate(0, (pg-home)*adv); paintShape(g, s); g.restore(); } }
         } else {
-            for (const Shape& s : d.shapes) if (qBound(0, s.layer, nL-1) == L) paintShape(g, s);
+            for (const Shape& s : d.shapes) if (qBound(0, s.layer, nL-1) == L && !cullShape(s) && !renderFiltered(s)) paintShape(g, s);
         }
     }
 }

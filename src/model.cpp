@@ -953,6 +953,9 @@ static QColor colFrom(const QJsonObject& o){ return QColor(o["r"].toInt(),o["g"]
 static QJsonObject ptJson(const QPointF& p){ return QJsonObject{{"x",p.x()},{"y",p.y()}}; }
 static QPointF ptFrom(const QJsonObject& o){ return QPointF(o["x"].toDouble(),o["y"].toDouble()); }
 
+QString pathToStr(const QPainterPath& p);        // compact O(n) path (de)serialisation (defined below)
+QPainterPath pathFromStr(const QString& str);
+
 QJsonObject Shape::toJson() const {
     QJsonObject o;
     o["type"] = int(type);
@@ -973,7 +976,9 @@ QJsonObject Shape::toJson() const {
     if (fill.type==FillType::Bitmap) {
         f["p2"]=ptJson(fill.p2);
         if (fill.contone){ f["contone"]=true; f["c2"]=colJson(fill.color2); }
-        if (!fill.image.isNull()){ QByteArray ba; QBuffer buf(&ba); buf.open(QIODevice::WriteOnly);
+        if (!fill.imageSrc.isEmpty()){                                     // reuse the original encoded bytes (no slow PNG re-encode)
+            f["imgsrc"]=QString::fromLatin1(fill.imageSrc.toBase64()); }
+        else if (!fill.image.isNull()){ QByteArray ba; QBuffer buf(&ba); buf.open(QIODevice::WriteOnly);
             fill.image.save(&buf,"PNG"); f["img"]=QString::fromLatin1(ba.toBase64()); }
     }
     if (fill.type==FillType::Mesh || fill.type==FillType::Square) {
@@ -1049,18 +1054,14 @@ QJsonObject Shape::toJson() const {
         if(extrude.color.isValid()) ex["c"]=colJson(extrude.color);
         if(extrude.rotX!=0.0) ex["rx"]=extrude.rotX; if(extrude.rotY!=0.0) ex["ry"]=extrude.rotY; if(extrude.bevel!=0.0) ex["bv"]=extrude.bevel;
         o["extr"]=ex; }
-    if (blur>0) o["blur"]=blur;
-    if (type==ShapeType::Path){ o["path"]=path.toFillPolygon().isEmpty()?QString():QString(); /* path stored as svg below */ }
-    if (type==ShapeType::Path){
-        QJsonArray pa;
-        for (int i=0;i<path.elementCount();++i){ auto e=path.elementAt(i); pa.append(QJsonArray{int(e.type),e.x,e.y}); }
-        o["pathel"]=pa;
-    }
+    if (blur>0) o["blur"]=blur; if(blurGain!=1.0) o["blurGain"]=blurGain;
+    if (type==ShapeType::Path) o["pathd"]=pathToStr(path);   // compact O(n) encoding (was "pathel", O(n^2))
     if (!regionPath.isEmpty()){ QJsonArray pa; for (int i=0;i<regionPath.elementCount();++i){ auto e=regionPath.elementAt(i); pa.append(QJsonArray{int(e.type),e.x,e.y}); } o["region"]=pa; if(regionFeather>0) o["regFea"]=regionFeather; }
     if (type==ShapeType::Group){ QJsonArray ch; for (auto& c : children) ch.append(c.toJson()); o["children"]=ch;
         if(blendSteps>0){ o["blendSteps"]=blendSteps; if(blendProfile!=0.0) o["blendProf"]=blendProfile; if(blendAttrProfile!=0.0) o["blendAttrP"]=blendAttrProfile; if(blendNodeShift!=0.0) o["blendNS"]=blendNodeShift;
             if(!blendSpine.isEmpty()){ QJsonArray pa; for(int i=0;i<blendSpine.elementCount();++i){ auto e=blendSpine.elementAt(i); pa.append(QJsonArray{int(e.type),e.x,e.y}); } o["blendSpine"]=pa; } }
-        if(isClipView){ o["clipView"]=true; o["clipSplit"]=clipSplit; } }
+        if(isClipView){ o["clipView"]=true; o["clipSplit"]=clipSplit; }
+        if(isolate) o["isolate"]=true; }
     if (type==ShapeType::Table){ QJsonObject t;
         QJsonArray cw; for(double w:table.colW) cw.append(w); t["cw"]=cw;
         QJsonArray rh; for(double h:table.rowH) rh.append(h); t["rh"]=rh;
@@ -1086,6 +1087,26 @@ QJsonObject Shape::toJson() const {
 }
 
 // Rebuild a QPainterPath from a serialized element array (shared by `path` and `textPath`).
+// Compact, O(n) path (de)serialisation as a space-separated "type x y" element stream. The old form
+// stored each element as a nested QJsonArray appended one at a time, which is O(n^2) to build for large
+// paths (QJson/CBOR container reallocation) — pathologically slow when a document has many/large paths.
+QString pathToStr(const QPainterPath& p) {
+    QString s; s.reserve(p.elementCount()*20);
+    for (int i=0;i<p.elementCount();++i){ const QPainterPath::Element e=p.elementAt(i);
+        if(i) s+=QLatin1Char(' ');
+        s+=QString::number(int(e.type)); s+=QLatin1Char(' ');
+        s+=QString::number(e.x,'g',17); s+=QLatin1Char(' '); s+=QString::number(e.y,'g',17); }
+    return s;
+}
+QPainterPath pathFromStr(const QString& str) {
+    QPainterPath p; const QStringList t=str.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    for (int i=0;i+2<t.size();){ const int ty=t[i].toInt();
+        if (ty==QPainterPath::MoveToElement){ p.moveTo(t[i+1].toDouble(),t[i+2].toDouble()); i+=3; }
+        else if (ty==QPainterPath::CurveToElement && i+8<t.size()){
+            p.cubicTo(t[i+1].toDouble(),t[i+2].toDouble(), t[i+4].toDouble(),t[i+5].toDouble(), t[i+7].toDouble(),t[i+8].toDouble()); i+=9; }
+        else { p.lineTo(t[i+1].toDouble(),t[i+2].toDouble()); i+=3; } }
+    return p;
+}
 static QPainterPath pathFromJsonArray(const QJsonArray& pa) {
     QPainterPath pp;
     for (int i=0;i<pa.size();){ auto el=pa[i].toArray(); int ty=el[0].toInt();
@@ -1120,7 +1141,9 @@ Shape Shape::fromJson(const QJsonObject& o) {
     if (s.fill.type==FillType::Bitmap) {
         s.fill.p2=ptFrom(f["p2"].toObject());
         s.fill.contone=f["contone"].toBool(false); s.fill.color2=colFrom(f["c2"].toObject());
-        if (f.contains("img")){ QByteArray ba=QByteArray::fromBase64(f["img"].toString().toLatin1());
+        if (f.contains("imgsrc")){ QByteArray raw=QByteArray::fromBase64(f["imgsrc"].toString().toLatin1());
+            s.fill.image.loadFromData(raw); s.fill.imageSrc=raw; }        // auto-detect format; keep src so re-save stays fast
+        else if (f.contains("img")){ QByteArray ba=QByteArray::fromBase64(f["img"].toString().toLatin1());
             s.fill.image.loadFromData(ba,"PNG"); }
     }
     if (s.fill.type==FillType::Mesh || s.fill.type==FillType::Square) {
@@ -1194,14 +1217,16 @@ Shape Shape::fromJson(const QJsonObject& o) {
     if (o.contains("extr")){ auto ex=o["extr"].toObject(); s.extrude.on=true; s.extrude.depth=ex["d"].toDouble(28); s.extrude.angle=ex["a"].toDouble(35); s.extrude.light=ex["l"].toInt(135);
         if(ex.contains("c")) s.extrude.color=colFrom(ex["c"].toObject());
         s.extrude.rotX=ex["rx"].toDouble(0); s.extrude.rotY=ex["ry"].toDouble(0); s.extrude.bevel=ex["bv"].toDouble(0); }
-    s.blur = o["blur"].toDouble();
-    if (o.contains("pathel")){ QPainterPath p; for (auto v : o["pathel"].toArray()){ auto e=v.toArray(); int t=e[0].toInt(); double x=e[1].toDouble(),y=e[2].toDouble(); if(t==0)p.moveTo(x,y); else if(t==1)p.lineTo(x,y); else p.lineTo(x,y);} s.path=p; }
+    s.blur = o["blur"].toDouble(); s.blurGain=o["blurGain"].toDouble(1.0);
+    if (o.contains("pathd")) s.path=pathFromStr(o["pathd"].toString());   // compact form (faithful cubics)
+    else if (o.contains("pathel")){ QPainterPath p; for (auto v : o["pathel"].toArray()){ auto e=v.toArray(); int t=e[0].toInt(); double x=e[1].toDouble(),y=e[2].toDouble(); if(t==0)p.moveTo(x,y); else if(t==1)p.lineTo(x,y); else p.lineTo(x,y);} s.path=p; }   // legacy
     if (o.contains("tpath")){ s.textPath=pathFromJsonArray(o["tpath"].toArray()); s.textPathOffset=qMax(0.0, o["tpoff"].toDouble(0.0)); s.textPathInside=o["tpin"].toBool(false); }   // clamp ≥0 (a corrupt negative would render glyphs before the path start)
     if (o.contains("region")){ s.regionPath=pathFromJsonArray(o["region"].toArray()); s.regionFeather=o["regFea"].toDouble(0); }
     if (o.contains("children")){ for (auto v : o["children"].toArray()) s.children.append(Shape::fromJson(v.toObject()));
         s.blendSteps=o["blendSteps"].toInt(0); s.blendProfile=o["blendProf"].toDouble(0.0); s.blendAttrProfile=o["blendAttrP"].toDouble(0.0); s.blendNodeShift=o["blendNS"].toDouble(0.0);
         if(o.contains("blendSpine")) s.blendSpine=pathFromJsonArray(o["blendSpine"].toArray());
-        s.isClipView=o["clipView"].toBool(false); s.clipSplit=o["clipSplit"].toInt(0); }
+        s.isClipView=o["clipView"].toBool(false); s.clipSplit=o["clipSplit"].toInt(0);
+        s.isolate=o["isolate"].toBool(false); }
     if (o.contains("table")){ auto t=o["table"].toObject();
         for(auto v:t["cw"].toArray()) s.table.colW.append(v.toDouble());
         for(auto v:t["rh"].toArray()) s.table.rowH.append(v.toDouble());
@@ -1260,6 +1285,10 @@ QJsonObject Document::toJson() const {
     { QJsonObject pg{{"w",pageSize.width()},{"h",pageSize.height()},{"count",pageCount},{"gap",pageGap}};
       if(!rulerOrigin.isNull()){ pg["rox"]=rulerOrigin.x(); pg["roy"]=rulerOrigin.y(); }   // ruler zero-point (gated: default 0,0)
       if(!scaleLineWidths) pg["noScaleLW"]=true;   // gated: default is ON (scale stroke width on resize)
+      if(bleed>0) pg["bleed"]=bleed;
+      auto nums=[](const QVector<double>& v){ QJsonArray a; for(double x: v) a.append(x); return a; };
+      if(!guidesH.isEmpty()) pg["gh"]=nums(guidesH);
+      if(!guidesV.isEmpty()) pg["gv"]=nums(guidesV);
       o["page"]=pg; }
     if(pageColor!=QColor(Qt::white)) o["pgcol"]=(qint64)pageColor.rgba();
     QJsonArray sh; for (auto& s : shapes) sh.append(s.toJson()); o["shapes"]=sh;
@@ -1282,6 +1311,9 @@ QJsonObject Document::toJson() const {
 Document Document::fromJson(const QJsonObject& o) {
     Document d;
     auto p=o["page"].toObject(); if(!p.isEmpty()){ d.pageSize=QSizeF(p["w"].toDouble(1123),p["h"].toDouble(794)); d.pageCount=qMax(1,p["count"].toInt(1)); d.pageGap=p["gap"].toDouble(50); d.rulerOrigin=QPointF(p["rox"].toDouble(0),p["roy"].toDouble(0)); d.scaleLineWidths=!p["noScaleLW"].toBool(false); }
+    if(!p.isEmpty()){ d.bleed=qBound(0.0,p["bleed"].toDouble(0),1e5);
+        for(const auto& v: p["gh"].toArray()) d.guidesH.push_back(v.toDouble());
+        for(const auto& v: p["gv"].toArray()) d.guidesV.push_back(v.toDouble()); }
     if(o.contains("pgcol")) d.pageColor=QColor::fromRgba((QRgb)o["pgcol"].toVariant().toLongLong());
     d.shapes.clear(); for (auto v : o["shapes"].toArray()) d.shapes.append(Shape::fromJson(v.toObject()));
     for (auto v : o["namedColors"].toArray()){ auto j=v.toObject(); NamedColor n; n.name=j["name"].toString();

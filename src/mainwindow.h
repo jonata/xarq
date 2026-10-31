@@ -5,9 +5,12 @@
 #include <QHash>
 #include <QKeySequence>
 #include <QVector>
+#include <QPair>
+#include <functional>
 #include "canvas.h"
 
 class QButtonGroup; class QLabel; class QToolButton; class QScrollArea; class QTabWidget; class QMenuBar; class QStackedWidget;
+class QGraphicsOpacityEffect; class QPropertyAnimation;
 int runSelfTest();   // deterministic test harness (selftest.cpp); befriended so it can reach empty-state internals
 
 namespace xara {
@@ -19,6 +22,7 @@ class MainWindow : public QMainWindow {
 public:
     MainWindow();
     Canvas* canvas() const { return m_canvas; }
+    bool bitmapExportDialog(const QString& initialPath);   // rich two-region Export bitmap dialog (preview + options rail); public for the --shot hook
     // Keyboard shortcut customization — public for introspection/tests.
     void applyShortcutOverrides();                            // apply the user's saved (QSettings) shortcut overrides
     QStringList  commandPaths() const;                        // every menu command's stable path key
@@ -39,10 +43,19 @@ public:
     void showStartScreen();                                   // the welcome launcher
     QStringList recentFiles() const;                          // most-recent-first, QSettings-backed
     void addRecentFile(const QString& path);                  // record a file as recently opened/saved
-    void openPath(const QString& p);                          // open a .xar/.svg into a tab (used by Start screen + recents)
+    void openPath(const QString& p);                          // open ANY supported file into a tab as a document (Start screen + recents)
+    static QString supportedOpenFilter();                     // File-dialog filter covering every openable/importable format
     void newFromTemplate(int kind);                           // new document from a named template, in a tab
+    void newBlankSized(double w, double h);                    // new blank document at a custom page size, in a tab (Start screen "Custom size")
+    // Crash recovery is surfaced on the welcome screen (no modal): the Start screen lists these and calls
+    // recoverAll()/discardRecovery() when the user chooses. Public so startscreen.cpp can build the section.
+    QVector<QPair<QString,QString>> recoveryEntries() const;  // (snapshotFile, originalPath) per recoverable doc, existing files only
+    void recoverAll();                                        // restore every recovery snapshot into a tab, then show the workspace
+    void discardRecovery();                                   // delete the recovery snapshots and refresh the welcome screen
 protected:
     void closeEvent(class QCloseEvent* e) override;           // warn on unsaved tabs + clear recovery on clean exit
+    void changeEvent(class QEvent* e) override;               // keep the frameless maximize/restore glyph in sync
+    void resizeEvent(class QResizeEvent* e) override;         // re-elide the centred title for the new width
     bool eventFilter(QObject* o, QEvent* e) override;         // reposition the floating tool rail when the canvas resizes
 private:
     void buildToolRail();
@@ -52,6 +65,7 @@ private:
     QToolButton* railButton(Tool t, const QString& tip, const QString& shortcut);
 
     void newFile(); void openFile(); bool saveFile(); bool saveFileAs(); void exportImage();
+    bool importIntoDoc(const QString& p, const std::function<bool()>& imp);   // import into the current doc + add to Recent on success
     void pageSetup(); void printDocument();
     void about();
     void updateTitle();
@@ -63,7 +77,6 @@ private:
     void autosave();                 // periodic recovery snapshot of all dirty tabs
     void snapshotRecovery();         // write every dirty tab to its own recovery file + manifest
     void clearRecovery();            // remove all recovery files + the manifest
-    void offerRecovery();            // on startup, restore every leftover recovery document into a tab
 
     // Keyboard shortcut customization (Batch R5)
     void captureShortcutDefaults();  // record the built-in shortcut of every menu command
@@ -72,6 +85,8 @@ private:
 
     Canvas* m_canvas{};
     bool m_dirty{false};             // active document changed since the last save/autosave
+    QString m_lastCanvasMsg;         // the most recent Canvas::statusMessage — an importer's own
+                                     // diagnostic, which must not be buried by a generic line
     bool m_startupDialogs{true};     // show recovery + welcome dialogs on launch (off in headless/test)
     bool m_deferStartup{false};      // if true the ctor skips the startup sequence (main() runs it after the splash)
     class QTimer* m_autosaveTimer{};
@@ -116,6 +131,7 @@ private:
     QWidget* m_rightPanel{};      // the Design|Prototype panel, floated as a translucent glass overlay over the canvas
     QWidget* m_panelGrip{};       // draggable handle on the panel's left edge to resize it
     int  m_rightPanelW{302};      // current panel width (user-resizable)
+    std::function<void()> m_pokeRightPanel;   // reveal the auto-hide (show-on-hover) right panel programmatically
     bool m_gripDrag{false};
     void positionRightPanel();    // pin it to the right edge of the canvas, full height
     QTabWidget* m_rpTabs{};
@@ -123,8 +139,21 @@ private:
     QScrollArea* m_designScroll{};
     void revealPanelSection(int which);   // 0=Properties 1=Layers 2=Colour: show the dock, Design tab, expand+scroll
     QMenuBar* m_menuBar{};        // the app menu, embedded in the custom DS title bar (not the native menu bar)
-    void buildTitleBar();         // DS TitleBar: wordmark + menus + centered doc name/badge + Share/cloud (setMenuWidget)
-    void refreshDocStatus();      // update m_docName + m_docBadge from filePath + m_dirty
+    void buildTitleBar();         // frameless custom title bar: quick actions + centered title⇄menu hover-swap + window controls
+    void refreshDocStatus();      // update the centred identity + Save button + status "Saved" from filePath + m_dirty
+    // --- frameless title bar ("App title bar design"): centre swaps document identity ⇄ menu bar on hover ---
+    QToolButton* m_saveBtn{}; QToolButton* m_exportBtn{};
+    QWidget* m_titleBarW{};                          // the DragBar background (OS window move handle)
+    QWidget* m_docLayer{}; QWidget* m_menuLayer{};   // the two cross-faded centre layers
+    QLabel*  m_pathLabel{}; QLabel* m_titleLabel{}; QString m_titleFull;
+    QGraphicsOpacityEffect *m_docFx{}, *m_menuFx{};
+    QPropertyAnimation *m_docAnim{}, *m_menuAnim{};
+    QToolButton *m_minBtn{}, *m_maxBtn{}, *m_closeBtn{};
+    void updateSaveButton();      // green tint when the document is dirty, neutral when saved
+    void updateCenterIdentity();  // path line + middle-elided title from the active document
+    void setCenterHover(bool on); // cross-fade the identity out and the menu bar in (and back)
+    void updateMaxButtonIcon();   // maximize vs restore glyph + square/rounded top corners
+    void reelideTitle();          // recompute the middle-elided title for the current centre width
     QLabel* m_sTool{}; QLabel* m_sCoord{}; QLabel* m_sZoom{}; QLabel* m_sSel{}; QLabel* m_sSnap{}; QLabel* m_sSaved{};
 };
 

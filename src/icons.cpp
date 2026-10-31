@@ -116,6 +116,64 @@ QIcon actionIcon(const QString& name, int size, const QColor& col) {
             g.setPen(Qt::NoPen); g.setBrush(col);
             for(QPointF v:{QPointF(s*0.18,s*0.18),QPointF(s*0.82,s*0.18),QPointF(s*0.18,s*0.82),QPointF(s*0.82,s*0.82)})
                 g.drawRect(QRectF(v.x()-s*0.06,v.y()-s*0.06,s*0.12,s*0.12)); }
+        // ---- Lucide-style glyphs used by the welcome / start screen ----
+        else if (name=="plus"){            // + (new document)
+            g.drawLine(QPointF(c,s*0.22),QPointF(c,s*0.78)); g.drawLine(QPointF(s*0.22,c),QPointF(s*0.78,c)); }
+        else if (name=="file"){            // clean document with a folded corner
+            const double x0=s*0.28,y0=s*0.14,x1=s*0.72,y1=s*0.86,f=s*0.16;
+            QPainterPath p; p.moveTo(x0,y0); p.lineTo(x1-f,y0); p.lineTo(x1,y0+f); p.lineTo(x1,y1); p.lineTo(x0,y1); p.closeSubpath();
+            g.drawPath(p); g.drawPolyline(QPolygonF({QPointF(x1-f,y0),QPointF(x1-f,y0+f),QPointF(x1,y0+f)})); }
+        else if (name=="folder-open"){     // Lucide folder-open: a tabbed back panel with the front lid tilted open
+            QPainterPath back;             // back of the folder (tab + top edge + sides)
+            back.moveTo(s*0.14,s*0.70); back.lineTo(s*0.14,s*0.30); back.lineTo(s*0.20,s*0.24);
+            back.lineTo(s*0.40,s*0.24); back.lineTo(s*0.46,s*0.32); back.lineTo(s*0.82,s*0.32); back.lineTo(s*0.82,s*0.44);
+            g.drawPath(back);
+            QPainterPath lid;              // open front lid — a parallelogram flaring out to the right (perspective)
+            lid.moveTo(s*0.14,s*0.70); lid.lineTo(s*0.28,s*0.46); lid.lineTo(s*0.94,s*0.46); lid.lineTo(s*0.80,s*0.70); lid.closeSubpath();
+            g.drawPath(lid); }
+        else if (name=="globe"){           // circle + meridian + parallels
+            g.drawEllipse(QPointF(c,c),s*0.32,s*0.32);
+            g.drawEllipse(QPointF(c,c),s*0.13,s*0.32);
+            g.drawLine(QPointF(s*0.18,c),QPointF(s*0.82,c));
+            g.drawLine(QPointF(s*0.26,s*0.32),QPointF(s*0.74,s*0.32));
+            g.drawLine(QPointF(s*0.26,s*0.68),QPointF(s*0.74,s*0.68)); }
+        else if (name=="arrow-up-right"){  // ↗
+            g.drawLine(QPointF(s*0.30,s*0.70),QPointF(s*0.72,s*0.28));
+            g.drawPolyline(QPolygonF({QPointF(s*0.40,s*0.28),QPointF(s*0.72,s*0.28),QPointF(s*0.72,s*0.60)})); }
+        else if (name=="search"){          // magnifier
+            g.drawEllipse(QPointF(s*0.44,s*0.44),s*0.24,s*0.24);
+            g.drawLine(QPointF(s*0.62,s*0.62),QPointF(s*0.82,s*0.82)); }
+        else if (name=="history"){         // clock face + counter-clockwise arrow
+            g.drawArc(QRectF(s*0.24,s*0.24,s*0.52,s*0.52), 55*16, 285*16);
+            g.drawPolyline(QPolygonF({QPointF(s*0.20,s*0.24),QPointF(s*0.28,s*0.20),QPointF(s*0.34,s*0.30)}));   // arrowhead at the gap (top-left)
+            g.drawPolyline(QPolygonF({QPointF(c,s*0.40),QPointF(c,c),QPointF(s*0.66,s*0.58)})); }               // hour + minute hands
+        else if (name=="monitor"){         // screen + stand
+            rrect(s*0.14,s*0.20,s*0.86,s*0.64,r*1.4);
+            g.drawLine(QPointF(c,s*0.64),QPointF(c,s*0.78)); g.drawLine(QPointF(s*0.36,s*0.80),QPointF(s*0.64,s*0.80)); }
+        else if (name=="credit-card"){     // card + magnetic stripe
+            rrect(s*0.14,s*0.26,s*0.86,s*0.74,r*1.3);
+            g.drawLine(QPointF(s*0.14,s*0.42),QPointF(s*0.86,s*0.42));
+            g.drawLine(QPointF(s*0.24,s*0.60),QPointF(s*0.40,s*0.60)); }
+        else if (name=="images"){          // back frame + front frame with sun + mountains
+            rrect(s*0.30,s*0.16,s*0.80,s*0.56,r);
+            rrect(s*0.16,s*0.30,s*0.66,s*0.80,r);
+            g.drawEllipse(QPointF(s*0.30,s*0.44),s*0.045,s*0.045);
+            g.drawPolyline(QPolygonF({QPointF(s*0.18,s*0.72),QPointF(s*0.32,s*0.56),QPointF(s*0.44,s*0.66),QPointF(s*0.52,s*0.58),QPointF(s*0.64,s*0.72)})); }
+        else if (name=="presentation"){    // screen on a stand + tiny bar chart
+            rrect(s*0.14,s*0.18,s*0.86,s*0.62,r);
+            g.drawLine(QPointF(c,s*0.62),QPointF(c,s*0.74));
+            g.drawLine(QPointF(s*0.40,s*0.84),QPointF(c,s*0.74)); g.drawLine(QPointF(s*0.60,s*0.84),QPointF(c,s*0.74));
+            g.drawLine(QPointF(s*0.36,s*0.50),QPointF(s*0.36,s*0.40)); g.drawLine(QPointF(s*0.50,s*0.50),QPointF(s*0.50,s*0.32)); g.drawLine(QPointF(s*0.64,s*0.50),QPointF(s*0.64,s*0.36)); }
+        else if (name=="win-min"){         // window minimize — a single centered bar
+            g.drawLine(QPointF(s*0.28,c),QPointF(s*0.72,c)); }
+        else if (name=="win-max"){         // window maximize — a rounded square
+            rrect(s*0.28,s*0.28,s*0.72,s*0.72,r*2.2); }
+        else if (name=="win-restore"){     // window restore — two overlapping squares
+            rrect(s*0.34,s*0.24,s*0.74,s*0.64,r*1.6);   // back square
+            g.setBrush(Qt::NoBrush); rrect(s*0.26,s*0.36,s*0.66,s*0.76,r*1.6); }   // front square
+        else if (name=="win-close"){       // window close — an X
+            g.drawLine(QPointF(s*0.30,s*0.30),QPointF(s*0.70,s*0.70));
+            g.drawLine(QPointF(s*0.70,s*0.30),QPointF(s*0.30,s*0.70)); }
         else { g.drawEllipse(QPointF(c,c),s*0.25,s*0.25); }
     }, col);
     return QIcon(pm);

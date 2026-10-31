@@ -28,9 +28,18 @@ void Canvas::commitNewShape(Shape s, const QString& label) {
 
 void Canvas::mousePressEvent(QMouseEvent* e) {
     setFocus();
+    // A press starts a real interaction (select / drag / draw) — the interactive zoom-preview is over, so drop it
+    // and let this frame render crisply (the settle timer would eventually do this, but a press must not wait for it).
+    if(m_previewZoom){ m_previewZoom=false; if(m_zoomSettleTimer) m_zoomSettleTimer->stop(); }
+    // A mouse press CANCELS the pie (releasing Ctrl/Alt is the sole commit gesture) and falls through, so a
+    // Ctrl- or Alt-modified drag (constrain / snap-bypass) still begins normally instead of the press being
+    // swallowed as a destructive wedge click.
+    if(m_radialActive) radialDisarm();
+    if(m_radialTimer && m_radialTimer->isActive()) m_radialTimer->stop();
     const QPointF w = e->position();
     const QPointF d = toDoc(w);
     m_pressView = m_lastView = w; m_pressDocPt = d; m_curDocPt = d;
+    m_pressMoved = false; m_moveUndoPending = false;   // reset per-press; a plain click stays a no-op (no re-raster, no undo)
 
     if (m_cropMode) {   // interactive crop: grab a handle (or ignore); all left-clicks stay in crop mode
         if (e->button()==Qt::LeftButton) m_cropHandle = cropHandleAt(w);
@@ -142,7 +151,7 @@ void Canvas::mousePressEvent(QMouseEvent* e) {
               if(!grp.isEmpty()) for(int i=0;i<m_doc.shapes.size();++i) if(m_doc.shapes[i].softGroup>0 && grp.contains(m_doc.shapes[i].softGroup) && !m_sel.contains(i)) m_sel.push_back(i); }
             m_dragging=true; m_dragStartXf.clear(); for(int i:m_sel) m_dragStartXf.push_back(m_doc.shapes[i].transform);
             m_dragStartBounds=selBoundsDoc();
-            pushUndo("Move");
+            m_moveUndoPending=true;   // defer the "Move" snapshot to the first real move — a plain click must not serialise the whole doc
             emit selectionChanged();
         } else { m_sel.clear(); m_rubber=true; m_rubberRect=QRectF(w,w); emit selectionChanged(); }
         update(); break;
@@ -459,7 +468,9 @@ void Canvas::mousePressEvent(QMouseEvent* e) {
 }
 
 void Canvas::mouseMoveEvent(QMouseEvent* e) {
+    if(m_radialActive){ radialHover(e->position()); return; }   // while the pie is up, the cursor only aims a wedge
     const QPointF w=e->position(); const QPointF d=toDoc(w); m_curDocPt=d;
+    if (e->buttons() & Qt::LeftButton) m_pressMoved=true;   // an actual drag has begun → manipulatingContent() may now re-raster
     m_createConstrain = e->modifiers()&Qt::ControlModifier;   // Ctrl while drawing a new shape → square / angle-snap (live preview reads this)
     if (m_textDragging){ setCaretAtDocPoint(d, true); return; }   // drag inside edited text = extend selection
     emit mouseDoc(d);
@@ -585,6 +596,7 @@ void Canvas::mouseMoveEvent(QMouseEvent* e) {
                 s.rect=r; reflowText(); emit documentChanged(); emit selectionChanged(); update(); return;
             }
         }
+        if (m_moveUndoPending){ pushUndo("Move"); m_moveUndoPending=false; }   // first real move of a body-drag → snapshot now (deferred from press)
         if (m_activeHandle!=HNone){ // resize via bbox scaling
             QRectF b=m_dragStartBounds; QPointF anchor; double sx=1,sy=1;
             QPointF dd=d-m_pressDocPt;
@@ -838,6 +850,7 @@ void Canvas::mouseMoveEvent(QMouseEvent* e) {
 
 void Canvas::mouseReleaseEvent(QMouseEvent* e) {
     const QPointF w=e->position(); const QPointF d=toDoc(w);
+    clearDragProxy();   // any live drag is ending; drop the proxy bitmaps → next paint is a full, correct render
     if (m_textDragging){ m_textDragging=false; return; }   // end a text drag-selection
     if (m_indentDrag>=0){ m_indentDrag=-1; update(); return; }   // finish an indent-marker drag
     if (m_guideDrag!=GDNone) {   // finish a guide drag; drop back onto the ruler or off-canvas = delete
@@ -1078,19 +1091,52 @@ void Canvas::mouseDoubleClickEvent(QMouseEvent* e) {
             return;
         }
         int hit=hitShape(d);
-        if(hit>=0 && m_doc.shapes[hit].type==ShapeType::Text && Canvas::canInlineEdit(m_doc.shapes[hit])){   // point text → in-canvas edit at the click
-            m_textEditIsNew=false;
-            beginTextEdit(hit, m_doc.shapes[hit].textIndexAtLocal(m_doc.shapes[hit].transform.inverted().map(d))); }
-        else if(hit>=0 && m_doc.shapes[hit].type==ShapeType::Text){   // frame/curve/tabbed → modal editor
-            bool ok=false; QString t=QInputDialog::getText(this,"Edit Text","Text:",QLineEdit::Normal,m_doc.shapes[hit].text,&ok);
-            if(ok){ pushUndo("Edit text"); m_doc.shapes[hit].text=t; emit documentChanged(); update(); } }
-        else if(hit>=0 && m_doc.shapes[hit].type==ShapeType::Group){   // enter the group, sub-selecting the child under the cursor
-            enterGroup(hit, hitChildInGroup(m_doc.shapes[hit], m_doc.shapes[hit].transform, d)); }
+        if (hit<0) return;
+        // Double-clicking an object auto-activates the tool best suited to editing it (Xara-style): text → the
+        // Text tool (with a caret / editor), a path → the Shape-editor (Node) tool, an ellipse/polygon → its
+        // own parametric tool, a table → the Table tool. A Rectangle and a SmartShape are already fully
+        // editable in the Selector (their corner-radius / parametric handles are drawn there), so they stay
+        // put; a group is descended into rather than switched.
+        Shape& sh=m_doc.shapes[hit];
+        // A double-click is an *edit* intent, not a drag or a rotate toggle: neutralise every residual gesture
+        // bit left by the two preceding clicks so nothing leaks into the tool we switch to (or, for the
+        // stay-in-Select types, into a stray button-held move after this handler). Clearing m_dragStartXf makes
+        // any such move a no-op (empty target list); clearing m_rotateMode undoes the first click's reclick
+        // resize<->rotate toggle so a double-clicked object never silently lands in rotate/skew mode.
+        m_dragging=false; m_activeHandle=HNone; m_moveUndoPending=false; m_dragStartXf.clear();
+        m_rotateMode=false; m_rotPivotSet=false; m_toggleRotCandidate=false;
+        auto selectHit=[&]{ if(!(m_sel.size()==1 && m_sel[0]==hit)) select({hit}); };
+        switch (sh.type){
+        case ShapeType::Text:
+            selectHit(); setTool(Tool::Text);
+            if (Canvas::canInlineEdit(sh)){                           // point text → in-canvas caret at the click
+                m_textEditIsNew=false;
+                beginTextEdit(hit, sh.textIndexAtLocal(sh.transform.inverted().map(d))); }
+            else {                                                    // frame/curve/tabbed/rich → modal editor (multi-line, keeps paragraphs)
+                bool ok=false; QString t=QInputDialog::getMultiLineText(this,"Edit Text","Text:",sh.text,&ok);
+                if(ok){ pushUndo("Edit text"); Shape& s2=m_doc.shapes[hit]; s2.text=t; s2.textRuns.clear();   // a bulk replace can't keep per-char runs (they'd mis-index) → flatten to the base style
+                    emit documentChanged(); update(); } }
+            break;
+        case ShapeType::Path:    selectHit(); setTool(Tool::Node);    break;   // Shape editor: setTool auto-begins node editing
+        case ShapeType::Ellipse:                                              // only a swept pie/arc/segment has editable rim handles in the Ellipse tool;
+            if (sh.ellipseMode!=0){ selectHit(); setTool(Tool::Ellipse); }    // a plain full ellipse is fully editable in the Selector, so leave it there
+            break;
+        case ShapeType::Polygon: selectHit(); setTool(Tool::Polygon); break;  // sides / star-depth / edge-curvature handles
+        case ShapeType::Table:   selectHit(); setTool(Tool::Table);           // land on the clicked cell so it's ready to edit (mirrors text dropping a caret)
+            { int rr,ccl; if(tableCellAt(hit,d,rr,ccl)) tableSelectCell(hit,rr,ccl,false); } break;
+        case ShapeType::Group:                                                // enter the group, sub-selecting the child under the cursor
+            enterGroup(hit, hitChildInGroup(sh, sh.transform, d)); break;
+        case ShapeType::Rect:    // corner-radius + resize/rotate handles live in the Selector — nothing to switch to
+        case ShapeType::Smart:   // SmartShape parametric handles live in the Selector — stay put
+        default: break;
+        }
     }
 }
 
 void Canvas::wheelEvent(QWheelEvent* e) {
+    if(m_radialActive || (m_radialTimer && m_radialTimer->isActive())) radialDisarm();   // Ctrl+wheel is zoom, not the pie
     if (e->modifiers()&Qt::ControlModifier || true) {
+        noteZoomPanInteraction();          // fast draft frame during the wheel gesture; crisp repaint once it settles
         double f = e->angleDelta().y()>0 ? 1.15 : 1.0/1.15;
         QPointF before=toDoc(e->position());
         m_zoom=qBound(0.05,m_zoom*f,40.0);
@@ -1101,6 +1147,23 @@ void Canvas::wheelEvent(QWheelEvent* e) {
 }
 
 void Canvas::keyPressEvent(QKeyEvent* e) {
+    // Ctrl radial menu: bare Ctrl arms the press-and-hold; any other key while armed/open dismisses it
+    // (Escape is consumed, everything else falls through so the real shortcut/key still fires).
+    // Ctrl+Alt (both held) arms the radial pie. Handle the two modifier keys here so a lone Ctrl or lone Alt —
+    // or their autorepeat — neither arms the pie nor trips the "any other key disarms" net below.
+    if(e->key()==Qt::Key_Control || e->key()==Qt::Key_Alt){
+        if(!e->isAutoRepeat()){
+            const auto mods=e->modifiers();   // event snapshot: reliably carries the already-held modifier
+            const bool both=((mods&Qt::ControlModifier)||e->key()==Qt::Key_Control) && ((mods&Qt::AltModifier)||e->key()==Qt::Key_Alt);
+            // ...but NOT AltGr: on some (EU) layouts AltGr reports as Ctrl+Alt; it carries GroupSwitchModifier
+            // (and on Linux, the app's target, AltGr is GroupSwitch, not Ctrl+Alt) → never mistake it for the pie.
+            if(both && !(mods&Qt::GroupSwitchModifier)){ radialArm(); return; }
+        }
+        QWidget::keyPressEvent(e); return;   // lone Ctrl/Alt, autorepeat, or AltGr → normal handling, pie untouched
+    }
+    if(m_radialActive || (m_radialTimer && m_radialTimer->isActive())){
+        const bool esc=(e->key()==Qt::Key_Escape); radialDisarm(); if(esc) return;
+    }
     if (m_cropMode){ if(e->key()==Qt::Key_Return||e->key()==Qt::Key_Enter) applyCropMode();
                      else if(e->key()==Qt::Key_Escape) cancelCropMode(); return; }
     if (m_straightenMode){ if(e->key()==Qt::Key_Return||e->key()==Qt::Key_Enter) applyStraightenMode();
@@ -1168,11 +1231,29 @@ void Canvas::keyPressEvent(QKeyEvent* e) {
     case Qt::Key_Escape: m_penActive=false; m_penHandleDrag=false; m_penResume=-1; m_penResumeBase=QPainterPath(); m_penAnchors.clear(); m_penHandles.clear(); selectNone(); setTool(Tool::Select); update(); break;
     case Qt::Key_Return: if(m_tool==Tool::Pen && m_penActive){ commitPen(false); } break;
     case Qt::Key_Left: case Qt::Key_Right: case Qt::Key_Up: case Qt::Key_Down: {
+        if(e->modifiers()&(Qt::ControlModifier|Qt::AltModifier)) break;   // only bare / Shift+arrow nudges; Ctrl/Alt+arrow belongs to the WM / the pie
         if(m_sel.isEmpty())break; double s=(e->modifiers()&Qt::ShiftModifier)?10:1; QPointF dd(0,0);
         if(e->key()==Qt::Key_Left)dd.setX(-s); if(e->key()==Qt::Key_Right)dd.setX(s); if(e->key()==Qt::Key_Up)dd.setY(-s); if(e->key()==Qt::Key_Down)dd.setY(s);
         applyToSelection([&](Shape& sh){ sh.transform=sh.transform*QTransform::fromTranslate(dd.x(),dd.y()); },"Nudge"); break; }
     default: QWidget::keyPressEvent(e);
     }
+}
+
+void Canvas::keyReleaseEvent(QKeyEvent* e) {
+    if(e->key()==Qt::Key_Control || e->key()==Qt::Key_Alt){
+        // ⚠️ Do NOT trust e->isAutoRepeat(): some X11 setups deliver a HELD key's autorepeat as release+press pairs
+        // with isAutoRepeat()==false, so an autorepeat release would spuriously stop the pending pie timer / commit
+        // the pie every ~30ms. Trust the LIVE physical key state: if the released modifier is still down, it is a
+        // repeat-release — ignore it and let the arm/pie stand.
+        const auto live = QApplication::queryKeyboardModifiers();
+        const bool stillDown = (e->key()==Qt::Key_Control && (live&Qt::ControlModifier))
+                            || (e->key()==Qt::Key_Alt     && (live&Qt::AltModifier));
+        if(!stillDown){
+            if(m_radialActive){ radialHide(true); return; }                                   // real release → commit the aimed wedge
+            if(m_radialTimer && m_radialTimer->isActive()){ m_radialTimer->stop(); return; }   // a quick Ctrl+Alt tap → never bloomed
+        }
+    }
+    QWidget::keyReleaseEvent(e);
 }
 
 // Right-click context menu — object/selection ops (single object at top, then multi-object,

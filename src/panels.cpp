@@ -3,6 +3,7 @@
 #include "dialogs.h"
 #include <QtWidgets>
 #include <QTimer>
+#include <QFontDatabase>
 #include <QRegularExpression>
 
 namespace xara {
@@ -84,7 +85,9 @@ PropertiesPanel::PropertiesPanel(Canvas* c, QWidget* parent):QWidget(parent),m_c
             if(grad && s.fill.p0==s.fill.p1){ QRectF lb=s.localBounds(); s.fill.p0=lb.topLeft(); s.fill.p1=lb.bottomRight(); }
             if(t==FillType::Mesh && s.fill.meshColors.size()<3){ QColor b=s.fill.representativeColor(); s.fill.meshColors={b.lighter(140),b,b.darker(150),b.lighter(110)}; }
           },"Fill type"); refresh(); });
-      connect(m_fillColor,&ColorButton::changed,this,[this](QColor c){ if(m_block)return; Fill nf=m_c->currentFill(); nf.color=c; if(nf.type==FillType::None) nf.type=FillType::Solid; m_c->setCurrentFill(nf); apply([&](Shape&s){ s.fill.type= (s.fill.type==FillType::None?FillType::Solid:s.fill.type); if(s.fill.type==FillType::Solid)s.fill.color=c; },"Fill colour"); });
+      connect(m_fillColor,&ColorButton::changed,this,[this](QColor c){ if(m_block)return;
+          if(m_c->formatEditSelection([c](QFont&,QColor&col){ col=c; },"Text colour")) return;   // colour just the selected characters
+          Fill nf=m_c->currentFill(); nf.color=c; if(nf.type==FillType::None) nf.type=FillType::Solid; m_c->setCurrentFill(nf); apply([&](Shape&s){ s.fill.type= (s.fill.type==FillType::None?FillType::Solid:s.fill.type); if(s.fill.type==FillType::Solid)s.fill.color=c; },"Fill colour"); });
       connect(m_gradBar,&GradientBar::changed,this,[this]{ if(m_block)return; apply([&](Shape&s){ s.fill.stops=m_gradBar->stops(); },"Gradient"); });
       connect(m_fillSpread,QOverload<int>::of(&QComboBox::activated),this,[this](int i){ if(m_block)return; QGradient::Spread sp=i==1?QGradient::RepeatSpread:i==2?QGradient::ReflectSpread:QGradient::PadSpread; apply([&](Shape&s){ s.fill.spread=sp; },"Gradient repeat"); });
       connect(m_fillRainbow,&QCheckBox::toggled,this,[this](bool b){ if(m_block)return; apply([&](Shape&s){ s.fill.rainbow=b; },"Rainbow"); });
@@ -243,18 +246,22 @@ LayersPanel::LayersPanel(Canvas* c, QWidget* parent):QWidget(parent),m_c(c) {
     mk("dup","Duplicate",[c]{c->duplicateSelection();}); mk("group","Group",[c]{c->groupSelection();});
     mk("delete","Delete",[c]{c->deleteSelection();}); row->addStretch(); V->addLayout(row);
     connect(m_list,&QListWidget::itemSelectionChanged,this,&LayersPanel::onRowChanged);
-    connect(m_list,&QListWidget::itemChanged,this,[this](QListWidgetItem* it){ if(m_block)return; int row=m_list->row(it); int idx=m_list->count()-1-row; if(idx<0||idx>=m_c->doc().shapes.size())return; m_c->doc().shapes[idx].visible=(it->checkState()==Qt::Checked); m_c->update(); });
-    connect(m_c,&Canvas::documentChanged,this,&LayersPanel::refresh);
+    connect(m_list,&QListWidget::itemChanged,this,[this](QListWidgetItem* it){ if(m_block)return; int idx=it->data(Qt::UserRole).toInt(); if(idx<0||idx>=m_c->doc().shapes.size())return; m_c->doc().shapes[idx].visible=(it->checkState()==Qt::Checked); m_c->update(); });
+    connect(m_c,&Canvas::documentChangedDebounced,this,&LayersPanel::refresh);   // debounced: rebuilds a row per shape
     connect(m_c,&Canvas::selectionChanged,this,&LayersPanel::refresh);
     refresh();
 }
 void LayersPanel::refresh() {
     m_block=true; m_list->clear();
     const auto& sh=m_c->doc().shapes; auto sel=m_c->selection();
-    for(int i=sh.size()-1;i>=0;--i){ const Shape&s=sh[i];
+    // Building a swatch pixmap per object doesn't scale to thousands (e.g. a big imported .cdr):
+    // cap the list to the top N objects and note the remainder, so import stays responsive.
+    const int CAP=2000; const int lo=qMax(0, sh.size()-CAP);
+    for(int i=sh.size()-1;i>=lo;--i){ const Shape&s=sh[i];
         QString nm=s.name.isEmpty()? QString("Object %1").arg(i+1):s.name;
         if(s.type==ShapeType::Text) nm=QString("“%1”").arg(s.text.left(16));
         auto* it=new QListWidgetItem(nm);
+        it->setData(Qt::UserRole, i);   // real shape index (list order/cap-independent)
         it->setFlags(it->flags()|Qt::ItemIsUserCheckable);
         it->setCheckState(s.visible?Qt::Checked:Qt::Unchecked);
         QPixmap pm(18,18); pm.fill(Qt::transparent); QPainter g(&pm); g.setRenderHint(QPainter::Antialiasing);
@@ -263,11 +270,13 @@ void LayersPanel::refresh() {
         if(sel.contains(i)) it->setSelected(true);
         m_list->addItem(it);
     }
+    if(lo>0){ auto* more=new QListWidgetItem(QString("… and %1 more objects").arg(lo));
+        more->setData(Qt::UserRole,-1); more->setFlags(Qt::ItemIsEnabled); more->setForeground(QColor(140,146,158)); m_list->addItem(more); }
     m_block=false;
 }
 void LayersPanel::onRowChanged() {
     if(m_block)return; QVector<int> sel;
-    for(auto* it:m_list->selectedItems()){ int row=m_list->row(it); int idx=m_list->count()-1-row; if(idx>=0) sel.push_back(idx);}
+    for(auto* it:m_list->selectedItems()){ int idx=it->data(Qt::UserRole).toInt(); if(idx>=0) sel.push_back(idx);}
     std::sort(sel.begin(),sel.end()); m_c->select(sel);
 }
 
@@ -444,19 +453,54 @@ void InfoBar::rebuild(){
         // Attributes fall back to the Text tool's own font (m_c->textFont()) so they also seed NEW text.
         QFont f=(sel&&sel->type==ShapeType::Text)?sel->font:m_c->textFont();
         auto* fc=new QFontComboBox; fc->setCurrentFont(f); fc->setFixedWidth(190);
-        connect(fc,&QFontComboBox::currentFontChanged,this,[this](const QFont& nf){
-            m_c->applyToSelection([nf](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setFamily(nf.family()); s.font=g; } },"Font");
-            QFont tf=m_c->textFont(); tf.setFamily(nf.family()); m_c->setTextFont(tf); });
-        m_lay->addWidget(fc);
-        ispin("Size",4,400,f.pointSize()>0?f.pointSize():36,[this](int v){ m_c->applyToSelection([v](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setPointSize(v); s.font=g; } },"Size");
+        // Weight / style selector: lists the faces THIS family actually ships (Light/Regular/Medium/Semibold/
+        // Bold/Black…), so a family like 'Arson Pro' can be set to Heavy/Black (900), not just toggled Bold (700)
+        // — the same weight choice Inkscape/Xara expose. Repopulated whenever the family changes.
+        auto* wc=new QComboBox; wc->setFixedWidth(120); wc->setToolTip("Font weight / style");
+        auto stylesFor=[](const QString& fam)->QStringList{ QStringList st=QFontDatabase::styles(fam); if(st.isEmpty()) st<<QStringLiteral("Regular"); return st; };
+        auto matchStyle=[](const QStringList& st,const QString& fam,int wt,bool it)->int{   // index of the face closest to (weight,italic)
+            int best=0; long bestScore=1L<<60;
+            for(int i=0;i<st.size();++i){ QFont pf=QFontDatabase::font(fam,st[i],12);
+                long sc=qAbs((long)pf.weight()-wt)+(pf.italic()!=it?100000L:0); if(sc<bestScore){ bestScore=sc; best=i; } }
+            return best; };
+        auto fillWeights=[wc,stylesFor,matchStyle](const QFont& font){ QSignalBlocker b(wc); wc->clear();
+            const QStringList st=stylesFor(font.family()); wc->addItems(st);
+            wc->setCurrentIndex(matchStyle(st,font.family(),font.weight(),font.italic())); };
+        fillWeights(f);
+        // Each control formats the ACTIVE on-canvas text selection if there is one (Inkscape-style, via
+        // formatEditSelection), else the whole selected object(s). The trailing setTextFont keeps the pending
+        // "type next" style in sync.
+        connect(fc,&QFontComboBox::currentFontChanged,this,[this,fillWeights](const QFont& nf){
+            if(!m_c->formatEditSelection([nf](QFont&g,QColor&){ g.setFamily(nf.family()); },"Font"))
+                m_c->applyToSelection([nf](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setFamily(nf.family()); s.font=g; } },"Font");
+            QFont tf=m_c->textFont(); tf.setFamily(nf.family()); m_c->setTextFont(tf);
+            fillWeights(tf); });   // new family → refresh the weight list (keeping the current weight/slant)
+        connect(wc,QOverload<int>::of(&QComboBox::activated),this,[this,fc,wc](int){
+            const QFont probe=QFontDatabase::font(fc->currentFont().family(), wc->currentText(), 12);
+            const int wt=probe.weight(); const bool it=probe.italic();
+            if(!m_c->formatEditSelection([wt,it](QFont&g,QColor&){ g.setWeight(QFont::Weight(wt)); g.setItalic(it); },"Font weight"))
+                m_c->applyToSelection([wt,it](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setWeight(QFont::Weight(wt)); g.setItalic(it); s.font=g; } },"Font weight");
+            QFont tf=m_c->textFont(); tf.setWeight(QFont::Weight(wt)); tf.setItalic(it); m_c->setTextFont(tf); });
+        m_lay->addWidget(fc); m_lay->addWidget(wc);
+        ispin("Size",4,400,f.pointSize()>0?f.pointSize():36,[this](int v){
+                       if(!m_c->formatEditSelection([v](QFont&g,QColor&){ g.setPointSize(v); },"Size"))
+                           m_c->applyToSelection([v](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setPointSize(v); s.font=g; } },"Size");
                        QFont tf=m_c->textFont(); tf.setPointSize(v); m_c->setTextFont(tf); });
-        btn("B",[this]{ m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setBold(!g.bold()); s.font=g; } },"Bold");
+        btn("B",[this]{ const bool nb=!m_c->editSelectionFont().bold();
+                        if(!m_c->formatEditSelection([nb](QFont&g,QColor&){ g.setBold(nb); },"Bold"))
+                            m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setBold(!g.bold()); s.font=g; } },"Bold");
                         QFont tf=m_c->textFont(); tf.setBold(!tf.bold()); m_c->setTextFont(tf); });
-        btn("I",[this]{ m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setItalic(!g.italic()); s.font=g; } },"Italic");
+        btn("I",[this]{ const bool ni=!m_c->editSelectionFont().italic();
+                        if(!m_c->formatEditSelection([ni](QFont&g,QColor&){ g.setItalic(ni); },"Italic"))
+                            m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setItalic(!g.italic()); s.font=g; } },"Italic");
                         QFont tf=m_c->textFont(); tf.setItalic(!tf.italic()); m_c->setTextFont(tf); });
-        btn("U",[this]{ m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setUnderline(!g.underline()); s.font=g; } },"Underline");
+        btn("U",[this]{ const bool nu=!m_c->editSelectionFont().underline();
+                        if(!m_c->formatEditSelection([nu](QFont&g,QColor&){ g.setUnderline(nu); },"Underline"))
+                            m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setUnderline(!g.underline()); s.font=g; } },"Underline");
                         QFont tf=m_c->textFont(); tf.setUnderline(!tf.underline()); m_c->setTextFont(tf); });
-        btn("S̶",[this]{ m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setStrikeOut(!g.strikeOut()); s.font=g; } },"Strikethrough");
+        btn("S̶",[this]{ const bool ns=!m_c->editSelectionFont().strikeOut();
+                        if(!m_c->formatEditSelection([ns](QFont&g,QColor&){ g.setStrikeOut(ns); },"Strikethrough"))
+                            m_c->applyToSelection([](Shape&s){ if(s.type==ShapeType::Text){ QFont g=s.font; g.setStrikeOut(!g.strikeOut()); s.font=g; } },"Strikethrough");
                         QFont tf=m_c->textFont(); tf.setStrikeOut(!tf.strikeOut()); m_c->setTextFont(tf); }); sep();
         combo({"⯇ Left","≡ Centre","⯈ Right","≣ Justify"},sel?sel->textAlign:0,[this](int v){ m_c->applyToSelection([v](Shape&s){ if(s.type==ShapeType::Text) s.textAlign=v; },"Text align"); });
         check("Frame",sel&&sel->textFrame,[this](bool v){ m_c->applyToSelection([v](Shape&s){ if(s.type==ShapeType::Text){ s.textFrame=v; if(v&&s.rect.width()<20) s.rect.setWidth(320); if(v&&s.rect.height()<20) s.rect.setHeight(200); } },"Text frame"); }); sep();
@@ -705,7 +749,9 @@ void ColourLine::applyColour(int idx, bool line){
     if(!none){ if(idx<0||idx>=swatchPalette().size())return; col=swatchPalette()[idx].second; }
     if(line){ m_c->applyToSelection([&](Shape&s){ if(none)s.stroke.enabled=false; else { s.stroke.enabled=true; s.stroke.color=col; } },"Line colour");
         Stroke st=m_c->currentStroke(); st.enabled=!none; if(!none)st.color=col; m_c->setCurrentStroke(st); }
-    else { m_c->applyToSelection([&](Shape&s){ if(none)s.fill.type=FillType::None; else { s.fill.type=FillType::Solid; s.fill.color=col; } },"Fill colour");
+    else { // a real colour while editing text with a selection recolours just those characters (Inkscape-style)
+        if(!none && m_c->formatEditSelection([col](QFont&,QColor&c){ c=col; },"Text colour")) return;
+        m_c->applyToSelection([&](Shape&s){ if(none)s.fill.type=FillType::None; else { s.fill.type=FillType::Solid; s.fill.color=col; } },"Fill colour");
         Fill f=m_c->currentFill(); f.type=none?FillType::None:FillType::Solid; if(!none)f.color=col; m_c->setCurrentFill(f); }
 }
 void ColourLine::mousePressEvent(QMouseEvent* e){

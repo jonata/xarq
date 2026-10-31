@@ -67,7 +67,7 @@ ColorGallery::ColorGallery(Canvas* c, QWidget* parent):QWidget(parent),m_c(c){
         themeCombo->setCurrentIndex(0); m_c->refreshAll(); });
     themeRow->addWidget(themeCombo,1);
 
-    connect(m_c,&Canvas::documentChanged,this,&ColorGallery::refresh);
+    connect(m_c,&Canvas::documentChangedDebounced,this,&ColorGallery::refresh);   // debounced: no per-frame rebuild during a drag
     rebuild();
 }
 
@@ -253,16 +253,25 @@ NameGallery::NameGallery(Canvas* c,QWidget* parent):QWidget(parent),m_c(c){
     connect(m_table,&QTableWidget::cellClicked,this,[this](int r,int){ if(m_block)return; m_c->select({r}); });
     connect(m_table,&QTableWidget::cellChanged,this,[this](int r,int col){ if(m_block||col!=0||r>=m_c->doc().shapes.size())return;
         m_c->pushUndo("Rename object"); m_c->doc().shapes[r].name=m_table->item(r,0)->text(); m_c->refreshAll(); });
-    connect(m_c,&Canvas::documentChanged,this,&NameGallery::refresh);
+    connect(m_c,&Canvas::documentChangedDebounced,this,&NameGallery::refresh);   // debounced: iterates named colours + shapes
     connect(m_c,&Canvas::selectionChanged,this,&NameGallery::refresh);
     refresh();
 }
 void NameGallery::refresh(){
-    m_block=true; const auto& sh=m_c->doc().shapes; m_table->setRowCount(sh.size());
-    static const char* tn[]={"Rectangle","Ellipse","Polygon","Path","Text","Group"};
-    for(int i=0;i<sh.size();++i){ auto* ni=new QTableWidgetItem(sh[i].name.isEmpty()?QString("Object %1").arg(i+1):sh[i].name);
-        m_table->setItem(i,0,ni); auto* ti=new QTableWidgetItem(tn[int(sh[i].type)]); ti->setFlags(ti->flags()&~Qt::ItemIsEditable); m_table->setItem(i,1,ti); }
-    auto sel=m_c->selection(); m_table->clearSelection(); for(int i: sel) if(i<m_table->rowCount()) m_table->selectRow(i);
+    m_block=true; const auto& sh=m_c->doc().shapes;
+    // A per-object table is unusable — and pathologically slow to build/select — for thousands of objects
+    // (e.g. a big imported .cdr). Cap it: list the first N and skip the O(n^2) per-row select storm.
+    const int CAP=2000; const int n=qMin(sh.size(), CAP);
+    m_table->setRowCount(n);
+    // One label per ShapeType enumerator, IN ORDER — must stay in sync with model.h's
+    // `enum class ShapeType`. int(type) indexes this, so a missing entry over-reads the array.
+    static const char* tn[]={"Rectangle","Ellipse","Polygon","Path","Text","Group","Shape","Table"};
+    constexpr int TN=int(sizeof(tn)/sizeof(tn[0]));
+    for(int i=0;i<n;++i){ auto* ni=new QTableWidgetItem(sh[i].name.isEmpty()?QString("Object %1").arg(i+1):sh[i].name);
+        m_table->setItem(i,0,ni); const int t=int(sh[i].type);
+        auto* ti=new QTableWidgetItem((t>=0&&t<TN)?tn[t]:"Object"); ti->setFlags(ti->flags()&~Qt::ItemIsEditable); m_table->setItem(i,1,ti); }
+    auto sel=m_c->selection(); m_table->clearSelection();
+    if(sel.size()<=CAP) for(int i: sel) if(i<n) m_table->selectRow(i);   // skip the selection storm on a huge (whole-doc) selection
     m_block=false;
 }
 
@@ -360,7 +369,7 @@ PageLayerGallery::PageLayerGallery(Canvas* c,QWidget* parent):QWidget(parent),m_
     mk("⤓","Layer down",[this]{ m_c->moveLayer(m_c->activeLayer(),-1); });
     btns->addStretch();
 
-    connect(m_c,&Canvas::documentChanged,this,&PageLayerGallery::refresh);
+    connect(m_c,&Canvas::documentChangedDebounced,this,&PageLayerGallery::refresh);   // debounced: rebuilds the page/layer/object tree
     connect(m_c,&Canvas::selectionChanged,this,[this]{ if(m_block) return; m_block=true;
         // Highlight the tree rows matching the canvas selection without a full rebuild.
         const auto sel=m_c->selection(); QSet<int> ss(sel.begin(),sel.end());
@@ -512,7 +521,7 @@ BitmapGallery::BitmapGallery(Canvas* c,QWidget* parent):QWidget(parent),m_c(c){
     auto* V=new QVBoxLayout(this); V->setContentsMargins(8,8,8,8); V->setSpacing(6);
     V->addWidget(new QLabel("Embedded bitmaps — click to select"));
     m_host=new QWidget; V->addWidget(m_host); V->addStretch();
-    connect(m_c,&Canvas::documentChanged,this,&BitmapGallery::refresh);
+    connect(m_c,&Canvas::documentChangedDebounced,this,&BitmapGallery::refresh);   // debounced: scans the bitmap list
     refresh();
 }
 void BitmapGallery::refresh(){

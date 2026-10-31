@@ -44,7 +44,9 @@ bool Raw::available(){ return loader().ok; }
 
 QStringList Raw::extensions(){
     return { "cr2","cr3","crw","nef","nrw","arw","srf","sr2","dng","orf","rw2","raf",
-             "pef","srw","kdc","dcr","mrw","x3f","3fr","mef","mos","iiq","rwl","raw","erf" };
+             "pef","srw","kdc","dcr","mrw","x3f","3fr","mef","mos","iiq","rwl","raw","erf",
+             // Further formats LibRaw's decoder already handles by content — just route the extensions.
+             "fff","ptx","cap","bay","dcs","drf","k25","kc2","ori","pxn","mdc","arq","qtk" };
 }
 bool Raw::isRawFile(const QString& path){
     return extensions().contains(QFileInfo(path).suffix().toLower());

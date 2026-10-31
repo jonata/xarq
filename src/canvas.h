@@ -4,6 +4,8 @@
 // undo/redo, and emits signals so the side panels stay in sync.
 #pragma once
 #include <QWidget>
+#include <QImage>
+#include <QSet>
 #include <functional>
 #include "model.h"
 #include "pathedit.h"
@@ -25,6 +27,13 @@ public:
     const Document& doc() const { return m_doc; }
     void setDocument(const Document& d, const QString& path=QString());
 
+    // One undo/redo level = a copy-on-write snapshot of the document + selection. Storing the live
+    // Document (Qt's implicitly-shared containers) instead of a JSON blob makes pushUndo O(1) at the
+    // push (a ref bump); the O(N) detach happens lazily on the next mutation. This matters on heavy
+    // imports (a 9k-object .cdr): JSON-serialising the whole doc on every drag-start froze the UI for
+    // hundreds of ms. The stack is in-memory only (never written to disk), so a binary snapshot is fine.
+    struct UndoSnap { Document doc; QVector<int> sel; };
+
     // Multi-document tabs: the full per-document editing state, so MainWindow can stash an
     // inactive tab and restore it later into this one shared Canvas. Transient interaction
     // state (crop/clone/mask/pen/node/mould drags) is NOT part of a Session — it resets on load.
@@ -32,7 +41,7 @@ public:
         Document doc;
         QString  path;
         QVector<int> sel;
-        QVector<QByteArray> undo, redo;
+        QVector<UndoSnap> undo, redo;
         int    activeLayer = 0;
         double zoom = 1.0;
         QPointF origin{60, 60};
@@ -172,6 +181,12 @@ public:
     // font and/or colour and/or hyperlink (null = leave unchanged). Materialises & re-coalesces runs.
     void setTextRunAttr(int start, int len, const QFont* font, const QColor* color, const QString* url=nullptr);
     void setTextRunTypography(int start, int len, double baseline, double tracking);   // per-run super/subscript + letter-spacing
+    // Inkscape-style: if text is being edited on-canvas with an active selection, format ONLY that character range
+    // (font and/or colour), then re-coalesce runs. Returns true iff it handled it — the InfoBar/palette then skips
+    // its whole-object path. `mut` receives each selected character's font & colour by reference.
+    bool formatEditSelection(const std::function<void(QFont&,QColor&)>& mut, const QString& label);
+    QFont editSelectionFont() const;   // resolved font of the edit selection's first char (for toggles); else base font
+    bool  hasTextEditSelection() const { return editingText() && textHasSelection(); }
     void setTextSpacing(double lineSpacing, double tracking);        // per-object leading + letter-spacing
     void setTextIndents(double firstLine, double left, double right); // per-object paragraph indents (doc px)
     void setTextTabWidth(double w);                                  // per-object tab-stop interval (doc px; 0 = off)
@@ -230,6 +245,7 @@ public:
     void   skewSelection(double hDeg, double vDeg);      // shear the selection about its centre (incremental)
     void   autoFitToPage(bool bothAxes);                 // scale all objects to fit the page (width-only, or width+height)
     bool   replacePhotoAt(const QPointF& docPt, const QImage& img);  // drop an image onto a photo → swap the fill image (keep frame)
+    int    placeBitmap(const QImage& img, const QPointF& centerDoc, const char* undoLabel);  // new photo object centred at centerDoc (shared by paste & drop); returns its index or -1
     QString webTitle() const { return m_doc.webTitle; }
     QString webDescription() const { return m_doc.webDescription; }
     QString webKeywords() const { return m_doc.webKeywords; }
@@ -293,17 +309,83 @@ public:
     void   setSelectedNodeType(int type);                 // 0 cusp / 1 smooth / 2 symmetric on the grabbed node or selection
     int    activeNodeSub() const { return m_nodeSub; }    // -1 if none grabbed
     void refreshAll(){ update(); emit documentChanged(); emit selectionChanged(); }   // repaint + notify panels after an external doc edit
+    // Perf instrument (headless test/benchmark): average ms of one uncached backdrop render vs one
+    // cached-blit + overlay render, on the currently loaded document at the current size.
+    struct RenderProbe { double fullMs = 0, cachedMs = 0; };
+    RenderProbe renderProbe(int iters);
+    void setCullEnabled(bool b){ m_cullEnabled = b; m_cacheDirty = true; update(); }   // viewport culling of offscreen shapes (on by default)
+    bool cullEnabled() const { return m_cullEnabled; }
+    void setDragProxyEnabled(bool b){ m_dragProxyEnabled = b; if(!b) clearDragProxy(); }   // bitmap drag proxy (on by default)
+    bool dragProxyEnabled() const { return m_dragProxyEnabled; }
+    bool dragProxyActive() const { return m_dragProxyActive; }   // test/introspection hook
+    // Headless perf probe: with the current selection, simulate a small move drag, build the proxy, and
+    // time N proxy-composite frames vs N full-document-rebuild frames. Returns false if the proxy didn't
+    // activate (nothing selected / ineligible). proxyMs & fullMs receive the per-frame millisecond costs.
+    bool dragProxyProbe(int iters, double& proxyMs, double& fullMs);
+    // Headless probe isolating the selection-outline cost: times drawSelection with the drag-start outline
+    // cache (cachedMs) vs the per-frame path rebuild (rebuiltMs). Returns false if the proxy didn't build.
+    bool dragOutlineProbe(int iters, double& cachedMs, double& rebuiltMs);
+    double snapAdjustProbeMs(int iters);   // headless: mean ms of one move-frame's snapAdjust over the current selection
     void addShapes(const QVector<Shape>& s, const QString& label);   // insert + select + undo (galleries/clipart)
     bool importImage(const QString& path);                           // place an image file as a photo object
     bool importAnimatedGif(const QString& path);                     // one layer (frame) per GIF frame → editable animation
     bool importRtfFile(const QString& path);                         // read an .rtf file into a styled Text shape
     bool importSvgFile(const QString& path);                         // parse an SVG file into editable shapes
+    void warnMissingFonts(const QVector<Shape>& shapes);             // status-bar notice if a needed font isn't installed in this session
+    static QStringList substitutedFontFamilies(const QVector<Shape>& shapes);  // distinct Text families Qt substituted (not resolvable this session)
     bool importEpub(const QString& path);                            // import an EPUB e-book → one editable text page per chapter
     bool importDocx(const QString& path);                            // import a .docx → an editable text frame (paragraphs/runs)
+    bool importFb2(const QString& path);                             // import a FictionBook .fb2 (+.fb2.zip) → an editable text frame
     bool importCdr(const QString& path);                             // import a CorelDRAW .cdr preview bitmap (best-effort placeholder)
     bool mailMerge(const QString& csvPath);                          // data merge: current page = template with {{Field}} → one page per CSV row
     bool insertQrCode(const QString& text);                          // insert a QR code (via libqrencode) as a bitmap object
     bool importVectorFile(const QString& path);                      // EPS/AI/PDF vector import (Module 3) → editable shapes
+    bool importCbz(const QString& path);                             // comic-book archive (.cbz zip of images) → one page per image
+    bool importCbr(const QString& path);                             // comic-book archive (.cbr/.cb7/.cbt via libarchive) → one page per image
+    bool importGeoJson(const QString& path);                         // GeoJSON geometry → editable vector paths
+    bool importKml(const QString& path);                             // KML / KMZ geometry → editable vector paths
+    bool importHpgl(const QString& path);                            // HP-GL/2 plotter file → editable vector paths
+    bool importApng(const QString& path);                            // animated PNG → one layer (frame) per animation frame
+    bool importOdg(const QString& path);                             // OpenDocument Drawing (.odg) → editable shapes
+    bool importWpg(const QString& path);                             // WordPerfect Graphics (.wpg) → editable vectors (via libwpg)
+    bool importVisio(const QString& path);                           // Microsoft Visio (.vsd/.vsdx/.vdx…) → editable vectors (via libvisio)
+    bool importFreehand(const QString& path);                        // Macromedia/Adobe FreeHand (.fh*) → editable vectors (via libfreehand)
+    bool importMsPub(const QString& path);                           // Microsoft Publisher (.pub) → editable vectors (via libmspub)
+    bool importPageMaker(const QString& path);                       // Adobe/Aldus PageMaker (.pmd/.p65) → editable vectors (via libpagemaker)
+    bool importZmf(const QString& path);                             // Zoner Draw / Callisto (.zmf) → editable vectors (via libzmf)
+    bool importQxp(const QString& path);                             // QuarkXPress (.qxp/.qxd) → editable vectors (via libqxp)
+    bool importStarOffice(const QString& path);                      // StarOffice StarDraw/StarImpress (.sda/.sdd) → editable vectors (via libstaroffice)
+    bool importIWork(const QString& path);                           // Apple iWork Keynote (.key) → editable vectors (via libetonyek)
+    bool importMwaw(const QString& path);                            // legacy Mac MacDraw/ClarisDraw → editable vectors (via libmwaw)
+    bool importOgr(const QString& path);                             // GDAL/OGR geospatial vector (DGN/MapInfo/GeoPackage/S-57/GML) → editable paths
+    bool importDot(const QString& path);                             // Graphviz DOT graph → laid-out editable vectors (via libgvc)
+    bool importOra(const QString& path);                             // OpenRaster (.ora) → one editable photo per layer (stack.xml)
+    bool importKra(const QString& path);                             // Krita (.kra) → flattened composite (mergedimage.png)
+    bool importWmfFile(const QString& path);                         // Windows Metafile (.wmf): libwmf → SVG (falls back to the native prepress parser)
+    bool importShapefile(const QString& path);                       // ESRI Shapefile (.shp) geometry → editable vector paths (native)
+    bool importGpx(const QString& path);                             // GPX (GPS Exchange) tracks/routes/waypoints → editable vectors (native)
+    bool importXfig(const QString& path);                            // Xfig (.fig) drawing → editable vectors (native)
+    bool importCgm(const QString& path);                             // CGM binary (ISO 8632) → editable vectors (native)
+    bool importSvgz(const QString& path);                            // gzipped SVG (.svgz) → editable shapes (native inflate → SVG parser)
+    bool importCmx(const QString& path);                             // Corel Presentation Exchange (.cmx) → editable vectors (via libcdr CMXDocument)
+    bool importGerber(const QString& path);                          // Gerber RS-274X PCB image → editable vector paths/pads (native)
+    bool importExcellon(const QString& path);                        // Excellon/XNC PCB drill file → editable circles (native)
+    bool importLottie(const QString& path);                          // Lottie/Bodymovin animation → static first-frame editable shapes (native)
+    bool importSketch(const QString& path);                          // Sketch (.sketch) first page → editable shapes (native)
+    bool importTgs(const QString& path);                             // Telegram sticker (.tgs, gzipped Lottie) → static editable shapes (native)
+    bool importTopoJson(const QString& path);                        // TopoJSON → editable vector paths (native)
+    bool importVml(const QString& path);                             // VML (.vml legacy MS vector markup) → editable shapes (native)
+    bool importXps(const QString& path);                             // XPS / OpenXPS (.xps/.oxps) first page → editable shapes (native)
+    bool importScribus(const QString& path);                         // Scribus (.sla/.scd) → editable shapes (native)
+    bool importAffinity(const QString& path);                        // Serif Affinity (.afdesign/.afphoto/.afpub/.aftemplate/.af) → editable shapes (native)
+private:
+    bool importComicEntries(const QMap<QString,QByteArray>& entries, const QString& srcName);  // shared CBZ/CBR page builder
+    void placeZipComposite(const QImage& img, const QString& name, const QString& undoLabel);   // place a flattened bitmap as one photo
+    // Shared consumer for the librevenge-backed vector importers (CDR/WPG/Visio/FreeHand/Publisher):
+    // one standard-SVG string per page → parseSvg, multi-page stacked vertically, added as one undo-able import.
+    bool importVectorSvgPages(const QStringList& pages, const QString& undoLabel,
+                              const QString& statusVerb, const QString& viaLib);
+public:
     bool dropImportByExtension(const QString& path);                 // route a dropped file to its importer (svg/pdf/epub/docx/cdr/rtf/gif/xar)
     bool stitchSelectedPhotos();                                     // merge selected overlapping photos into one panorama
     bool traceBitmapSelection();                                     // vectorise the selected photo/bitmap (Trace Bitmap)
@@ -363,6 +445,9 @@ public:
     bool correctPerspective(int si, double kv, double kh);// photo keystone/perspective correction (projective warp; kv=vertical, kh=horizontal)
     void replaceColorInSelection(const QColor& from, const QColor& to, int tol);// swap one colour (within tolerance) for another
 
+    int  selOutlineElemsForTest(){ ensureSelOutlineCache(); return m_selOutlineDoc.elementCount(); }   // --selftest: build+measure the cached silhouette
+    bool selCacheValidForTest() const { return m_selCacheValid; }                                       // --selftest: is the outline cache warm?
+    QRectF selBoundsForTest(){ ensureSelOutlineCache(); return m_selBoundsDoc; }                         // --selftest: the cached selection box
     // selection geometry (for the InfoBar position/size/rotation fields)
     QRectF selectionBoundsDoc() const { return selBoundsDoc(); }
     double selectionRotation() const;          // degrees, from the first selected shape
@@ -374,6 +459,10 @@ public:
     void zoomToRect(const QRectF& docR);  // fit a doc rectangle to the view (marquee zoom)
     void zoomToSelection(); void zoomToDrawing(); void previousZoom();
     double zoom() const { return m_zoom; }
+    void   benchForceCrisp(){ m_previewZoom = false; m_cacheDirty = true; }   // --zoombench only: measure the full crisp repaint, not the preview blit
+    bool   previewActiveForTest() const { return m_previewZoom; }             // --previewshot only: is the bitmap-preview path armed?
+    void   enterGroupForTest(int topIndex){ enterGroup(topIndex,-1); }        // --groupshot only: enter a top-level group (isolation fade)
+    int    firstTopLevelGroup() const { for(int i=0;i<m_doc.shapes.size();++i) if(m_doc.shapes[i].type==ShapeType::Group) return i; return -1; }
 
     void lockSelection(); void unlockSelection();    // Shape.locked: locked objects can't be moved/edited
     // layers
@@ -442,6 +531,10 @@ public:
     void addPage(); void deletePage(int i); void duplicatePage(int i); void gotoPage(int i);
 
     QPointF mapToView(QPointF docPt) const { return toView(docPt); }  // test helper (--selftest)
+    void openRadialForShot(int hoverRing=1, int hoverIdx=1);           // debug/screenshot: force the Ctrl pie open (XARA_RADIAL)
+    int  radialCount(int ring) const { return ring==0? m_radialInner.size() : ring==1? m_radialOuter.size() : 0; }   // --selftest
+    int  radialHitProbe(const QPointF& v, int& ring) const { return radialHitTest(v,ring); }                          // --selftest
+    void radialForceClose();                                                                                          // --selftest (defined in canvas_radial.inc; QTimer is incomplete here)
     static QPointF constrainSquareCorner(const QPointF& a, const QPointF& b);  // Ctrl-draw: square/circle box
     static QPointF constrainLineAngle(const QPointF& a, const QPointF& b);     // Ctrl-draw: snap line to 15°
 
@@ -458,7 +551,9 @@ public:
     bool saveSnapshot(const QString& path) const;   // write the doc WITHOUT changing the file path (autosave/recovery)
     bool saveCompressed(const QString& path);        // write a deflate-compressed .xar (smaller on disk)
     bool exportPng(const QString& path, int scale=2);
-    bool exportRaster(const QString& path, int areaMode, double scale, int quality, bool transparent, bool indexed=false, bool dither=false);  // Export dialog engine (area/scale/quality/matte + palette optimiser)
+    bool exportRaster(const QString& path, int areaMode, double scale, int quality, bool transparent, bool indexed=false, bool dither=false, int pageIndex=-1);  // Export dialog engine (area/scale/quality/matte + palette optimiser); pageIndex: which page for areaMode==Page (-1 = current)
+    QRectF exportAreaRect(int areaMode, int pageIndex=-1);                                        // doc-space rect for a given export area (Page/Drawing/Selection)
+    QImage exportRasterImage(int areaMode, double scale, bool transparent, int pageIndex=-1, int maxDim=0);  // render the area to an ARGB image (no encoding); maxDim>0 caps the longest side (for live preview)
     bool exportSvg(const QString& path);
     bool exportEps(const QString& path);   // Encapsulated PostScript (prepress interchange)
     bool exportPdf(const QString& path);
@@ -478,20 +573,29 @@ public:
 signals:
     void selectionChanged();
     void documentChanged();
+    // Coalesced form of documentChanged: emitted immediately for one-off edits, but debounced (~45 ms)
+    // while a live drag is firing documentChanged every frame. Heavy O(N) galleries/panels connect here
+    // so a move/resize of a big selection doesn't rebuild the whole Layers/Name/Colour trees per frame.
+    void documentChangedDebounced();
     void toolChanged(Tool t);
     void zoomChanged(double z);
     void mouseDoc(QPointF docPt);
     void statusMessage(QString s);
     void unitsChanged();
+    void fileImported(const QString& path);   // a file was dropped onto the canvas & imported → MainWindow records it in Recent Files
 
 protected:
     void paintEvent(QPaintEvent*) override;
+    void paintBackdrop(QPainter& g);          // background + pages + grid + document layer — the expensive, cacheable part
+    void paintOverlays(QPainter& g);          // guides, selection, tool handles, crop/straighten, rulers — cheap, drawn every frame
+    bool manipulatingContent() const;         // a live drag is mutating document geometry ⇒ the doc cache must be rebuilt this frame
     void mousePressEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void mouseReleaseEvent(QMouseEvent*) override;
     void mouseDoubleClickEvent(QMouseEvent*) override;
     void wheelEvent(QWheelEvent*) override;
     void keyPressEvent(QKeyEvent*) override;
+    void keyReleaseEvent(QKeyEvent*) override;   // Ctrl release commits the radial ("pie") menu selection
     bool event(QEvent*) override;   // steal ShortcutOverride for editing keys (Delete/Ctrl+A/…) while a text caret is active
     void contextMenuEvent(class QContextMenuEvent*) override;   // right-click object/selection/pasteboard menu
     void dragEnterEvent(QDragEnterEvent*) override;   // accept a dragged colour swatch
@@ -521,13 +625,14 @@ public:
     int  meshCorner() const { return m_meshCorner; }
     int  hitShape(const QPointF& docPt) const;                    // topmost object under docPt (public for --selftest)
     int  hitShapeBehind(const QPointF& docPt, int above) const;   // Alt+click: cycle down the z-stack under the cursor
+    QTransform viewXf() const;                                    // doc→view (translate + uniform zoom, no rotation)
+    QPointF toDoc(const QPointF& w) const;                        // view/widget → document coords
+    QPointF toView(const QPointF& d) const;                       // document → view/widget coords
 private:
-    QTransform viewXf() const;
-    QPointF toDoc(const QPointF& w) const;
-    QPointF toView(const QPointF& d) const;
 
     Handle hitHandle(const QPointF& widgetPt) const;
     QVector<QPointF> handlePoints() const;
+    QVector<QPointF> handlePointsForRect(const QRectF& viewRect) const;   // 8 bbox handles + rotate stem, from a view-space rect
     bool smartHandle(QPointF& outView) const;   // view pos of the SmartShape param handle (single Smart selected)
     QVector<QPointF> meshCornerLocals(const Shape& s) const;   // the 4 mesh corner positions in shape-local space
     int  hitMeshCorner(const QPointF& widgetPt) const;         // which mesh corner swatch is under the cursor (-1 none)
@@ -615,6 +720,11 @@ private:
     double  m_prevZoom = 1.0; QPointF m_prevOrigin{60,60}; bool m_hasPrevZoom = false;   // Previous Zoom
 
     bool    m_dragging = false, m_panning = false, m_rotating=false;
+    bool    m_pressMoved = false;       // has the mouse moved (with a button held) since the last press? — a plain
+                                        // click keeps this false so manipulatingContent() stays false and the
+                                        // cached document is reused (no full re-raster just to add a selection)
+    bool    m_moveUndoPending = false;  // a body-drag was armed on press; push the "Move" undo only on the first
+                                        // actual move, so a plain click doesn't serialise the whole document
     QPointF m_pressView, m_lastView, m_pressDocPt, m_panStart;
     Handle  m_activeHandle = HNone;
     QRectF  m_dragStartBounds;
@@ -662,6 +772,65 @@ private:
     int     m_tacLimit = 300;                          // ink limit in % (300 = typical coated-stock TAC)
     double  m_gridStep = 37.795275;   // 1 cm @96dpi
     bool    m_gridIso = false;         // isometric grid mode
+
+    // ---- screen-render cache (perf) --------------------------------------
+    // The backdrop + document (paintBackdrop) is expensive; it only changes when the document, the view
+    // transform, the widget size or a view-mode toggle changes. Cache it and, on overlay-only repaints
+    // (mouse hover, selection, guides, coordinate readout, rulers, crop/straighten), just blit the cache
+    // and redraw the cheap overlays. Screen-only — the export path (paintDocument) is never cached.
+    struct DocCacheKey {
+        QTransform xf; QRectF pagesRect; double gridStep=0; unsigned pageColor=0;
+        int tacLimit=0, pageCount=0;
+        bool outline=false, softProof=false, gamut=false, tac=false, grid=false, gridIso=false;
+        int  enterTop=-1;   // top-level index of the entered group (-1 = not in group-isolation), for the fade overlay
+        bool operator==(const DocCacheKey& o) const {
+            return xf==o.xf && pagesRect==o.pagesRect && gridStep==o.gridStep && pageColor==o.pageColor
+                && tacLimit==o.tacLimit && pageCount==o.pageCount && outline==o.outline && softProof==o.softProof
+                && gamut==o.gamut && tac==o.tac && grid==o.grid && gridIso==o.gridIso && enterTop==o.enterTop; }
+    };
+    QImage      m_screenCache;              // cached backdrop+document at device pixels; reused across overlay-only frames
+    DocCacheKey m_cacheKey;                 // view/mode key the cache was built for
+    bool        m_cacheDirty = true;        // document content changed ⇒ the cache must be rebuilt
+    bool        m_cullEnabled = true;       // skip rasterising shapes wholly outside the viewport (canvas only)
+    DocCacheKey currentCacheKey() const;
+    // Interactive-zoom bitmap preview. A full-quality repaint of a busy document at high zoom can take ~1s and
+    // blocks the event loop, freezing the UI. While a wheel-zoom gesture is live we DON'T re-render the document:
+    // we blit the last rendered backdrop (m_screenCache), transformed from the view it was rendered at to the
+    // current view — an instant scaled preview. A debounce timer then does ONE crisp re-render after motion
+    // settles. Only armed when the previous full frame was actually slow, so light docs re-render crisply every
+    // frame (no pixelated "pop").
+    bool        m_previewZoom = false;      // this frame is an interactive scaled-bitmap preview (no document re-render)
+    double      m_lastBackdropMs = 0.0;     // wall-clock of the last full backdrop rebuild (adaptive preview trigger)
+    QTimer*     m_zoomSettleTimer = nullptr;// fires ~150 ms after the last zoom step → clear preview + one crisp repaint
+    void        noteZoomPanInteraction();   // call on each wheel/interactive-zoom step to arm the preview + settle timer
+
+    // --- Drag proxy (dynamic-object layer) ---------------------------------------------------------
+    // While a whole-selection affine drag (move / resize / rotate / skew) is in progress, every selected
+    // shape's transform is startXf·M for a SINGLE shared doc-space matrix M. So the moving selection is a
+    // fixed picture captured once into m_dragMovingProxy; each frame we blit the static rest of the document
+    // (m_dragStaticProxy) and draw the moving bitmap under S = viewInv·M·view. No per-frame vector re-raster.
+    bool       m_dragProxyActive = false;   // proxy built and in use this drag
+    bool       m_dragProxyTried  = false;   // build attempted this drag (don't retry every frame if ineligible/too big)
+    bool       m_dragProxyEnabled = true;   // master toggle (test/opt-out)
+    QImage     m_dragStaticProxy;           // screen-sized: full backdrop with the moving shapes skipped
+    QImage     m_dragMovingProxy;           // object-bounds bitmap: only the moving shapes, at build-time geometry
+    QPointF    m_dragProxyOrigin;           // logical (view) top-left where m_dragMovingProxy sat at build time
+    QTransform m_dragProxyBaseXf;           // reference target's transform at build time (M = base⁻¹·current)
+    QTransform m_dragProxyViewXf;           // view transform at build time (bail out if zoom/pan changes mid-drag)
+    QSize      m_dragProxyViewSize;         // widget size at build time (bail out on resize mid-drag)
+    QSet<const void*> m_dragProxySkip;      // honoured by paintBackdrop's document layer when building the static proxy
+    QPainterPath m_dragSelOutline;          // selection silhouette captured (doc space) at drag start; drawSelection remaps it
+                                            // by M each frame instead of rebuilding each shape's (heavy group) path — see drawSelection
+    // Static (non-drag) selection-outline cache: the doc-space selection/entered-group silhouette + its bounds, built
+    // ONCE per selection/doc change and reused across the many overlay repaints (e.g. every Ctrl+Alt pie-hover frame).
+    // Without it, drawSelection rebuilt the whole group's QPainterPath via Shape::localPath() EVERY frame → a repaint
+    // storm that froze the UI on a big grouped document while the pie was open. Overlay-only; never in the export path.
+    QPainterPath m_selOutlineDoc; QRectF m_selBoundsDoc; bool m_selCacheValid=false;
+    void       ensureSelOutlineCache();     // (re)build m_selOutlineDoc/m_selBoundsDoc when invalid
+    bool       dragProxyEligible() const;   // is the current gesture a proxy-able whole-selection affine drag?
+    bool       buildDragProxies();          // capture static + moving bitmaps; false ⇒ ineligible/too big (fall back)
+    void       clearDragProxy();            // drop the proxy bitmaps and force a full re-render next paint
+    void       paintDragProxy(QPainter& g); // blit static + transformed moving bitmap + overlays
     QVector<double> m_guideX, m_guideY;   // active smart-guide lines (doc coords) during a drag
     QVector<double> m_guideHpos, m_guideVpos;   // persistent user guides (doc coords)
     enum GuideDrag { GDNone, GDNewH, GDNewV, GDMoveH, GDMoveV };
@@ -701,6 +870,23 @@ private:
     bool    m_spellLive = true;                          // draw live spell-check squiggles under misspelled words
     bool    m_outlineView = false;                       // wireframe/outline view mode (screen only)
     QTimer* m_caretTimer = nullptr;
+    QTimer* m_docDebounceTimer = nullptr;   // coalesces per-frame documentChanged into documentChangedDebounced during drags
+
+    // ---- Ctrl radial ("pie" / marking) menu: inner ring = tools, outer ring = the active tool's actions ----
+    struct RadialItem { QString label; std::function<void()> action; bool current=false; int toolId=-1; QString iconName; };  // toolId>=0 → tool icon; else iconName → glyph; else the text label
+    bool    m_radialActive=false;                // the pie is currently shown
+    QPointF m_radialCenter;                      // where it opened (widget/view coords)
+    QVector<RadialItem> m_radialInner, m_radialOuter;
+    int     m_radialRing=-1, m_radialIndex=-1;   // hovered wedge: ring 0=tools,1=actions; index within it (-1 = none)
+    QTimer* m_radialTimer=nullptr;               // press-and-hold delay before the pie appears (distinguishes Ctrl+key combos)
+    void radialArm();                            // Ctrl pressed idle → start the hold timer
+    void radialDisarm();                         // cancel a pending / open pie without acting
+    void radialShowAtCursor();                   // timer fired → build items + show at the cursor
+    void radialHide(bool activate);              // close; activate the hovered wedge if `activate`
+    void radialHover(const QPointF& viewPt);     // update the hovered wedge from the cursor position
+    int  radialHitTest(const QPointF& viewPt, int& ringOut) const;
+    void radialBuildItems();                     // populate inner (tools) + outer (active tool's actions)
+    void drawRadialMenu(QPainter& g);            // paint the two-ring pie (called from paintOverlays)
     void    textReplaceRange(int a, int b, const QString& ins);   // core edit: replace [a,b) with ins, undoable
     void    syncTextEditToDoc();   // after any doc-replacing op: drop the caret if its shape is gone / not text; else clamp
     void    resetTextEdit();   // clear all caret state + stop the blink timer (out-of-line: QTimer is fwd-declared here)
@@ -720,11 +906,11 @@ private:
     // structurally (delete/reorder/reload) so a stale m_mouldShape can't bake onto the wrong object.
     void    invalidateMould(){ m_mouldShape=-1; m_mouldDrag=-1; m_mouldHasSource=false; }
 
-    QVector<QByteArray> m_undo, m_redo;
+    QVector<UndoSnap> m_undo, m_redo;
     QStringList m_undoLabels, m_redoLabels;   // parallel to m_undo/m_redo: the op name at each level (named undo/redo)
     QByteArray m_clip;          // in-app clipboard (JSON array of shapes)
-    QByteArray serialize() const;
-    void deserialize(const QByteArray& b);
+    UndoSnap captureSnap() const;             // cheap COW snapshot of doc+selection (replaces the old JSON serialize)
+    void applyUndoSnap(const UndoSnap& s);    // restore a snapshot (replaces the old JSON deserialize)
 };
 
 } // namespace xara

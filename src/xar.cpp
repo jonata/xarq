@@ -227,16 +227,26 @@ struct Writer {
         return s;
     }
 
-    // Embed a bitmap (once) as a PNG DEFINEBITMAP record and return its record sequence number.
+    // Embed a bitmap (once) as a DEFINEBITMAP record and return its record sequence number. `src` (optional) is the
+    // ORIGINAL encoded file bytes (e.g. from an SVG import) — writing them verbatim avoids a slow zlib PNG re-encode
+    // per image (which froze save/autosave/recovery on image-heavy documents). Only formats the reader accepts as a
+    // DEFINEBITMAP (PNG/JPEG/GIF, sniffed by magic bytes) are reused; anything else falls back to a PNG encode.
     QHash<qint64,qint32> bitmapSeq;
-    qint32 bitmapRef(const QImage& img){
+    qint32 bitmapRef(const QImage& img, const QByteArray& src=QByteArray()){
         qint64 k = img.cacheKey();
         auto it = bitmapSeq.find(k);
         if(it!=bitmapSeq.end()) return it.value();
-        QByteArray png; QBuffer buf(&png); buf.open(QIODevice::WriteOnly); img.save(&buf,"PNG"); buf.close();
+        qint32 tag = TAG_DEFINEBITMAP_PNG; QByteArray body;
+        if(src.size()>=4){
+            const uchar* p = reinterpret_cast<const uchar*>(src.constData());
+            if(p[0]==0x89 && p[1]=='P' && p[2]=='N' && p[3]=='G'){ tag=TAG_DEFINEBITMAP_PNG;  body=src; }
+            else if(p[0]==0xFF && p[1]==0xD8){                     tag=TAG_DEFINEBITMAP_JPEG; body=src; }
+            else if(p[0]=='G' && p[1]=='I' && p[2]=='F'){          tag=TAG_DEFINEBITMAP_GIF;  body=src; }
+        }
+        if(body.isEmpty()){ QBuffer buf(&body); buf.open(QIODevice::WriteOnly); img.save(&buf,"PNG"); buf.close(); tag=TAG_DEFINEBITMAP_PNG; }
         QByteArray d; wUniZ(d, QStringLiteral("img"));   // UTF-16LE null-terminated name
-        d.append(png);                                    // then the raw PNG file bytes
-        qint32 s = rec(TAG_DEFINEBITMAP_PNG, d);
+        d.append(body);                                   // then the raw image-file bytes
+        qint32 s = rec(tag, d);
         bitmapSeq.insert(k, s);
         return s;
     }
@@ -269,7 +279,7 @@ struct Writer {
         case FillType::Radial: emitGrad(TAG_CIRCULARFILL, TAG_CIRCULARFILLMULTISTAGE); break;
         case FillType::Bitmap: {
             if(f.image.isNull()){ QByteArray d; wI32(d, colourRef(f.contone? f.color : QColor(150,150,150))); rec(TAG_FLATFILL,d); break; }
-            qint32 bref = bitmapRef(f.image);             // emit the embedded bitmap (defined before this fill)
+            qint32 bref = bitmapRef(f.image, f.imageSrc);  // emit the embedded bitmap (reuse the original bytes if we have them)
             QPointF p0=xf.map(f.p0), p1=xf.map(f.p1), p2=xf.map(f.p2);
             QByteArray d;
             wI32(d,toX(p0.x())); wI32(d,toY(p0.y())); wI32(d,toX(p1.x())); wI32(d,toY(p1.y())); wI32(d,toX(p2.x())); wI32(d,toY(p2.y()));
@@ -437,8 +447,10 @@ bool saveXar(const Document& doc, const QString& path, bool compress){
     w.rec(TAG_UP);
     // Private lossless sidecar: the full document as compressed JSON, so XarQ round-trips
     // everything the standard XAR records above can't carry. Skipped by other readers.
+    // Level 1, not 9: the sidecar is dominated by base64 of already-compressed image bytes (imgsrc), which is
+    // incompressible — level 9 spends many extra seconds for no size win on image-heavy docs, and text is tiny.
     { const QByteArray json = QJsonDocument(doc.toJson()).toJson(QJsonDocument::Compact);
-      w.rec(TAG_XSTUDIO_DOC, qCompress(json, 9)); }
+      w.rec(TAG_XSTUDIO_DOC, qCompress(json, 1)); }
     if(compress){
         // Deflate the record body (everything after FILEHEADER) into a Xara STARTCOMPRESSION stream.
         QByteArray body = w.out.mid(headLen);

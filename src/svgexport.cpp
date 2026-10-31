@@ -199,7 +199,8 @@ QByteArray writeSvg(const QVector<Shape>& shapes, QRectF vb) {
             const int n2=s.text.size(); int i=0;
             while(i<n2){ int j=i+1; while(j<n2 && fonts[j]==fonts[i] && cols[j]==cols[i] && urls[j]==urls[i] && bl[j]==bl[i]) ++j;
                 QString span="<tspan fill=\""+cols[i].name()+"\" font-family=\""+esc(fonts[i].family())+"\" font-size=\""+n(fontSize(fonts[i]))+"\"";
-                if(fonts[i].bold()) span+=" font-weight=\"bold\""; if(fonts[i].italic()) span+=" font-style=\"italic\"";
+                if(fonts[i].weight()!=QFont::Normal) span+=" font-weight=\""+QString::number(fonts[i].weight())+"\"";   // numeric weight preserves Heavy/Black (900), not just Bold
+                if(fonts[i].italic()) span+=" font-style=\"italic\"";
                 if(bl[i]!=0.0) span+=" baseline-shift=\""+n(bl[i])+"\"";       // per-run super/subscript
                 if(fonts[i].letterSpacingType()==QFont::AbsoluteSpacing && fonts[i].letterSpacing()!=0.0) span+=" letter-spacing=\""+n(fonts[i].letterSpacing())+"\"";
                 span+=">"+esc(s.text.mid(i,j-i))+"</tspan>";
@@ -212,7 +213,7 @@ QByteArray writeSvg(const QVector<Shape>& shapes, QRectF vb) {
             QFontMetricsF fm(s.font);           // simple single-line point text stays editable <text>
             body += ind+"<text x=\"0\" y=\""+n(fm.ascent())+"\" font-family=\""+esc(s.font.family())
                  +"\" font-size=\""+n(fontSize(s.font))+"\"";
-            if (s.font.bold())   body += " font-weight=\"bold\"";
+            if (s.font.weight()!=QFont::Normal) body += " font-weight=\""+QString::number(s.font.weight())+"\"";
             if (s.font.italic()) body += " font-style=\"italic\"";
             body += fa+op+tr+">"+esc(s.text)+"</text>\n";
         } else {                                 // Path / Polygon / Smart / complex Text -> outlined <path>

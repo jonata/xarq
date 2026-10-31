@@ -9,6 +9,9 @@
 #include "render.h"
 #include "splash.h"
 #include <QtWidgets>
+#include <QBuffer>
+#include <QImageWriter>
+#include <QPainter>
 #include <QStackedWidget>
 #include <QDesktopServices>
 #include <QUrl>
@@ -28,11 +31,134 @@
 #include "xar.h"
 #include "icc.h"
 #include "raw.h"
+#include "rasterextra.h"
+#include "extcodecs.h"
 #include "startscreen.h"
 
 namespace xara {
 
+namespace {
+// Make a floating canvas overlay fully transparent until the pointer is over its area, then fade it in.
+// The filter is installed on the widget AND every descendant, so gliding between child buttons never
+// flickers; on leaving, a short delay re-checks the cursor against the whole widget rect before fading out.
+class HoverReveal : public QObject {
+public:
+    // peer: an optional sibling (e.g. a resize grip) that ALSO reveals the target and counts as "inside" —
+    // so a large auto-hide panel can be re-summoned from a thin edge handle.
+    HoverReveal(QWidget* target, double idle=0.0, double active=1.0, int fadeMs=140, QWidget* peer=nullptr)
+        : QObject(target), m_target(target), m_peer(peer), m_idle(idle), m_active(active) {
+        m_fx = new QGraphicsOpacityEffect(target); m_fx->setOpacity(idle);
+        target->setGraphicsEffect(m_fx);                       // replaces any prior effect (e.g. a drop shadow)
+        m_anim = new QPropertyAnimation(m_fx, "opacity", this); m_anim->setDuration(fadeMs);
+        m_leave.setSingleShot(true); m_leave.setInterval(90);
+        connect(&m_leave, &QTimer::timeout, this, [this]{ if(!cursorInside()) fade(m_idle); });
+        m_hold.setSingleShot(true);                            // after a programmatic poke(), auto-hide unless engaged
+        connect(&m_hold,  &QTimer::timeout, this, [this]{ if(!cursorInside()) fade(m_idle); });
+        install(target);
+        if(m_peer) install(m_peer);
+    }
+    // Programmatically reveal (e.g. a menu opened the panel), then auto-hide after holdMs unless the pointer engages.
+    void poke(int holdMs=1400){ m_leave.stop(); fade(m_active); m_hold.start(holdMs); }
+protected:
+    bool eventFilter(QObject*, QEvent* e) override {
+        if(e->type()==QEvent::Enter){ m_hold.stop(); m_leave.stop(); fade(m_active); }
+        else if(e->type()==QEvent::Leave){ m_leave.start(); }
+        return false;                                          // never consume — buttons stay clickable
+    }
+private:
+    void install(QWidget* w){ w->installEventFilter(this);
+        for(QObject* c : w->children()) if(auto* cw=qobject_cast<QWidget*>(c)) install(cw); }
+    bool cursorInside() const {
+        auto in=[](QWidget* w){ return w && w->isVisible() && w->rect().contains(w->mapFromGlobal(QCursor::pos())); };
+        return in(m_target) || in(m_peer); }
+    void fade(double to){ if(!m_target || !m_fx) return; if(qFuzzyCompare(m_fx->opacity()+1.0, to+1.0)) return;
+        m_anim->stop(); m_anim->setStartValue(m_fx->opacity()); m_anim->setEndValue(to); m_anim->start(); }
+    // m_peer is a SIBLING (not the owner), so it can be destroyed while a queued m_leave/m_hold timer is still
+    // pending at shutdown — a QPointer keeps cursorInside() from dereferencing a dangling widget (fixes an
+    // intermittent teardown segfault). m_target (the owner) is guarded too for symmetry.
+    QPointer<QWidget> m_target; QPointer<QWidget> m_peer; QPointer<QGraphicsOpacityEffect> m_fx;
+    QPropertyAnimation* m_anim; QTimer m_leave, m_hold;
+    double m_idle, m_active;
+};
+
+// ---- Frameless-window chrome ("App title bar design") -------------------------------------------------
+
+// The title-bar background is the OS window move handle: press-drag to move (delegated to the window
+// manager so snapping/tiling still work), double-click to toggle maximize. Buttons/menus sit above and
+// consume their own presses; the document-identity layer is click-through so dragging over it moves too.
+class DragBar : public QWidget {
+public:
+    explicit DragBar(std::function<void()> onToggleMax): m_toggle(std::move(onToggleMax)) {}
+protected:
+    void mousePressEvent(QMouseEvent* e) override {
+        if(e->button()==Qt::LeftButton && window() && window()->windowHandle()){ window()->windowHandle()->startSystemMove(); e->accept(); return; }
+        QWidget::mousePressEvent(e); }
+    void mouseDoubleClickEvent(QMouseEvent* e) override {
+        if(e->button()==Qt::LeftButton && m_toggle){ m_toggle(); e->accept(); return; }
+        QWidget::mouseDoubleClickEvent(e); }
+    std::function<void()> m_toggle;
+};
+
+// Reveals the menu bar (and hides the document identity) while the pointer is over the centre zone. A short
+// leave-delay + cursor re-check stops the menu flickering as the pointer glides between the menu buttons.
+class TitleCenterHover : public QObject {
+public:
+    TitleCenterHover(QWidget* zone, std::function<void(bool)> setHover)
+        : QObject(zone), m_zone(zone), m_setHover(std::move(setHover)) {
+        m_leave.setSingleShot(true); m_leave.setInterval(90);
+        connect(&m_leave,&QTimer::timeout,this,[this]{ if(!m_zone->rect().contains(m_zone->mapFromGlobal(QCursor::pos()))) m_setHover(false); });
+        install(zone); }
+protected:
+    bool eventFilter(QObject*, QEvent* e) override {
+        if(e->type()==QEvent::Enter){ m_leave.stop(); m_setHover(true); }
+        else if(e->type()==QEvent::Leave){ m_leave.start(); }
+        return false; }
+private:
+    void install(QWidget* w){ w->installEventFilter(this); for(QObject* c:w->children()) if(auto* cw=qobject_cast<QWidget*>(c)) install(cw); }
+    QWidget* m_zone; std::function<void(bool)> m_setHover; QTimer m_leave;
+};
+
+// Swaps a button's icon on hover (QSS can recolor a background but not a QIcon) — used so the close X turns
+// white over its red hover fill.
+class HoverIconSwap : public QObject {
+public:
+    HoverIconSwap(QToolButton* b, QIcon normal, QIcon hover): QObject(b), m_b(b), m_n(std::move(normal)), m_h(std::move(hover)) { b->installEventFilter(this); }
+protected:
+    bool eventFilter(QObject*, QEvent* e) override {
+        if(e->type()==QEvent::Enter) m_b->setIcon(m_h);
+        else if(e->type()==QEvent::Leave) m_b->setIcon(m_n);
+        return false; }
+    QToolButton* m_b; QIcon m_n, m_h;
+};
+
+// Edge/corner resize for a frameless window: a left-press within 6px of the RIGHT or BOTTOM window border
+// starts a WM-driven resize (right edge, bottom edge, or the bottom-right corner). We deliberately skip the
+// TOP and LEFT edges — XarQ's rulers live there and dragging off a ruler makes a guide, and the title-bar
+// window controls sit top-right — so resizing only from bottom/right avoids stealing those interactions.
+// Installed on qApp so it works over any child; never fires over a button.
+class EdgeResizer : public QObject {
+public:
+    explicit EdgeResizer(QWidget* win): QObject(win), m_win(win) {}
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if(e->type()!=QEvent::MouseButtonPress) return false;
+        auto* w=qobject_cast<QWidget*>(o); if(!w || w->window()!=m_win) return false;
+        if(qobject_cast<QAbstractButton*>(w) || qobject_cast<QMenuBar*>(w)) return false;   // don't eat a control's click
+        if(m_win->isMaximized()||m_win->isFullScreen()||!m_win->windowHandle()) return false;
+        auto* me=static_cast<QMouseEvent*>(e); if(me->button()!=Qt::LeftButton) return false;
+        const int B=6; const QRect r=m_win->frameGeometry(); const QPoint g=me->globalPosition().toPoint();
+        Qt::Edges ed;
+        if(g.x()>=r.right()-B)  ed|=Qt::RightEdge;
+        if(g.y()>=r.bottom()-B) ed|=Qt::BottomEdge;
+        if(ed){ m_win->windowHandle()->startSystemResize(ed); return true; }
+        return false; }
+    QWidget* m_win;
+};
+} // namespace
+
 MainWindow::MainWindow() {
+    setWindowFlag(Qt::FramelessWindowHint, true);   // custom "App title bar design" chrome replaces the OS frame
+    qApp->installEventFilter(new EdgeResizer(this));  // border-drag resize via the window manager (frameless windows have no native grips)
     m_canvas = new Canvas(this);
     { QWidget* central=nullptr; setupTabBar(central); setCentralWidget(central); }
 
@@ -111,7 +237,12 @@ MainWindow::MainWindow() {
     connect(m_canvas,&Canvas::mouseDoc,this,[this](QPointF p){ m_sCoord->setText("X "+m_canvas->fmtLen(p.x(),false)+"   Y "+m_canvas->fmtLen(p.y(),false)); });
     connect(m_canvas,&Canvas::zoomChanged,this,[zoomCombo](double z){ zoomCombo->setCurrentText(QString::number(int(z*100+0.5))+"%"); });
     connect(m_canvas,&Canvas::selectionChanged,this,[updSel]{ updSel(); });
-    connect(m_canvas,&Canvas::statusMessage,this,[this](QString s){ statusBar()->showMessage(s,3000); });
+    connect(m_canvas,&Canvas::statusMessage,this,[this](QString s){ m_lastCanvasMsg=s; statusBar()->showMessage(s,3000); });
+    // A file dropped on the canvas → Recent Files. Like openPath/importIntoDoc, keep the importer's
+    // own diagnostic rather than replacing it with a generic line it would never be seen behind.
+    connect(m_canvas,&Canvas::fileImported,this,[this](const QString& p){
+        addRecentFile(p);
+        statusBar()->showMessage(m_lastCanvasMsg.isEmpty() ? "Imported "+QFileInfo(p).fileName() : m_lastCanvasMsg, 6000); });
     connect(m_canvas,&Canvas::toolChanged,this,[this](Tool t){ if(auto* b=m_tools->button(int(t))){ b->setChecked(true); m_sTool->setText(b->toolTip().section(' ',0,0)+" tool"); } });   // sync rail + status even on programmatic setTool
     updSnap();
 
@@ -129,13 +260,14 @@ MainWindow::MainWindow() {
     // Don't open a blank "Untitled" document by default: the landing tab is created only once the user picks
     // something in the welcome screen (or as a blank fallback if they skip it / it's disabled). When no
     // splash drives startup (headless/tests/--export), materialise the blank landing tab now so it's usable.
-    QTimer::singleShot(0,[this]{
+    QTimer::singleShot(0,this,[this]{   // context = this: cancel the deferred call if the window is destroyed first
         if(m_startupDialogs && !m_deferStartup) runStartupSequence();
         else if(!m_deferStartup) ensureLandingTab();
     });
-    QTimer::singleShot(0,[this]{ m_canvas->zoomFit();
+    QTimer::singleShot(0,this,[this]{ m_canvas->zoomFit();   // context = this: don't fire zoomFit on a destroyed window
         if(qEnvironmentVariableIsSet("XARA_UITOOL")){ int t=qEnvironmentVariable("XARA_UITOOL").toInt(); m_canvas->select({2}); m_canvas->setTool(Tool(t)); }
-        if(qEnvironmentVariableIsSet("XARA_SHOWDOCK")){ if(auto* d=findChild<QDockWidget*>(qEnvironmentVariable("XARA_SHOWDOCK"))){ d->show(); d->raise(); } } });   // screenshot/test helper
+        if(qEnvironmentVariableIsSet("XARA_SHOWDOCK")){ if(auto* d=findChild<QDockWidget*>(qEnvironmentVariable("XARA_SHOWDOCK"))){ d->show(); d->raise(); } }   // screenshot/test helper
+        if(qEnvironmentVariableIsSet("XARA_RADIAL")){ int t=qEnvironmentVariable("XARA_RADIAL").toInt(); m_canvas->setTool(Tool(t)); m_canvas->openRadialForShot(); } });   // screenshot: force the Ctrl pie open
 }
 
 void MainWindow::buildTopBar() {
@@ -174,6 +306,9 @@ void MainWindow::buildTopBar() {
     connect(cta,&QPushButton::clicked,this,[this]{ exportImage(); });
     tb->addWidget(cta);
     auto* gap2=new QWidget; gap2->setFixedWidth(4); tb->addWidget(gap2);
+    // Hidden by default: its actions all live elsewhere (Save/Export in the title bar, zoom in the floating
+    // canvas pill, New/Open/Undo/Redo/… in the File/Edit menus + shortcuts). Re-enable via Window ▸ Standard Toolbar.
+    tb->hide();
 }
 
 QToolButton* MainWindow::railButton(Tool t, const QString& tip, const QString& sc) {
@@ -220,11 +355,10 @@ void MainWindow::buildToolRail() {
     m_railOverlay=new QWidget(m_canvas); m_railOverlay->setObjectName("railGlass");
     m_railOverlay->setAttribute(Qt::WA_StyledBackground, true);
     auto* gl=new QVBoxLayout(m_railOverlay); gl->setContentsMargins(0,6,0,6); gl->setSpacing(0); gl->addWidget(railScroll);
-    auto* sh=new QGraphicsDropShadowEffect(m_railOverlay); sh->setBlurRadius(24); sh->setOffset(0,8); sh->setColor(QColor(0,0,0,150));
-    m_railOverlay->setGraphicsEffect(sh);
     m_canvas->installEventFilter(this);
     positionRailOverlay();
     m_railOverlay->show(); m_railOverlay->raise();
+    new HoverReveal(m_railOverlay);   // transparent until the pointer is over the rail
 }
 
 // Keep the floating glass rail pinned to the top-left of the canvas viewport, sized to its content but
@@ -294,9 +428,8 @@ void MainWindow::buildZoomPill(){
     auto* grid=mkBtn("grid","Show grid",true); grid->setChecked(m_canvas->showGrid());
     connect(grid,&QToolButton::toggled,this,[this](bool on){ m_canvas->setShowGrid(on); });
     h->addWidget(pan); h->addWidget(fit); h->addWidget(sep); h->addWidget(guides); h->addWidget(grid);
-    auto* sh=new QGraphicsDropShadowEffect(m_zoomPill); sh->setBlurRadius(24); sh->setOffset(0,6); sh->setColor(QColor(0,0,0,150));
-    m_zoomPill->setGraphicsEffect(sh);
     positionZoomPill(); m_zoomPill->show(); m_zoomPill->raise();
+    new HoverReveal(m_zoomPill);   // transparent until the pointer is over the pill
 }
 
 void MainWindow::positionZoomPill(){
@@ -496,6 +629,10 @@ void MainWindow::buildDocks() {
     m_panelGrip->setAttribute(Qt::WA_StyledBackground,true);
     m_panelGrip->setCursor(Qt::SplitHCursor); m_panelGrip->installEventFilter(this);
     positionRightPanel(); rightPanel->show(); rightPanel->raise(); m_panelGrip->show();
+    // Show-on-hover, exactly like the left tool rail: the panel is transparent until the pointer is over it
+    // (or over its resize grip), then fades in. Menu-driven reveals call m_pokeRightPanel() to fade it in.
+    auto* hr=new HoverReveal(m_rightPanel, 0.0, 1.0, 150, m_panelGrip);
+    m_pokeRightPanel=[hr]{ hr->poke(); };
 }
 
 // Pin the floating glass right panel to the right edge of the canvas (full height), plus its resize grip.
@@ -513,17 +650,53 @@ void MainWindow::positionRightPanel(){
 void MainWindow::revealPanelSection(int which){
     if(!m_rightPanel) return;
     m_rightPanel->show(); m_rightPanel->raise();
+    if(m_pokeRightPanel) m_pokeRightPanel();   // fade the auto-hide panel in (and hold briefly)
     if(m_rpTabs) m_rpTabs->setCurrentIndex(0);
     CollapsibleSection* sec = which==1? m_secLayers : which==2? m_secColour : m_secProps;
     if(sec){ sec->setOpen(true);
         if(m_designScroll) QTimer::singleShot(0,this,[this,sec]{ m_designScroll->ensureWidgetVisible(sec); }); }
 }
 
-// File-open filter for Import Image: standard rasters + PSD, plus camera RAW when LibRaw is loaded.
+// File-open filter for Import Image: standard rasters + PSD, our native decoders (QOI/PCX/SGI/HDR/
+// PFM/PAM/DDS), formats decodable via installed Qt image plugins (TGA/ICO/ICNS/WBMP/MNG…), plus
+// camera RAW when LibRaw is loaded.
 static QString imageImportFilter(){
-    QString f = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp *.psd *.heic *.heif *.avif";
+    QString f = "Images (*.png *.apng *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp *.psd *.psb *.heic *.heif *.avif";
+    for(const QString& e : xara::RasterExtra::extensions())      f += " *."+e;
+    for(const QString& e : xara::RasterExtra::qtExtraExtensions()) f += " *."+e;
+    for(const QString& e : xara::ExtCodec::extensions())         f += " *."+e;   // JPEG 2000 / JPEG XL when libs present
     if(xara::Raw::available()) for(const QString& e : xara::Raw::extensions()) f += " *."+e;
     return f + ")";
+}
+
+// Every vector / page / document format Canvas::dropImportByExtension() routes to a first-party importer.
+// KEEP IN SYNC with that dispatcher (src/canvas.cpp) — the Open dialog builds its filter from this.
+static QString vectorImportPatterns(){
+    return "*.svg *.svgz *.pdf *.ai *.eps *.epsi *.ept *.ept2 *.ept3 *.epsf *.eps2 *.eps3 *.epi *.ps *.ps2 *.ps3 *.dxf *.dwg *.cdr *.cmx *.wmf *.apm "
+           "*.afdesign *.afphoto *.afpub *.aftemplate *.afpackage *.af *.epub *.fb2 *.fb2.zip *.fbz *.docx *.rtf *.odg *.odp *.odt *.ods *.otg *.otp *.ott *.fodg *.fodp *.fodt "
+           "*.sxd *.sxi *.sxw *.std *.sti *.cbz *.cbr *.cb7 *.cbt *.apng *.gif "
+           "*.wpg *.vsd *.vsdx *.vdx *.vss *.vssx *.vst *.vstx *.vsdm "
+           "*.fh *.fh4 *.fh5 *.fh6 *.fh7 *.fh8 *.fh9 *.fh10 *.fh11 *.fhd *.ft8 *.ft9 *.ft10 *.ft11 "
+           "*.pub *.pmd *.pm6 *.pm5 *.pm4 *.p65 *.t65 *.zmf *.qxp *.qxd *.qxb *.qxt "
+           "*.sda *.sdd *.key *.pages *.numbers *.cwk *.drw *.dgn *.tab *.mif *.gpkg *.gml *.s57 *.000 *.gv *.dot "
+           "*.tgs *.topojson *.vml *.xps *.oxps *.sla *.scd *.ora *.kra "
+           "*.geojson *.kml *.kmz *.json *.plt *.hpgl *.hgl *.shp *.gpx *.fig *.cgm "
+           "*.gbr *.ger *.gtl *.gbl *.gts *.gbs *.gto *.gbo *.gko *.gm1 *.gpt *.pho "
+           "*.drl *.xnc *.drd *.tap *.exc *.nc *.lottie *.sketch";
+}
+
+// A single comprehensive filter for File ▸ Open (and the Start-screen open button): a default "All supported" group
+// covering native .xar + every vector/page importer + every raster format, then per-category groups, then All files.
+QString MainWindow::supportedOpenFilter(){
+    const QString vec = vectorImportPatterns();
+    QString imgFull = imageImportFilter();                                  // "Images (*.png *.jpg …)"
+    QString imgPat = imgFull.mid(imgFull.indexOf('(')+1); imgPat.chop(1);   // just the patterns, no label/parens
+    const QString all = "*.xar " + vec + " " + imgPat;
+    return "All supported files (" + all + ")"
+         + ";;XarQ document (*.xar)"
+         + ";;Vector && page formats (" + vec + ")"
+         + ";;" + imgFull
+         + ";;All files (*)";
 }
 
 void MainWindow::buildMenus() {
@@ -541,15 +714,28 @@ void MainWindow::buildMenus() {
         statusBar()->showMessage("Created "+sel+" — publish it via File ▸ Publish Website.",4000); });
     mFile->addAction("Open…",this,[this]{openFile();},QKeySequence("Ctrl+O"));
     mFile->addAction("Start screen…",this,[this]{ showStartScreen(); });
-    mFile->addAction("Import Image…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Image","",imageImportFilter(),nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return; if(m_tabs.isEmpty()) ensureLandingTab();
-        const bool ok = p.endsWith(".gif",Qt::CaseInsensitive) ? m_canvas->importAnimatedGif(p) : m_canvas->importImage(p);
-        if(!ok) statusBar()->showMessage("Could not load "+p,4000); },QKeySequence("Ctrl+Shift+I"));
-    mFile->addAction("Import RTF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import RTF","","Rich Text (*.rtf)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importRtfFile(p)) statusBar()->showMessage("Could not import "+p,4000); else statusBar()->showMessage("Imported "+p,4000); } });
-    mFile->addAction("Import Word (DOCX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import DOCX","","Word document (*.docx)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importDocx(p)) statusBar()->showMessage("Could not import "+p,4000); else statusBar()->showMessage("Imported "+p,4000); } });
-    mFile->addAction("Import CorelDRAW (CDR)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import CDR","","CorelDRAW (*.cdr)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importCdr(p)) statusBar()->showMessage("Could not import "+p,4000); } });
-    mFile->addAction("Import SVG…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import SVG","","SVG (*.svg)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importSvgFile(p)) statusBar()->showMessage("Could not import "+p,4000); else statusBar()->showMessage("Imported "+p,4000); } });
-    mFile->addAction("Import EPS/AI/PDF/DXF/WMF/EMF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector","","Vector (*.eps *.ai *.pdf *.dxf *.wmf *.emf)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importVectorFile(p)) statusBar()->showMessage("Could not import "+p,4000); else statusBar()->showMessage("Imported "+p,4000); } });
-    mFile->addAction("Import EPUB…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import EPUB","","EPUB e-book (*.epub)",nullptr,QFileDialog::DontUseNativeDialog); if(!p.isEmpty()){ if(m_tabs.isEmpty()) ensureLandingTab(); if(!m_canvas->importEpub(p)) statusBar()->showMessage("Could not import "+p,4000); else statusBar()->showMessage("Imported "+p,4000); } });
+    mFile->addAction("Import Image…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Image","",imageImportFilter(),nullptr,QFileDialog::DontUseNativeDialog);
+        importIntoDoc(p,[this,&p]{ return p.endsWith(".gif",Qt::CaseInsensitive) ? m_canvas->importAnimatedGif(p) : m_canvas->importImage(p); }); },QKeySequence("Ctrl+Shift+I"));
+    mFile->addAction("Import RTF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import RTF","","Rich Text (*.rtf)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importRtfFile(p); }); });
+    mFile->addAction("Import Word (DOCX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import DOCX","","Word document (*.docx)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importDocx(p); }); });
+    mFile->addAction("Import CorelDRAW (CDR / CMX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import CDR","","CorelDRAW (*.cdr *.cmx)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import SVG…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import SVG","","SVG (*.svg)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importSvgFile(p); }); });
+    mFile->addAction("Import PostScript/EPS/AI/PDF/DXF/DWG/WMF/EMF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector","","Vector (*.ps *.eps *.epsi *.ept *.ai *.pdf *.dxf *.dwg *.wmf *.emf *.apm)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import EPUB…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import EPUB","","EPUB e-book (*.epub)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importEpub(p); }); });
+    mFile->addAction("Import FictionBook (FB2)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import FictionBook","","FictionBook e-book (*.fb2 *.fb2.zip *.fbz)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importFb2(p); }); });
+    mFile->addAction("Import Apple iWork (Keynote / Pages / Numbers)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import iWork Document","","Apple iWork (*.key *.pages *.numbers)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importIWork(p); }); });
+    mFile->addAction("Import Comic (CBZ / CBR)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Comic","","Comic archive (*.cbz *.cbr *.cb7 *.cbt)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return p.endsWith(".cbz",Qt::CaseInsensitive) ? m_canvas->importCbz(p) : m_canvas->importCbr(p); }); });
+    mFile->addAction("Import OpenDocument (ODG/ODP/ODT)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import OpenDocument","","OpenDocument / OpenOffice (*.odg *.odp *.odt *.ods *.fodg *.fodp *.fodt *.otg *.sxd *.sxw)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importOdg(p); }); });
+    mFile->addAction("Import Map (GeoJSON / KML)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Map","","Map data (*.geojson *.json *.kml *.kmz)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return (p.endsWith(".kml",Qt::CaseInsensitive)||p.endsWith(".kmz",Qt::CaseInsensitive)) ? m_canvas->importKml(p) : m_canvas->importGeoJson(p); }); });
+    mFile->addAction("Import Plotter (HP-GL)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import HP-GL","","HP-GL plot (*.plt *.hpgl *.hgl)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importHpgl(p); }); });
+    mFile->addAction("Import Vector (WPG / Visio / FreeHand / Publisher)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector Drawing","","Vector drawings (*.wpg *.vsd *.vsdx *.vdx *.vss *.vst *.fh *.fh7 *.fh8 *.fh9 *.fh10 *.fh11 *.pub *.wmf)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import Vector (Shapefile / GPX / Xfig / CGM / SVGZ)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector Drawing","","Native vector formats (*.shp *.gpx *.fig *.cgm *.svgz)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import Vector (Gerber / Excellon / Lottie / Sketch)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector Drawing","","PCB & design formats (*.gbr *.ger *.gtl *.gbl *.gts *.gbs *.gko *.gm1 *.drl *.xnc *.nc *.lottie *.sketch *.json)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import Vector (PageMaker / QuarkXPress / Zoner / StarDraw / Keynote / MacDraw)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector Document","","Legacy & DTP vector formats (*.pmd *.p65 *.qxp *.qxd *.qxb *.qxt *.zmf *.sda *.sdd *.key *.cwk *.drw)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import GIS / Graph (DGN / MapInfo / GeoPackage / GML / DOT)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import GIS or Graph","","GIS & graph formats (*.dgn *.tab *.mif *.gpkg *.gml *.s57 *.000 *.gv *.dot)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import Affinity (Designer / Photo / Publisher)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Affinity Document","","Serif Affinity (*.afdesign *.afphoto *.afpub *.aftemplate *.afpackage *.af)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importAffinity(p); }); });
+    mFile->addAction("Import Vector (XPS / Scribus / VML / TopoJSON / Sticker)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector","","More vector formats (*.xps *.oxps *.sla *.scd *.vml *.topojson *.tgs)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import Layered Image (OpenRaster / Krita)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Layered Image","","Layered raster (*.ora *.kra)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return p.endsWith(".kra",Qt::CaseInsensitive) ? m_canvas->importKra(p) : m_canvas->importOra(p); }); });
     mFile->addAction("Save",this,[this]{saveFile();},QKeySequence("Ctrl+S"));
     mFile->addAction("Save As…",this,[this]{saveFileAs();},QKeySequence("Ctrl+Shift+S"));
     mFile->addAction("Save Compressed XAR…",this,[this]{ QString p=QFileDialog::getSaveFileName(this,"Save Compressed XAR","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog);
@@ -661,7 +847,7 @@ void MainWindow::buildMenus() {
         if(p.isEmpty())return; if(!p.endsWith(".pdf",Qt::CaseInsensitive))p+=".pdf";
         bool ok=m_canvas->exportCmykPdf(p); statusBar()->showMessage(ok?("Wrote composite device-CMYK PDF (with output intent): "+p):"CMYK PDF export failed",5000); });
     mFile->addAction("Export with Crop Marks…",this,[this]{
-        bool ok; double bleed=QInputDialog::getDouble(this,"Crop Marks","Bleed (px):",9,0,100,0,&ok); if(!ok)return;
+        bool ok; double bleed=QInputDialog::getDouble(this,"Crop Marks","Bleed (px):",m_canvas->doc().bleed>0?m_canvas->doc().bleed:9,0,1000,0,&ok); if(!ok)return;
         QString p=QFileDialog::getSaveFileName(this,"Export with Crop Marks","print.pdf","PDF (*.pdf)",nullptr,QFileDialog::DontUseNativeDialog);
         if(p.isEmpty())return; if(!p.endsWith(".pdf",Qt::CaseInsensitive))p+=".pdf";
         bool w=m_canvas->exportWithMarks(p,bleed,18); statusBar()->showMessage(w?("Wrote print-ready PDF: "+p):"Export failed",4000); });
@@ -1047,7 +1233,7 @@ void MainWindow::buildMenus() {
     dockToggle(mGal,"pageLayerDock","Pages & Layers","F10");
     mGal->addAction("Object List",this,[this]{ revealPanelSection(1); });
     { auto* a=mGal->addAction("Properties / Fills"); a->setShortcut(QKeySequence("F11"));
-      connect(a,&QAction::triggered,this,[this]{ if(m_rightPanel){ m_rightPanel->setVisible(!m_rightPanel->isVisible()); positionRightPanel(); } }); }
+      connect(a,&QAction::triggered,this,[this]{ if(m_rightPanel){ bool v=!m_rightPanel->isVisible(); m_rightPanel->setVisible(v); positionRightPanel(); if(v && m_pokeRightPanel) m_pokeRightPanel(); } }); }
     mGal->addSeparator();
     dockToggle(mGal,"fillGalleryDock","Fill Gallery","");
     dockToggle(mGal,"lineGalleryDock","Line Gallery","");
@@ -1206,7 +1392,7 @@ void MainWindow::buildMenus() {
     barToggle("infobarTb","Tool Options Bar (InfoBar)");
     barToggle("colourTb","Colour Line");
     mWin->addSeparator();
-    mWin->addAction("Properties panel",this,[this]{ if(m_rightPanel){ m_rightPanel->setVisible(!m_rightPanel->isVisible()); positionRightPanel(); } });
+    mWin->addAction("Properties panel",this,[this]{ if(m_rightPanel){ bool v=!m_rightPanel->isVisible(); m_rightPanel->setVisible(v); positionRightPanel(); if(v && m_pokeRightPanel) m_pokeRightPanel(); } });
     mWin->addAction("Layers",this,[this]{ revealPanelSection(1); });
     mWin->addAction("Colour",this,[this]{ revealPanelSection(2); });
     mWin->addSeparator();
@@ -1299,13 +1485,7 @@ void MainWindow::buildMenus() {
 
 // ---- file ops --------------------------------------------------------------
 void MainWindow::newFile(){ newDocumentTab(); snapshotRecovery(); }   // File▸New opens a fresh document tab
-void MainWindow::openFile(){ QString p=QFileDialog::getOpenFileName(this,"Open","","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty()) return;
-    if(m_tabs.isEmpty()) ensureLandingTab();   // opened from the empty state (title-bar File menu) → materialise a tab
-    // Reuse the current tab only if it is a pristine blank Untitled; otherwise open the file in a new tab.
-    const bool pristine = !m_dirty && m_canvas->filePath().isEmpty() && m_canvas->doc().shapes.isEmpty();
-    if(!pristine) newDocumentTab();
-    m_suppressDirty=true; const bool ok=m_canvas->load(p); m_suppressDirty=false;
-    if(ok){ m_dirty=false; addRecentFile(p); updateTitle(); enterDocState(); } snapshotRecovery(); }
+void MainWindow::openFile(){ QString p=QFileDialog::getOpenFileName(this,"Open",QString(),supportedOpenFilter(),nullptr,QFileDialog::DontUseNativeDialog|QFileDialog::HideNameFilterDetails); if(p.isEmpty()) return; openPath(p); }
 bool MainWindow::saveFile(){ if(m_tabs.isEmpty()) ensureLandingTab();   // Save from the empty state → materialise + reveal the (blank) document, don't act on the hidden canvas
     QString p=m_canvas->filePath(); if(p.isEmpty()) return saveFileAs(); m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); return true; }
 bool MainWindow::saveFileAs(){ if(m_tabs.isEmpty()) ensureLandingTab(); QString p=QFileDialog::getSaveFileName(this,"Save As","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return false; if(!p.endsWith(".xar",Qt::CaseInsensitive)) p+=".xar"; m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); return true; }
@@ -1323,30 +1503,69 @@ void MainWindow::addRecentFile(const QString& path){
     r.removeAll(path); r.prepend(path); while(r.size()>16) r.removeLast();
     s.setValue("recentFiles", r);
 }
+// Open ANY supported file as a document: a native .xar loads directly; anything else (SVG, PDF, CDR, an image, …)
+// opens as a fresh document via the by-extension importer. EVERY successfully opened file — whatever its type —
+// is recorded in Recent Files, so Recent reflects everything XarQ has opened, not just .xar.
 void MainWindow::openPath(const QString& p){
     if(p.isEmpty() || !QFile::exists(p)) return;
     if(m_tabs.isEmpty()) ensureLandingTab();   // empty state (welcome shown, no tab yet) → materialise a tab to load into
     const bool pristine = !m_dirty && m_canvas->filePath().isEmpty() && m_canvas->doc().shapes.isEmpty();
     if(!pristine) newDocumentTab();
-    const bool svg = p.endsWith(".svg",Qt::CaseInsensitive);
-    m_suppressDirty=true; bool ok = svg ? (m_canvas->newDocument(), m_canvas->importSvgFile(p)) : m_canvas->load(p); m_suppressDirty=false;
-    if(ok){ if(!svg){ m_dirty=false; addRecentFile(p); } updateTitle(); snapshotRecovery(); enterDocState(); }
+    const bool xar = p.endsWith(".xar",Qt::CaseInsensitive);
+    m_lastCanvasMsg.clear();
+    m_suppressDirty=true;
+    bool ok = xar ? m_canvas->load(p)
+                  : (m_canvas->newDocument(), m_canvas->dropImportByExtension(p));   // svg/pdf/cdr/image/… → import into a fresh doc
+    m_suppressDirty=false;
+    if(ok){
+        m_dirty = !xar;                          // an imported doc has no .xar path yet → unsaved; a loaded .xar is clean
+        addRecentFile(p);                        // record every opened file, any type
+        updateTitle(); snapshotRecovery(); enterDocState();
+        // An importer's own message ("3 raster layers not decoded", "needs zstd") is emitted during
+        // the synchronous import and would otherwise be replaced by this generic line before the
+        // status bar ever repaints — so the detail the user needs is never actually seen.
+        statusBar()->showMessage(m_lastCanvasMsg.isEmpty()
+            ? (xar?"Opened ":"Imported ")+QFileInfo(p).fileName() : m_lastCanvasMsg, 6000);
+    } else {
+        statusBar()->showMessage(m_lastCanvasMsg.isEmpty() ? "Could not open "+p : m_lastCanvasMsg, 6000);
+    }
+}
+// Import a file INTO the current document (File ▸ Import ▸ …) and, on success, record it in Recent Files so imported
+// files also appear there. `imp` performs the actual import and returns true on success.
+bool MainWindow::importIntoDoc(const QString& p, const std::function<bool()>& imp){
+    if(p.isEmpty()) return false;
+    if(m_tabs.isEmpty()) ensureLandingTab();
+    m_lastCanvasMsg.clear();
+    const bool ok = imp();
+    if(ok){ addRecentFile(p);
+            statusBar()->showMessage(m_lastCanvasMsg.isEmpty()
+                ? "Imported "+QFileInfo(p).fileName() : m_lastCanvasMsg, 6000); }
+    else statusBar()->showMessage(m_lastCanvasMsg.isEmpty() ? "Could not import "+p : m_lastCanvasMsg, 6000);
+    return ok;
 }
 void MainWindow::newFromTemplate(int kind){
     newDocumentTab();
     m_suppressDirty=true; m_canvas->setDocument(Canvas::templateDocument(kind)); m_suppressDirty=false;
     m_canvas->refreshAll(); m_dirty = (kind!=0); updateTitle();   // Blank(0) stays clean; content templates are unsaved
 }
+void MainWindow::newBlankSized(double w, double h){
+    newDocumentTab();
+    Document d; d.pageSize=QSizeF(qMax(1.0,w), qMax(1.0,h));
+    m_suppressDirty=true; m_canvas->setDocument(d); m_suppressDirty=false;
+    m_canvas->refreshAll(); m_dirty=true; updateTitle();          // a custom-sized blank is unsaved
+}
 void MainWindow::showStartScreen(){ StartScreen::show(this); }
 // Post-boot launch dialogs: restore any crashed-out work, then (on a clean
 // interactive launch with the pref on) show the welcome screen. Called after the
 // branded splash finishes, or directly when the splash is suppressed.
 void MainWindow::runStartupSequence(){
-    offerRecovery();                       // may restore leftover work into one or more tabs
-    if(!m_tabs.isEmpty()){ enterDocState(); return; }   // recovery brought documents back → show the workspace
-    // Nothing to restore: show the welcome screen unless the user unticked "Show this screen on startup"
-    // (startscreen.cpp persists it as showWelcome); when off, drop straight into a blank landing tab.
-    if(QSettings("XarQ","XarQ").value("showWelcome",true).toBool()) enterEmptyState();
+    // Crash recovery is no longer a yes/no modal. Any unsaved work from a previous session is surfaced ON
+    // the welcome screen (a "Recover unsaved work" section — see startscreen.cpp) so the user can choose to
+    // restore or discard it. We never auto-open a blank document over it. So: show the welcome screen when
+    // there's recoverable work OR the user hasn't unticked "Show this screen on startup"; otherwise drop
+    // straight into a blank landing tab.
+    const bool haveRecovery = !recoveryEntries().isEmpty();
+    if(haveRecovery || QSettings("XarQ","XarQ").value("showWelcome",true).toBool()) enterEmptyState();
     else ensureLandingTab();
 }
 
@@ -1358,7 +1577,7 @@ void MainWindow::setDocChromeVisible(bool on){
     vis(m_tabBar,on); vis(m_railOverlay,on); vis(m_rightPanel,on); vis(m_panelGrip,on); vis(m_zoomPill,on);
     vis(findChild<QToolBar*>("infobarTb"),on);
     vis(findChild<QToolBar*>("colourTb"),on);
-    vis(findChild<QToolBar*>("topbar"),on);
+    if(!on) vis(findChild<QToolBar*>("topbar"),false);   // empty state hides it; when a doc is shown, leave it to the user (hidden by default, opt-in via Window ▸ Standard Toolbar)
     vis(statusBar(),on);
     if(on){ positionRailOverlay(); positionRightPanel(); positionZoomPill(); }
 }
@@ -1461,10 +1680,12 @@ void MainWindow::confirmAndCloseTab(int idx){
 }
 void MainWindow::closeTab(int idx){
     if(idx<0 || idx>=m_tabs.size()) return;
-    if(m_tabs.size()==1){                                  // never zero tabs — reset the sole tab to a blank document
-        m_suppressDirty=true; m_canvas->newDocument(); m_suppressDirty=false;
-        m_tabs[0]=DocTab{ m_canvas->captureSession(), false }; m_dirty=false; m_activeTab=0;
-        refreshTabText(0); updateTitle(); snapshotRecovery(); return;
+    if(m_tabs.size()==1){                                  // closing the only document → back to the welcome/start screen
+        m_tabs.clear(); m_dirty=false; m_activeTab=-1;
+        { QSignalBlocker b(m_tabBar); m_tabBar->removeTab(0); }
+        m_suppressDirty=true; m_canvas->newDocument(); m_suppressDirty=false;   // clear the canvas behind the welcome page
+        enterEmptyState();                                // show the welcome panel, hide document chrome (m_activeTab=-1)
+        snapshotRecovery(); return;
     }
     if(idx==m_activeTab){                                  // close the visible tab → activate a neighbour
         const int nxt = (idx==m_tabs.size()-1)? idx-1 : idx+1;
@@ -1483,7 +1704,10 @@ void MainWindow::closeTab(int idx){
 // Autosave + crash recovery (Gap 7, made tab-aware in R6): each dirty tab gets its own recovery
 // snapshot recovery-<k>.xar, with recovery.manifest listing "<snapshotFile>\t<realPath>" per line.
 QString MainWindow::recoveryDir() const {
-    QString dir=QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    // XARA_RECOVERY_DIR isolates the recovery store (used by --selftest so it never touches the user's
+    // live crash-recovery snapshots); otherwise the per-user app-data directory.
+    QString dir=qEnvironmentVariable("XARA_RECOVERY_DIR");
+    if(dir.isEmpty()) dir=QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     if(dir.isEmpty()) dir=QDir::tempPath(); QDir().mkpath(dir);
     return dir;
 }
@@ -1533,7 +1757,8 @@ void MainWindow::closeEvent(QCloseEvent* e){
     clearRecovery();
     e->accept();
 }
-void MainWindow::offerRecovery(){
+// Enumerate the recoverable documents left by a previous session (existing snapshot files only).
+QVector<QPair<QString,QString>> MainWindow::recoveryEntries() const {
     QVector<QPair<QString,QString>> entries;                 // (snapshotFile, realPath)
     { QFile f(recoveryManifest());
       if(f.exists() && f.open(QIODevice::ReadOnly|QIODevice::Text))
@@ -1541,12 +1766,13 @@ void MainWindow::offerRecovery(){
             const QString rp=ln.section('\t',0,0), orig=ln.section('\t',1,1);
             if(QFile::exists(rp)) entries.append({rp,orig}); } }
     if(entries.isEmpty() && QFile::exists(recoveryPath())) entries.append({recoveryPath(),QString()});  // legacy format
+    return entries;
+}
+// Restore every recovery snapshot into its own tab, then reveal the workspace. Invoked from the welcome
+// screen's "Recover" button — never as a modal. Each restored doc is marked dirty so the user saves to keep it.
+void MainWindow::recoverAll(){
+    const auto entries=recoveryEntries();
     if(entries.isEmpty()) return;
-    const auto ans=QMessageBox::question(this,"Recover Work",
-        QString("XarQ found %1 unsaved document%2 from a previous session.\nRecover %3?")
-            .arg(entries.size()).arg(entries.size()==1?"":"s").arg(entries.size()==1?"it":"them"),
-        QMessageBox::Yes|QMessageBox::No, QMessageBox::Yes);
-    if(ans!=QMessageBox::Yes){ clearRecovery(); return; }
     bool first=true;
     for(const auto& e: entries){
         Document d; d.pageSize=m_canvas->doc().pageSize;
@@ -1558,7 +1784,16 @@ void MainWindow::offerRecovery(){
         m_dirty=true; refreshTabText(m_activeTab); updateTitle();
         first=false;
     }
+    if(m_tabs.isEmpty()) ensureLandingTab();   // every snapshot failed to load → fall back to a blank workspace
+    else enterDocState();
     statusBar()->showMessage("Recovered unsaved work — save each document to keep it.",6000);
+}
+// Discard the recovery snapshots (user chose not to restore). Refresh the welcome screen so its
+// "Recover unsaved work" section disappears.
+void MainWindow::discardRecovery(){
+    clearRecovery();
+    if(m_centerStack && m_welcomePanel && m_centerStack->currentWidget()==m_welcomePanel) enterEmptyState();
+    statusBar()->showMessage("Discarded recovered work from the previous session.",3000);
 }
 
 // ---- keyboard shortcut customization (Batch R5) ----------------------------
@@ -1660,28 +1895,299 @@ void MainWindow::exportImage(){ if(m_tabs.isEmpty()) ensureLandingTab();   // Ex
         connect(bb,&QDialogButtonBox::accepted,&dlg,&QDialog::accept); connect(bb,&QDialogButtonBox::rejected,&dlg,&QDialog::reject); form->addRow(bb);
         if(dlg.exec()!=QDialog::Accepted) return;
         ok=m_canvas->exportGif(p, delay->value(), loops->value()); }
-    else {                              // raster (png/jpg/bmp/tiff): show the Bitmap Export options dialog
-        const bool jpeg = p.endsWith(".jpg",Qt::CaseInsensitive)||p.endsWith(".jpeg",Qt::CaseInsensitive);
-        QDialog dlg(this); dlg.setWindowTitle("Export Bitmap");
-        auto* form=new QFormLayout(&dlg);
-        auto* area=new QComboBox(&dlg); area->addItems({"Page","Drawing (content)","Selection"});
-        if(!m_canvas->selection().isEmpty()) area->setCurrentIndex(2); else area->setCurrentIndex(1);
-        auto* scale=new QDoubleSpinBox(&dlg); scale->setRange(0.1,8.0); scale->setSingleStep(0.5); scale->setValue(2.0); scale->setSuffix("×");
-        auto* qual=new QSpinBox(&dlg); qual->setRange(1,100); qual->setValue(90); qual->setEnabled(jpeg);
-        auto* transp=new QCheckBox("Transparent background",&dlg); transp->setChecked(!jpeg); transp->setEnabled(!jpeg);
-        auto* indexed=new QCheckBox("Reduce to 256-colour palette (smaller PNG)",&dlg); indexed->setEnabled(!jpeg);
-        auto* dither=new QCheckBox("Dither (Floyd–Steinberg)",&dlg); dither->setEnabled(false);
-        connect(indexed,&QCheckBox::toggled,dither,[dither,jpeg](bool on){ dither->setEnabled(on && !jpeg); });
-        form->addRow("Area:",area); form->addRow("Resolution:",scale);
-        if(jpeg) form->addRow("JPEG quality:",qual); form->addRow(transp);
-        if(!jpeg){ form->addRow(indexed); form->addRow(dither); }
-        auto* bb=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel,&dlg);
-        connect(bb,&QDialogButtonBox::accepted,&dlg,&QDialog::accept); connect(bb,&QDialogButtonBox::rejected,&dlg,&QDialog::reject);
-        form->addRow(bb);
-        if(dlg.exec()!=QDialog::Accepted) return;
-        ok=m_canvas->exportRaster(p, area->currentIndex(), scale->value(), jpeg?qual->value():-1, transp->isChecked(), indexed->isChecked(), dither->isChecked());
-    }
+    else { bitmapExportDialog(p); return; }   // raster: the rich two-region Export bitmap dialog (reports its own status)
     statusBar()->showMessage(ok?("Exported "+p):"Export failed",4000); }
+
+// ---- Export bitmap: a two-region dialog (live source-vs-output preview + a scrolling options rail),
+//      styled to the XarQ design system. Its defining feature — the source/output comparison — is REAL:
+//      the output pane and size estimate come from encoding to the chosen format in-memory (QBuffer +
+//      QImageWriter), not a simulation. Scoped to the options the raster engine actually backs. ----
+namespace {
+class ExportPreview : public QWidget {
+public:
+    QImage src, out; int mode=0, matte=0; double split=0.52; bool dragging=false;   // mode 0 split /1 source /2 output
+    explicit ExportPreview(QWidget* p=nullptr):QWidget(p){ setMinimumSize(380,300); setMouseTracking(true); }
+    void setImages(const QImage& s,const QImage& o){ src=s; out=o; update(); }
+protected:
+    QRect artRect() const {
+        QSize is = src.isNull()? QSize(3,4) : src.size();
+        QSizeF s=is; s.scale(qMax(1,width()-48), qMax(1,height()-48), Qt::KeepAspectRatio);
+        QRect r(0,0,int(s.width()),int(s.height())); r.moveCenter(rect().center()); return r;
+    }
+    void paintEvent(QPaintEvent*) override {
+        QPainter g(this); g.fillRect(rect(), QColor(0x0C,0x0D,0x10));
+        const QRect ar=artRect();
+        if(matte==1) g.fillRect(ar, Qt::white);
+        else if(matte==2) g.fillRect(ar, Qt::black);
+        else { g.fillRect(ar, QColor(0x2C,0x31,0x3A)); g.save(); g.setClipRect(ar);
+            const int c=10; const QColor a(0x3A,0x3F,0x49);
+            for(int y=ar.top(); y<=ar.bottom(); y+=c) for(int x=ar.left(); x<=ar.right(); x+=c)
+                if((((x-ar.left())/c)+((y-ar.top())/c))%2==0) g.fillRect(x,y,c,c,a);
+            g.restore(); }
+        g.setRenderHint(QPainter::SmoothPixmapTransform);
+        const int sx = ar.left()+int(ar.width()*qBound(0.03,split,0.97));
+        if((mode==0||mode==1) && !src.isNull()){ g.save(); if(mode==0) g.setClipRect(QRect(ar.left(),ar.top(),sx-ar.left(),ar.height())); g.drawImage(ar,src); g.restore(); }
+        if((mode==0||mode==2) && !out.isNull()){ g.save(); if(mode==0) g.setClipRect(QRect(sx,ar.top(),ar.right()-sx+1,ar.height())); g.drawImage(ar,out); g.restore(); }
+        g.setPen(QColor(255,255,255,28)); g.setBrush(Qt::NoBrush); g.drawRect(ar.adjusted(0,0,-1,-1));
+        auto tag=[&](const QString& t, bool right, const QColor& fg){ QFont f("Ubuntu Mono"); f.setPixelSize(10); f.setBold(true); g.setFont(f);
+            QRect tr=g.fontMetrics().boundingRect(t).adjusted(-8,-4,8,4);
+            if(right) tr.moveBottomRight(QPoint(ar.right()-10, ar.bottom()-10)); else tr.moveBottomLeft(QPoint(ar.left()+10, ar.bottom()-10));
+            g.setPen(Qt::NoPen); g.setBrush(QColor(23,26,32,205)); g.drawRoundedRect(tr,4,4); g.setPen(fg); g.drawText(tr,Qt::AlignCenter,t); };
+        if(mode==0){ g.setPen(QPen(QColor(0x2D,0x6F,0xF7),2)); g.drawLine(sx,ar.top(),sx,ar.bottom());
+            tag("SOURCE",false,QColor(0xD2,0xD8,0xE0)); tag("OUTPUT",true,QColor(0x7F,0xA5,0xFF)); }
+        else if(mode==1) tag("SOURCE",false,QColor(0xD2,0xD8,0xE0));
+        else tag("OUTPUT",true,QColor(0x7F,0xA5,0xFF));
+    }
+    void mousePressEvent(QMouseEvent* e) override { if(mode==0){ dragging=true; setSplit(e->pos()); } }
+    void mouseMoveEvent(QMouseEvent* e) override { if(dragging) setSplit(e->pos()); setCursor(mode==0? Qt::SplitHCursor : Qt::ArrowCursor); }
+    void mouseReleaseEvent(QMouseEvent*) override { dragging=false; }
+    void setSplit(QPoint pt){ const QRect ar=artRect(); if(ar.width()>0){ split=qBound(0.03,double(pt.x()-ar.left())/ar.width(),0.97); update(); } }
+};
+} // namespace
+
+bool MainWindow::bitmapExportDialog(const QString& initialPath){
+    const int npages=m_canvas->pageCount();
+    // ---- format table (only what QImageWriter can actually write here) ----
+    struct Fmt { QString key, name, hint; };
+    const auto writable = QImageWriter::supportedImageFormats();
+    QVector<Fmt> fmts = { {"png","PNG","Lossless + alpha"}, {"jpg","JPEG","Photographic"} };
+    if(writable.contains("webp")) fmts.push_back({"webp","WebP","Modern web"});
+    if(writable.contains("tiff")) fmts.push_back({"tif","TIFF","Print"});
+    fmts.push_back({"gif","GIF","Indexed"}); fmts.push_back({"bmp","BMP","Uncompressed"});
+
+    // ---- state ----
+    QString curFmt = QFileInfo(initialPath).suffix().toLower();
+    if(curFmt=="jpeg") curFmt="jpg"; if(curFmt=="tiff") curFmt="tif";
+    { bool ok=false; for(const Fmt& f:fmts) if(f.key==curFmt) ok=true; if(!ok) curFmt="png"; }
+    int   areaIdx  = m_canvas->selection().isEmpty()? 1 : 2;
+    int   pageIdx  = qBound(0, m_canvas->currentPage(), qMax(0,npages-1));
+    double scaleVal= 2.0;
+    int   quality  = 90;
+    bool  indexed  = false, dither=false, transparent=true;
+    int   matte    = 0;                                   // 0 checker/keep · 1 white · 2 black
+    QString folder = QFileInfo(initialPath).absolutePath();
+    QString stem   = QFileInfo(initialPath).completeBaseName(); if(stem.isEmpty()) stem="export";
+
+    auto human=[](qint64 b)->QString{ if(b<1024) return QString("%1 B").arg(b);
+        if(b<1024*1024) return QString("%1 KB").arg(b/1024.0,0,'f',b<10240?1:0);
+        return QString("%1 MB").arg(b/1048576.0,0,'f',2); };
+    auto alphaFmt=[&]{ return curFmt=="png"||curFmt=="webp"||curFmt=="tif"||curFmt=="gif"; };
+    auto indexable=[&]{ return curFmt=="png"||curFmt=="gif"||curFmt=="bmp"; };
+    auto qualityFmt=[&]{ return curFmt=="jpg"||curFmt=="webp"; };
+
+    // ---- shell ----
+    QDialog dlg(this); dlg.setObjectName("exportDlg"); dlg.setModal(true);
+    dlg.setWindowFlags(Qt::Dialog|Qt::FramelessWindowHint);
+    dlg.resize(1080, 700);
+    dlg.setStyleSheet(R"QSS(
+        #exportDlg { background:#171A20; border:1px solid rgba(255,255,255,0.16); }
+        #expHeader,#expFooter { background:#111318; }
+        #expTitle { font-family:"Montserrat"; font-weight:700; font-size:15px; color:#EEF1F5; }
+        #expDoc,#expOutPath { font-family:"Ubuntu Mono"; font-size:11px; color:#6E7787; }
+        #expOut { font-family:"Ubuntu Mono"; font-size:12px; color:#D2D8E0; }
+        #expReadout { font-family:"Ubuntu Mono"; font-size:11px; color:#8B94A3; }
+        #expClose { color:#8B94A3; border:none; font-size:16px; font-weight:700; background:transparent; }
+        #expClose:hover { color:#EEF1F5; }
+        QLabel[secHdr="true"] { color:#6E7787; font-weight:700; font-size:11px; }
+        QLabel[rowLbl="true"] { color:#8B94A3; font-size:12px; }
+        #expRail { background:#171A20; border-left:1px solid rgba(255,255,255,0.10); }
+        QToolButton[seg="true"] { background:#23272F; border:1px solid rgba(255,255,255,0.10); color:#8B94A3; padding:3px 9px; font-size:11px; }
+        QToolButton[seg="true"]:checked { background:rgba(45,111,247,0.24); border:1px solid #2D6FF7; color:#7FA5FF; }
+        QToolButton[card="true"] { background:#23272F; border:1px solid rgba(255,255,255,0.10); border-radius:3px; text-align:left; padding:8px 10px; color:#D2D8E0; font-weight:700; font-size:12px; }
+        QToolButton[card="true"]:checked { background:rgba(45,111,247,0.16); border:1px solid #2D6FF7; color:#7FA5FF; }
+        #expPrimary { background:#2D6FF7; color:white; border:none; border-radius:4px; padding:9px 20px; font-weight:700; }
+        #expPrimary:hover { background:#3B79FF; }
+        #expGhost { background:transparent; color:#8B94A3; border:1px solid rgba(255,255,255,0.10); border-radius:4px; padding:9px 16px; }
+        #expGhost:hover { color:#EEF1F5; background:#1D2027; }
+        QLineEdit { background:#23272F; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#D2D8E0; padding:4px 7px; }
+        QScrollArea { border:none; }
+        QSlider::groove:horizontal { height:4px; background:#23272F; border-radius:2px; }
+        QSlider::handle:horizontal { width:12px; margin:-5px 0; background:#2D6FF7; border-radius:6px; }
+        QSlider::sub-page:horizontal { background:#3B79FF; border-radius:2px; }
+    )QSS");
+
+    auto* root=new QVBoxLayout(&dlg); root->setContentsMargins(0,0,0,0); root->setSpacing(0);
+
+    // ---- header ----
+    auto* header=new QWidget; header->setObjectName("expHeader"); header->setFixedHeight(48);
+    { auto* h=new QHBoxLayout(header); h->setContentsMargins(16,0,10,0); h->setSpacing(10);
+      auto* dot=new QLabel; dot->setFixedSize(9,9); dot->setStyleSheet("background:#2D6FF7;border-radius:2px;");
+      auto* title=new QLabel("Export bitmap"); title->setObjectName("expTitle");
+      auto* doc=new QLabel(QFileInfo(initialPath).fileName()); doc->setObjectName("expDoc");
+      auto* close=new QToolButton; close->setObjectName("expClose"); close->setText("✕"); close->setCursor(Qt::PointingHandCursor);
+      connect(close,&QToolButton::clicked,&dlg,&QDialog::reject);
+      h->addWidget(dot); h->addWidget(title); h->addSpacing(4); h->addWidget(doc); h->addStretch(); h->addWidget(close); }
+    root->addWidget(header);
+
+    // ---- body ----
+    auto* body=new QWidget; auto* bodyH=new QHBoxLayout(body); bodyH->setContentsMargins(0,0,0,0); bodyH->setSpacing(0);
+    root->addWidget(body,1);
+
+    // preview column
+    auto* prevCol=new QWidget; auto* prevV=new QVBoxLayout(prevCol); prevV->setContentsMargins(0,0,0,0); prevV->setSpacing(0);
+    prevCol->setStyleSheet("background:#0C0D10;");
+    auto* prevBar=new QWidget; prevBar->setFixedHeight(40); prevBar->setStyleSheet("background:#111318;border-bottom:1px solid rgba(255,255,255,0.06);");
+    auto* pbH=new QHBoxLayout(prevBar); pbH->setContentsMargins(12,0,12,0); pbH->setSpacing(8);
+    auto* preview=new ExportPreview;
+    auto* readout=new QLabel; readout->setObjectName("expReadout");
+    auto* readBar=new QWidget; readBar->setFixedHeight(30); readBar->setStyleSheet("background:#111318;border-top:1px solid rgba(255,255,255,0.06);");
+    { auto* rh=new QHBoxLayout(readBar); rh->setContentsMargins(12,0,12,0); rh->addWidget(readout); rh->addStretch(); }
+    prevV->addWidget(prevBar); prevV->addWidget(preview,1); prevV->addWidget(readBar);
+    bodyH->addWidget(prevCol,1);
+
+    // options rail
+    auto* rail=new QScrollArea; rail->setObjectName("expRail"); rail->setWidgetResizable(true); rail->setFixedWidth(360);
+    rail->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto* railInner=new QWidget; railInner->setObjectName("expRail"); auto* railV=new QVBoxLayout(railInner);
+    railV->setContentsMargins(0,0,0,10); railV->setSpacing(0); rail->setWidget(railInner);
+    bodyH->addWidget(rail);
+
+    // ---- footer ----
+    auto* footer=new QWidget; footer->setObjectName("expFooter"); footer->setFixedHeight(58);
+    auto* outLine=new QLabel; outLine->setObjectName("expOut");
+    auto* outPathLbl=new QLabel; outPathLbl->setObjectName("expOutPath");
+    auto* cancelBtn=new QPushButton("Cancel"); cancelBtn->setObjectName("expGhost"); cancelBtn->setCursor(Qt::PointingHandCursor);
+    auto* exportBtn=new QPushButton("Export"); exportBtn->setObjectName("expPrimary"); exportBtn->setCursor(Qt::PointingHandCursor); exportBtn->setDefault(true);
+    { auto* f=new QHBoxLayout(footer); f->setContentsMargins(16,0,16,0); f->setSpacing(12);
+      auto* col=new QVBoxLayout; col->setSpacing(3); col->addWidget(outLine); col->addWidget(outPathLbl);
+      f->addLayout(col); f->addStretch(); f->addWidget(cancelBtn); f->addWidget(exportBtn); }
+    root->addWidget(footer);
+    connect(cancelBtn,&QPushButton::clicked,&dlg,&QDialog::reject);
+
+    // ---- helpers to build controls ----
+    std::function<void()> refresh;                                   // assigned after widgets exist
+    auto seg=[&](QStringList items, int cur, std::function<void(int)> on)->QWidget*{
+        auto* w=new QWidget; auto* l=new QHBoxLayout(w); l->setContentsMargins(0,0,0,0); l->setSpacing(0);
+        auto* grp=new QButtonGroup(w); grp->setExclusive(true);
+        for(int i=0;i<items.size();++i){ auto* b=new QToolButton; b->setProperty("seg",true); b->setCheckable(true);
+            b->setText(items[i]); b->setCursor(Qt::PointingHandCursor); b->setChecked(i==cur); grp->addButton(b,i); l->addWidget(b,1); }
+        connect(grp,QOverload<int>::of(&QButtonGroup::idClicked),w,[on](int i){ on(i); });
+        return w; };
+    auto secHeader=[&](const QString& t){ auto* w=new QWidget; auto* l=new QHBoxLayout(w); l->setContentsMargins(16,13,16,7); l->setSpacing(8);
+        auto* lbl=new QLabel(t.toUpper()); lbl->setProperty("secHdr",true);
+        auto* rule=new QFrame; rule->setFrameShape(QFrame::HLine); rule->setStyleSheet("color:rgba(255,255,255,0.06);");
+        l->addWidget(lbl); l->addWidget(rule,1); railV->addWidget(w); };
+    auto rowWrap=[&](QWidget* content){ auto* w=new QWidget; auto* l=new QHBoxLayout(w); l->setContentsMargins(16,3,16,3); l->addWidget(content); railV->addWidget(w); };
+    auto labeledRow=[&](const QString& label, QWidget* content){ auto* w=new QWidget; auto* l=new QHBoxLayout(w); l->setContentsMargins(16,4,16,4); l->setSpacing(10);
+        auto* lb=new QLabel(label); lb->setProperty("rowLbl",true); lb->setFixedWidth(96); l->addWidget(lb); l->addWidget(content,1); railV->addWidget(w); };
+
+    // ---- SOURCE AREA ----
+    secHeader("Source area");
+    rowWrap(seg({"Page","Drawing","Selection"}, areaIdx, [&](int i){ areaIdx=i; if(refresh) refresh(); }));
+    QWidget* pageRow=nullptr;
+    if(npages>1){ auto* pc=new QComboBox; for(int i=0;i<npages;++i) pc->addItem(QString("Page %1").arg(i+1)); pc->setCurrentIndex(pageIdx);
+        connect(pc,QOverload<int>::of(&QComboBox::currentIndexChanged),&dlg,[&](int i){ pageIdx=i; if(refresh) refresh(); });
+        auto* w=new QWidget; auto* l=new QHBoxLayout(w); l->setContentsMargins(16,4,16,4); l->setSpacing(10);
+        auto* lb=new QLabel("Page"); lb->setProperty("rowLbl",true); lb->setFixedWidth(96); l->addWidget(lb); l->addWidget(pc,1);
+        railV->addWidget(w); pageRow=w; }
+
+    // ---- SIZE & RESOLUTION ----
+    secHeader("Size");
+    rowWrap(seg({"0.5×","1×","2×","3×","4×"}, 2, [&](int i){ const double sc[]={0.5,1,2,3,4}; scaleVal=sc[i]; if(refresh) refresh(); }));
+
+    // ---- FILE FORMAT ----
+    secHeader("File format");
+    QVector<QToolButton*> cards;
+    { auto* w=new QWidget; auto* grid=new QGridLayout(w); grid->setContentsMargins(16,4,16,6); grid->setSpacing(6);
+      auto* grp=new QButtonGroup(w); grp->setExclusive(true);
+      for(int i=0;i<fmts.size();++i){ auto* c=new QToolButton; c->setProperty("card",true); c->setCheckable(true);
+          c->setText(fmts[i].name); c->setToolTip(fmts[i].hint); c->setCursor(Qt::PointingHandCursor);
+          c->setSizePolicy(QSizePolicy::Expanding,QSizePolicy::Fixed); c->setChecked(fmts[i].key==curFmt);
+          grp->addButton(c,i); grid->addWidget(c, i/2, i%2); cards.push_back(c); }
+      connect(grp,QOverload<int>::of(&QButtonGroup::idClicked),&dlg,[&,fmts](int i){ curFmt=fmts[i].key; if(refresh) refresh(); });
+      railV->addWidget(w); }
+
+    // ---- FORMAT OPTIONS (quality / palette) — shown per format ----
+    auto* qualityRow=new QWidget; { auto* l=new QHBoxLayout(qualityRow); l->setContentsMargins(16,4,16,4); l->setSpacing(10);
+        auto* lb=new QLabel("Quality"); lb->setProperty("rowLbl",true); lb->setFixedWidth(96);
+        auto* sld=new QSlider(Qt::Horizontal); sld->setRange(1,100); sld->setValue(quality);
+        auto* val=new QLabel(QString::number(quality)); val->setObjectName("expReadout"); val->setFixedWidth(28);
+        connect(sld,&QSlider::valueChanged,&dlg,[&,val](int v){ quality=v; val->setText(QString::number(v)); if(refresh) refresh(); });
+        l->addWidget(lb); l->addWidget(sld,1); l->addWidget(val); }
+    railV->addWidget(qualityRow);
+    auto* paletteRow=new QWidget; { auto* l=new QVBoxLayout(paletteRow); l->setContentsMargins(16,2,16,4); l->setSpacing(7);
+        auto* c1=new QCheckBox("Reduce to a 256-colour palette"); c1->setChecked(indexed);
+        auto* c2=new QCheckBox("Dither (Floyd–Steinberg)"); c2->setChecked(dither); c2->setEnabled(indexed);
+        connect(c1,&QCheckBox::toggled,&dlg,[&,c2](bool on){ indexed=on; c2->setEnabled(on); if(refresh) refresh(); });
+        connect(c2,&QCheckBox::toggled,&dlg,[&](bool on){ dither=on; if(refresh) refresh(); });
+        l->addWidget(c1); l->addWidget(c2); }
+    railV->addWidget(paletteRow);
+
+    // ---- TRANSPARENCY ----
+    secHeader("Transparency");
+    auto* transRow=new QWidget; { auto* l=new QVBoxLayout(transRow); l->setContentsMargins(16,2,16,4); l->setSpacing(7);
+        auto* tc=new QCheckBox("Transparent background"); tc->setChecked(transparent);
+        connect(tc,&QCheckBox::toggled,&dlg,[&](bool on){ transparent=on; if(refresh) refresh(); });
+        auto* mrow=new QWidget; auto* ml=new QHBoxLayout(mrow); ml->setContentsMargins(0,0,0,0); ml->setSpacing(10);
+        auto* mlb=new QLabel("Matte"); mlb->setProperty("rowLbl",true); mlb->setFixedWidth(96);
+        ml->addWidget(mlb); ml->addWidget(seg({"Checker","White","Black"},0,[&](int i){ matte=i; preview->matte=i; if(refresh) refresh(); }),1);
+        l->addWidget(tc); l->addWidget(mrow); }
+    railV->addWidget(transRow);
+
+    // ---- DESTINATION ----
+    secHeader("Destination");
+    { auto* fnEdit=new QLineEdit(stem); connect(fnEdit,&QLineEdit::textChanged,&dlg,[&](const QString& t){ stem=t.trimmed().isEmpty()?"export":t.trimmed(); if(refresh) refresh(); });
+      labeledRow("File name", fnEdit);
+      auto* folderW=new QWidget; auto* fl=new QHBoxLayout(folderW); fl->setContentsMargins(0,0,0,0); fl->setSpacing(6);
+      auto* fEdit=new QLineEdit(folder); auto* browse=new QPushButton("Browse…"); browse->setObjectName("expGhost"); browse->setCursor(Qt::PointingHandCursor);
+      connect(fEdit,&QLineEdit::textChanged,&dlg,[&](const QString& t){ folder=t; if(refresh) refresh(); });
+      connect(browse,&QPushButton::clicked,&dlg,[&,fEdit]{ QString d=QFileDialog::getExistingDirectory(&dlg,"Export folder",folder); if(!d.isEmpty()){ folder=d; fEdit->setText(d); } });
+      fl->addWidget(fEdit,1); fl->addWidget(browse); labeledRow("Folder", folderW); }
+    railV->addStretch();
+
+    // ---- preview toolbar (mode + matte) ----
+    { auto* mlbl=new QLabel("COMPARE"); mlbl->setProperty("secHdr",true);
+      pbH->addWidget(mlbl);
+      pbH->addWidget(seg({"Split","Source","Output"},0,[&](int i){ preview->mode=i; preview->update(); }));
+      pbH->addStretch();
+      auto* mm=new QLabel("MATTE"); mm->setProperty("secHdr",true); pbH->addWidget(mm);
+      pbH->addWidget(seg({"⬛","◻","◼"},0,[&](int i){ matte=i; preview->matte=i; if(refresh) refresh(); })); }
+
+    // ---- refresh: render source (preview res) + encode to the chosen format for the real output ----
+    auto prepare=[&](const QImage& s)->QImage{
+        QImage e=s;
+        if(!(transparent && alphaFmt())){ QImage flat(e.size(), QImage::Format_RGB32); flat.fill(matte==2?Qt::black:Qt::white); QPainter p(&flat); p.drawImage(0,0,e); p.end(); e=flat; }
+        if(indexed && indexable()) e=e.convertToFormat(QImage::Format_Indexed8, Qt::AutoColor|(dither?Qt::DiffuseDither:Qt::ThresholdDither)|(dither?Qt::PreferDither:Qt::AvoidDither));
+        return e; };
+    auto encodeTo=[&](const QImage& prep, QByteArray* bytesOut)->QImage{
+        QByteArray qfmt = curFmt=="jpg"?"jpeg": curFmt=="tif"?"tiff": curFmt.toUtf8();
+        QByteArray buf; QBuffer b(&buf); b.open(QIODevice::WriteOnly);
+        QImageWriter w(&b, qfmt); if(qualityFmt()) w.setQuality(quality);
+        QImage out; if(w.canWrite() && w.write(prep)){ b.close(); if(bytesOut)*bytesOut=buf; out.loadFromData(buf, qfmt.constData()); }
+        if(out.isNull()){ if(bytesOut) bytesOut->clear(); return prep; } return out; };
+
+    refresh=[&]{
+        qualityRow->setVisible(qualityFmt());
+        paletteRow->setVisible(indexable());
+        for(int i=0;i<fmts.size();++i) cards[i]->setChecked(fmts[i].key==curFmt);
+        if(pageRow) pageRow->setVisible(areaIdx==0);
+        QImage src=m_canvas->exportRasterImage(areaIdx, scaleVal, transparent, npages>1?pageIdx:-1, 1400);
+        QByteArray bytes; QImage out=encodeTo(prepare(src), &bytes);
+        preview->setImages(src, out);
+        const QRectF ar=m_canvas->exportAreaRect(areaIdx, npages>1?pageIdx:-1);
+        const long rw=qMax(1L,long(ar.width()*scaleVal)), rh=qMax(1L,long(ar.height()*scaleVal));
+        const double ratio=(double(rw)*rh)/qMax(1.0,double(src.width())*src.height());
+        const qint64 est=qint64(bytes.size()*ratio);
+        readout->setText(QString("%1 × %2 px   ·   real encoder preview").arg(rw).arg(rh));
+        outLine->setText(QString("%1.%2   ·   %3 × %4   ·   ≈ %5").arg(stem, curFmt).arg(rw).arg(rh).arg(human(est)));
+        outPathLbl->setText(QDir(folder).filePath(stem+"."+curFmt));
+    };
+
+    connect(exportBtn,&QPushButton::clicked,&dlg,[&]{
+        const QString outPath=QDir(folder).filePath(stem+"."+curFmt);
+        QImage src=m_canvas->exportRasterImage(areaIdx, scaleVal, transparent, npages>1?pageIdx:-1, 0);   // full resolution
+        QByteArray bytes; QImage out=encodeTo(prepare(src), &bytes);
+        bool ok=false;
+        if(!bytes.isEmpty()){ QFile f(outPath); if(f.open(QIODevice::WriteOnly)){ ok=(f.write(bytes)==bytes.size()); f.close(); } }
+        else ok=out.save(outPath);
+        if(ok){ statusBar()->showMessage("Exported — "+QFileInfo(outPath).fileName(), 5000); dlg.accept(); }
+        else statusBar()->showMessage("Export failed", 4000);
+    });
+
+    refresh();
+    dlg.exec();
+    return true;
+}
 
 // Xara-style Print dialog: Printer + Pages (all / current / selected objects / range) + Copies & collate +
 // Layout (fit / actual / scale, orientation, centre) + Output (quality, greyscale) + a live page preview.
@@ -1919,52 +2425,112 @@ void MainWindow::updateTitle(){
 // status badge can sit truly CENTERED between the menus (left) and the Share/cloud controls (right),
 // exactly like ui_kits/editor. The real QMenuBar is embedded live, so all menus/shortcuts keep working.
 void MainWindow::buildTitleBar(){
-    auto* bar=new QWidget; bar->setObjectName("titleBar"); bar->setFixedHeight(40);
-    auto* h=new QHBoxLayout(bar); h->setContentsMargins(12,0,10,0); h->setSpacing(10);
+    // Frameless single-row chrome (38px): [ Save Export ] | (title ⇄ menu on hover) | XarQ v.. [ – ▢ ✕ ]
+    auto* bar=new DragBar([this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
+    bar->setObjectName("titleBar"); bar->setFixedHeight(38); m_titleBarW=bar;
+    auto* h=new QHBoxLayout(bar); h->setContentsMargins(0,0,0,0); h->setSpacing(0);
+    auto hair=[&]{ auto* d=new QFrame; d->setObjectName("titleHair"); d->setFixedSize(1,20); return d; };
 
-    // Every item is added with AlignVCenter so it keeps its natural height and sits on the bar's centre-line
-    // (without it, QLabels/badges stretch to the full 40px bar height — the "Unsaved" pill ballooned).
-    auto* word=new QLabel("<span style='color:#5488FF'>X</span>arQ"); word->setObjectName("appTitle");
-    word->setTextFormat(Qt::RichText);
-    h->addWidget(word, 0, Qt::AlignVCenter);
-    h->addWidget(m_menuBar, 0, Qt::AlignVCenter);
+    // LEFT — quick actions (Save, Export)
+    auto* left=new QWidget; auto* lh=new QHBoxLayout(left); lh->setContentsMargins(10,0,10,0); lh->setSpacing(7);
+    m_saveBtn=new QToolButton; m_saveBtn->setObjectName("titleSave"); m_saveBtn->setFixedSize(30,30);
+    m_saveBtn->setIconSize(QSize(16,16)); m_saveBtn->setCursor(Qt::PointingHandCursor);
+    connect(m_saveBtn,&QToolButton::clicked,this,[this]{ saveFile(); });
+    m_exportBtn=new QToolButton; m_exportBtn->setObjectName("titleQuick"); m_exportBtn->setFixedSize(30,30);
+    m_exportBtn->setIcon(actionIcon("export",15,QColor(174,179,186))); m_exportBtn->setIconSize(QSize(16,16));
+    m_exportBtn->setCursor(Qt::PointingHandCursor); m_exportBtn->setToolTip("Export…  Ctrl+E");
+    connect(m_exportBtn,&QToolButton::clicked,this,[this]{ exportImage(); });
+    lh->addWidget(m_saveBtn); lh->addWidget(m_exportBtn);
+    h->addWidget(left,0,Qt::AlignVCenter); h->addWidget(hair(),0,Qt::AlignVCenter);
 
-    h->addStretch(1);   // ← centering strut (left)
-    m_docName=new QLabel; m_docName->setObjectName("docName");
-    m_docBadge=new QLabel; m_docBadge->setObjectName("docBadge");
-    h->addWidget(m_docName, 0, Qt::AlignVCenter); h->addWidget(m_docBadge, 0, Qt::AlignVCenter);
-    h->addStretch(1);   // ← centering strut (right)
+    // CENTER — document identity ⇄ menu bar (cross-fade on hover)
+    auto* center=new QWidget; center->setObjectName("titleCenter");
+    auto* stack=new QStackedLayout(center); stack->setStackingMode(QStackedLayout::StackAll); stack->setContentsMargins(0,0,0,0);
+    m_menuLayer=new QWidget; auto* mlh=new QHBoxLayout(m_menuLayer); mlh->setContentsMargins(0,0,0,0); mlh->setSpacing(1);
+    mlh->addStretch(1); mlh->addWidget(m_menuBar,0,Qt::AlignCenter); mlh->addStretch(1);
+    m_docLayer=new QWidget; m_docLayer->setAttribute(Qt::WA_TransparentForMouseEvents,true);  // click-through → dragging the title moves the window
+    auto* dv=new QVBoxLayout(m_docLayer); dv->setContentsMargins(0,0,0,0); dv->setSpacing(1); dv->setAlignment(Qt::AlignCenter);
+    m_pathLabel=new QLabel; m_pathLabel->setObjectName("titlePath"); m_pathLabel->setAlignment(Qt::AlignCenter); m_pathLabel->hide();  // hidden until there's a real path, so an empty line doesn't push the title off-centre
+    m_titleLabel=new QLabel; m_titleLabel->setObjectName("titleName"); m_titleLabel->setAlignment(Qt::AlignCenter);
+    dv->addWidget(m_pathLabel,0,Qt::AlignCenter); dv->addWidget(m_titleLabel,0,Qt::AlignCenter);
+    stack->addWidget(m_menuLayer); stack->addWidget(m_docLayer);   // doc identity on top, menu beneath
+    m_docFx=new QGraphicsOpacityEffect(m_docLayer); m_docFx->setOpacity(1.0); m_docLayer->setGraphicsEffect(m_docFx);
+    m_menuFx=new QGraphicsOpacityEffect(m_menuLayer); m_menuFx->setOpacity(0.0); m_menuLayer->setGraphicsEffect(m_menuFx);
+    m_docAnim=new QPropertyAnimation(m_docFx,"opacity",this); m_docAnim->setDuration(150); m_docAnim->setEasingCurve(QEasingCurve::OutCubic);
+    m_menuAnim=new QPropertyAnimation(m_menuFx,"opacity",this); m_menuAnim->setDuration(150); m_menuAnim->setEasingCurve(QEasingCurve::OutCubic);
+    new TitleCenterHover(center,[this](bool on){ setCenterHover(on); });
+    h->addWidget(center,1); h->addWidget(hair(),0,Qt::AlignVCenter);
 
-    auto* share=new QToolButton; share->setObjectName("titleGhost"); share->setText("↗  Share");
-    share->setCursor(Qt::PointingHandCursor); share->setToolTip("Share");
-    connect(share,&QToolButton::clicked,this,[this]{ statusBar()->showMessage("Sharing is available when a document is published to the web.",2500); });
-    auto* cloud=new QToolButton; cloud->setObjectName("titleGhost"); cloud->setText("☁");
-    cloud->setCursor(Qt::PointingHandCursor); cloud->setToolTip("Sync status");
-    h->addWidget(share, 0, Qt::AlignVCenter); h->addWidget(cloud, 0, Qt::AlignVCenter);
+    // RIGHT — wordmark + version + window controls
+    auto* wm=new QWidget; auto* wmh=new QHBoxLayout(wm); wmh->setContentsMargins(14,0,8,0); wmh->setSpacing(6);
+    auto* word=new QLabel("<span style='color:#5488FF'>X</span>arQ"); word->setObjectName("brandWord"); word->setTextFormat(Qt::RichText);
+    auto* ver=new QLabel("v0.9"); ver->setObjectName("brandVer");
+    wmh->addWidget(word,0,Qt::AlignVCenter); wmh->addWidget(ver,0,Qt::AlignVCenter);
+    h->addWidget(wm,0,Qt::AlignVCenter);
+    auto mkWin=[&](const QString& glyph,const QString& obj,const QString& tip){
+        auto* b=new QToolButton; b->setObjectName(obj); b->setIcon(actionIcon(glyph,14,QColor(174,179,186))); b->setIconSize(QSize(15,15));
+        b->setFixedSize(46,38); b->setCursor(Qt::PointingHandCursor); b->setToolTip(tip); return b; };
+    m_minBtn  =mkWin("win-min","winBtn","Minimize");    connect(m_minBtn,&QToolButton::clicked,this,[this]{ showMinimized(); });
+    m_maxBtn  =mkWin("win-max","winBtn","Maximize");    connect(m_maxBtn,&QToolButton::clicked,this,[this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
+    m_closeBtn=mkWin("win-close","winClose","Close");   connect(m_closeBtn,&QToolButton::clicked,this,[this]{ close(); });
+    new HoverIconSwap(m_closeBtn, actionIcon("win-close",14,QColor(174,179,186)), actionIcon("win-close",14,QColor(255,255,255)));
+    h->addWidget(m_minBtn); h->addWidget(m_maxBtn); h->addWidget(m_closeBtn);
 
     setMenuWidget(bar);
+    updateMaxButtonIcon();
     refreshDocStatus();
+}
+// Cross-fade the centre zone: identity out + menu in on hover, reversed on leave (respects reduced motion).
+void MainWindow::setCenterHover(bool on){
+    if(!m_docFx || !m_menuFx) return;
+    const double dTo=on?0.0:1.0, mTo=on?1.0:0.0;
+    m_docAnim->stop(); m_docAnim->setStartValue(m_docFx->opacity()); m_docAnim->setEndValue(dTo); m_docAnim->start();
+    m_menuAnim->stop(); m_menuAnim->setStartValue(m_menuFx->opacity()); m_menuAnim->setEndValue(mTo); m_menuAnim->start();
+}
+void MainWindow::updateSaveButton(){
+    if(!m_saveBtn) return;
+    m_saveBtn->setIcon(actionIcon("save",15, m_dirty?QColor(0x51,0xcf,0x66):QColor(174,179,186)));
+    m_saveBtn->setToolTip(m_dirty? "Save — unsaved changes  Ctrl+S" : "Saved  Ctrl+S");
+    m_saveBtn->setProperty("dirty", m_dirty);
+    m_saveBtn->style()->unpolish(m_saveBtn); m_saveBtn->style()->polish(m_saveBtn);
+}
+void MainWindow::updateCenterIdentity(){
+    if(!m_pathLabel || !m_titleLabel) return;
+    if(m_activeTab<0){ m_pathLabel->setText(""); m_pathLabel->hide(); m_titleFull="No document"; reelideTitle(); return; }
+    const QString p=m_canvas->filePath();
+    // Only reserve a line for the folder path when there IS one; otherwise the empty label would occupy
+    // vertical space above the title and leave it looking bottom-heavy (e.g. a fresh "Untitled").
+    m_pathLabel->setText(p.isEmpty()? "" : QFileInfo(p).absolutePath()); m_pathLabel->setVisible(!p.isEmpty());
+    m_titleFull = p.isEmpty()? "Untitled" : QFileInfo(p).fileName();
+    reelideTitle();
+}
+void MainWindow::reelideTitle(){
+    if(!m_titleLabel) return;
+    const int avail = m_titleLabel->parentWidget()? qMax(80, m_titleLabel->parentWidget()->width()-24) : 400;
+    m_titleLabel->setText(m_titleLabel->fontMetrics().elidedText(m_titleFull, Qt::ElideMiddle, avail));
+}
+void MainWindow::updateMaxButtonIcon(){
+    if(m_maxBtn){ const bool mx=isMaximized();
+        m_maxBtn->setIcon(actionIcon(mx?"win-restore":"win-max",14,QColor(174,179,186)));
+        m_maxBtn->setToolTip(mx?"Restore":"Maximize"); }
+    if(m_titleBarW){ m_titleBarW->setProperty("maxed", isMaximized());
+        m_titleBarW->style()->unpolish(m_titleBarW); m_titleBarW->style()->polish(m_titleBarW); }
+}
+void MainWindow::changeEvent(QEvent* e){
+    QMainWindow::changeEvent(e);
+    if(e->type()==QEvent::WindowStateChange) updateMaxButtonIcon();
+}
+void MainWindow::resizeEvent(QResizeEvent* e){
+    QMainWindow::resizeEvent(e);
+    reelideTitle();
 }
 
 void MainWindow::refreshDocStatus(){
-    if(!m_docName || !m_docBadge) return;
-    if(m_activeTab<0){   // empty state — no document open
-        m_docName->setText("No document");
-        m_docBadge->setText("");
-        m_docBadge->setProperty("tone","ok");
-        m_docBadge->style()->unpolish(m_docBadge); m_docBadge->style()->polish(m_docBadge);
-        if(m_sSaved){ m_sSaved->setText("");
-            m_sSaved->setProperty("tone","ok");
-            m_sSaved->style()->unpolish(m_sSaved); m_sSaved->style()->polish(m_sSaved); }
-        return;
-    }
-    const QString p=m_canvas->filePath();
-    m_docName->setText(p.isEmpty()? "Untitled" : QFileInfo(p).fileName());
-    m_docBadge->setText(m_dirty ? "Unsaved" : "Saved");
-    m_docBadge->setProperty("tone", m_dirty ? "warning" : "ok");
-    m_docBadge->style()->unpolish(m_docBadge); m_docBadge->style()->polish(m_docBadge);   // re-evaluate QSS on tone change
-    if(m_sSaved){ m_sSaved->setText(m_dirty ? "● Unsaved" : "✓ Saved");
-        m_sSaved->setProperty("tone", m_dirty ? "warning" : "ok");
+    updateCenterIdentity();   // path + middle-elided title in the centre zone
+    updateSaveButton();       // green Save when dirty
+    const bool doc = m_activeTab>=0;
+    if(m_sSaved){ m_sSaved->setText(!doc ? "" : (m_dirty ? "● Unsaved" : "✓ Saved"));
+        m_sSaved->setProperty("tone", (doc && m_dirty) ? "warning" : "ok");
         m_sSaved->style()->unpolish(m_sSaved); m_sSaved->style()->polish(m_sSaved); }
 }
 

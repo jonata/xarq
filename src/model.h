@@ -56,6 +56,9 @@ struct Fill {
     QPointF  p0{0, 0}, p1{1, 0}, p2{0, 1};    // start / end / end2
     double   profileBias = 0.0, profileGain = 0.0;  // Schlick profile ([-1,+1], 0=linear) reshaping the graduation
     QImage   image;                           // bitmap texture (FillType::Bitmap)
+    QByteArray imageSrc;                        // ORIGINAL encoded file bytes (PNG/JPEG/GIF) as imported — saveXar writes these
+                                               // directly instead of re-encoding `image` (a slow zlib PNG pass per image, which
+                                               // froze saves/autosave/recovery on image-heavy SVGs); empty ⇒ re-encode. Not serialised.
     QImage   origImage;                        // unmodified source (photo adjustments re-derive `image` from this; not serialised)
     QImage   adjustMask;                        // Photo Mask Painter: grayscale coverage (255=adjust, 0=keep original); empty = whole image; not serialised
     bool     contone = false;                 // tint a greyscale image between color (0) and color2 (255)
@@ -271,6 +274,7 @@ struct Shape {
     Extrude   extrude;
     Table     table;                          // grid data when type==ShapeType::Table
     double    feather = 0.0;                   // feathered (soft) edge radius, doc units (0 = hard)
+    double    blurGain = 1.0;                   // blurred coverage is multiplied by this, then clamped (1 = plain blur)
     double    blur = 0.0;                       // live Gaussian blur radius, doc units (0 = sharp); whole-object soft-focus
     double    featherBias = 0.0, featherGain = 0.0;  // Schlick profile ([-1,+1]) shaping the feather falloff
     Qt::FillRule fillRule = Qt::OddEvenFill;   // path fill rule (Xara default = even-odd)
@@ -366,6 +370,7 @@ struct Shape {
     double  textPathOffset = 0;                // Text-on-curve: start distance (doc units) along the path; 0 = at the path start
     bool    textPathInside = false;            // Text-on-curve: flip glyphs to the reverse side (underside) of the path — reads upright on a bottom arc
     QVector<Shape> children;                  // Group
+    bool   isolate = false;                   // Group: composite children into their own buffer, then apply opacity, blend and mask as one
     bool   isClipView = false;                // ClipView group: keyhole children clip the content children
     int    blendSteps = 0;                     // LIVE blend group: >0 and exactly 2 children (the ends) => render regenerates this many morphed in-betweens
     int    clipSplit = 0;                     // ClipView: children[0..clipSplit) = keyhole(s); [clipSplit..) = clipped content
@@ -467,6 +472,8 @@ public:
     QColor          pageColor = Qt::white;
     int             pageCount = 1;         // pages stacked vertically on the pasteboard (Xara-style)
     double          pageGap = 50;          // gap between stacked pages, doc px
+    double          bleed = 0;             // print bleed from an imported document, doc px; the crop-mark export's default
+    QVector<double> guidesH, guidesV;      // ruler guides, as saved; the canvas edits its own live copies
     QPointF         rulerOrigin{0,0};      // doc-space point shown as (0,0) on the rulers (0,0 = default; view-only)
     bool            scaleLineWidths = true; // Xara default: resizing an object also scales its stroke width (& shadow)
     QVector<NamedColor> namedColors;       // document palette (named/theme/tint/shade/linked)

@@ -10,11 +10,25 @@
 // caller places them in the document.
 #pragma once
 #include <QByteArray>
+#include <QSizeF>
 #include <QString>
 #include <QVector>
+#include <QRectF>
 #include "model.h"
 
 namespace xara {
 // baseDir: directory to resolve relative <image> hrefs against (empty = only data-URI/absolute images).
-QVector<Shape> parseSvg(const QByteArray& xml, QString* error = nullptr, const QString& baseDir = QString());
+// pagesOut (optional): receives the document-space rects of any Inkscape 1.2+ <inkscape:page> elements, so
+// the caller can map a multi-page SVG onto real document pages.
+// The VIEWPORT the document's content is laid out in: the root <svg>'s width/height when present
+// (units resolved), else its viewBox extent. parseSvg maps viewBox -> viewport, so this — NOT the
+// viewBox extent — is the size a page must take to match the imported artwork. librevenge writes
+// the two in DIFFERENT units (width in inches, viewBox in points), so confusing them scales the
+// page wrong by 33% or more. Null when the input has no usable root element.
+QSizeF svgViewportSize(const QByteArray& xml);
+
+QVector<Shape> parseSvg(const QByteArray& xml, QString* error = nullptr, const QString& baseDir = QString(),
+                        QVector<QRectF>* pagesOut = nullptr);
+// Parse an SVG/ODF path-data string ("M..C..Z") into a QPainterPath (shared with the ODF importer).
+QPainterPath parseSvgPathData(const QString& d);
 }

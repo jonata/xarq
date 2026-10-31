@@ -1,4 +1,5 @@
 #include "canvas.h"
+#include "pdfvector.h"
 #include "render.h"
 #include "pathedit.h"
 #include "photoops.h"
@@ -12,11 +13,25 @@
 #include "prepress.h"
 #include "icc.h"
 #include "raw.h"
+#include "rasterextra.h"
+#include "vecextra.h"
+#include "gisvector.h"
+#include "dwgvector.h"
+#include "affvector.h"
+#include "extcodecs.h"
 #include "xar.h"
 #include <QPainter>
 #include <QSettings>
+#include <QElapsedTimer>
+#include "cdrvector.h"
+#include "extvector.h"
+#include "wmf.h"
 #include <QTimer>
 #include <QApplication>
+#include <QCursor>
+#include "icons.h"     // toolIcon() — the Ctrl radial menu's inner ring draws tool icons
+#include <QFontInfo>
+#include <QSet>
 #include <QClipboard>
 #include <QUrl>
 #include <QFileInfo>
@@ -57,6 +72,18 @@
 
 using namespace xara;
 
+// Above this many QPainterPath elements, the selection silhouette is not stroked every frame during a drag
+// (bbox + handles + the moving-proxy bitmap suffice); it returns in full when the drag ends. See drawSelection.
+static const int kDragOutlineStrokeCap = 1500;
+// Max device-pixel area for the drag-proxy capture. Beyond this the moving bitmap is rendered at reduced
+// resolution (and drawn back up to size) so the ONE-TIME build can't freeze the UI on a heavy group / HiDPI
+// screen. ~6 Mpx: bigger than a typical object at dpr 1, so ordinary drags capture at full resolution.
+static const qint64 kDragProxyBudgetPx = 6LL*1024*1024;
+// Above this many objects in the document, per-object snapping is skipped during a move (page edges, guides and
+// the grid still snap). Scanning every object's bounds each frame — with an O(M) membership test per object —
+// is O(N·M) and freezes a heavy doc; and past a few thousand candidates the 6 px snap threshold always finds
+// *something*, so object snapping is meaningless noise anyway. See snapAdjust.
+static const int kSnapObjectCandidateCap = 4000;
 static const QColor kBg(43, 45, 51);          // workspace
 static const QColor kBgDark(33, 35, 40);
 static const QColor kAccent(70, 150, 245);
@@ -66,6 +93,23 @@ Canvas::Canvas(QWidget* parent) : QWidget(parent) {
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
     setCursor(Qt::ArrowCursor);
+    // Every committed document change emits documentChanged → invalidate the screen-render cache.
+    connect(this, &Canvas::documentChanged, this, [this]{ m_cacheDirty = true; });
+    // The static selection-outline cache is invalid whenever the selection or the document changes.
+    connect(this, &Canvas::documentChanged,  this, [this]{ m_selCacheValid = false; });
+    connect(this, &Canvas::selectionChanged, this, [this]{ m_selCacheValid = false; });
+    // Coalesce documentChanged into documentChangedDebounced. One-off edits (menu ops, typing, programmatic
+    // changes — anything with no live drag in flight) forward immediately so panels stay in lock-step and
+    // the self-test sees synchronous refreshes. While a drag is emitting documentChanged every frame, the
+    // heavy O(N) galleries/panels instead get a single trailing refresh ~45 ms after the gesture settles.
+    m_docDebounceTimer = new QTimer(this);
+    m_docDebounceTimer->setSingleShot(true);
+    m_docDebounceTimer->setInterval(45);
+    connect(m_docDebounceTimer, &QTimer::timeout, this, [this]{ emit documentChangedDebounced(); });
+    connect(this, &Canvas::documentChanged, this, [this]{
+        if (manipulatingContent()) m_docDebounceTimer->start();
+        else { m_docDebounceTimer->stop(); emit documentChangedDebounced(); }
+    });
     setAcceptDrops(true);   // colour swatches can be dragged from the Colour Line onto objects
     m_fill.type = FillType::Solid; m_fill.color = QColor(74,144,226);
     m_stroke.enabled = true; m_stroke.color = QColor(28,32,40); m_stroke.width = 1.5;
@@ -323,30 +367,81 @@ QRectF Canvas::selBoundsDoc() const {
     for (int i : m_sel) { QRectF db=m_doc.shapes[i].docBounds(); b=b.isNull()?db:b.united(db); }
     return b;
 }
+// Build the doc-space selection silhouette + bounds that drawSelection strokes, but only when the cache is stale.
+// This is the ONLY place that recurses a group's full geometry for the overlay — reused across every repaint until
+// the selection/doc changes, so a per-frame repaint (e.g. sweeping the Ctrl+Alt pie) no longer rebuilds it each frame.
+// Cheap recursive SHAPE COUNT — a pure pointer walk, builds no paths. Used to decide whether a selection is small
+// enough to build the exact (merged, AA-stroked) silhouette or must fall back to bbox-only.
+static int countShapesRec(const Shape& s){
+    if (s.type != ShapeType::Group) return 1;
+    int n=1; for (const Shape& c : s.children) n += countShapesRec(c); return n;
+}
+// Doc-space bounds of a shape via child-RECT unions — never builds one giant merged QPainterPath. A Group's
+// Shape::localPath()/docBounds() recurse the whole subtree into a single enormous path (then boundingRect it); for a
+// 35-page imported group that merge alone is a multi-second stall. This unions leaf bounding rects instead.
+static QRectF cheapLocalBounds(const Shape& s){
+    if (s.type != ShapeType::Group) return s.localBounds();      // leaf: its own small path's bbox
+    QRectF b;
+    for (const Shape& c : s.children){ QRectF cb = c.transform.mapRect(cheapLocalBounds(c)); b = b.isNull()? cb : b.united(cb); }
+    return b;
+}
+static const int kSelOutlineShapeCap = 400;   // above this many shapes, skip the merged/AA-stroked silhouette — bbox + handles only
+
+void Canvas::ensureSelOutlineCache(){
+    // A live manipulation moves the geometry every frame, so never serve a stale outline during one — always rebuild
+    // (the non-drag idle/pie-hover case is where caching matters, and there manipulatingContent() is false).
+    if (m_selCacheValid && !manipulatingContent()) return;
+    m_selOutlineDoc = QPainterPath();
+    if (inGroup()) {
+        // Dashed "you are inside this group" boundary = the whole container silhouette (expensive) — build it only if
+        // the container is small enough. The HANDLE BOX is the sub-selection bounds (usually one child → cheap + exact).
+        const Shape* c=enteredContainer();
+        if (c && countShapesRec(*c) <= kSelOutlineShapeCap) m_selOutlineDoc = containerXf().map(c->localPath());
+        m_selBoundsDoc = selBoundsDoc();
+    } else {
+        int count=0; for (int i : m_sel) if (i>=0 && i<m_doc.shapes.size()) count += countShapesRec(m_doc.shapes[i]);
+        if (count <= kSelOutlineShapeCap) {                         // light: exact silhouette + exact bounds (no regression)
+            for (int i : m_sel) if (i>=0 && i<m_doc.shapes.size()) m_selOutlineDoc.addPath(Document::docPath(m_doc.shapes[i]));
+            m_selBoundsDoc = m_selOutlineDoc.boundingRect();
+        } else {                                                    // heavy: no giant merge — union cheap leaf rects for the box
+            QRectF b; for (int i : m_sel) if (i>=0 && i<m_doc.shapes.size()){ const Shape& s=m_doc.shapes[i];
+                QRectF db = s.transform.mapRect(cheapLocalBounds(s)); b = b.isNull()? db : b.united(db); }
+            m_selBoundsDoc = b;
+        }
+    }
+    m_selCacheValid = !manipulatingContent();          // don't persist a transient mid-manipulation snapshot
+}
 void Canvas::select(const QVector<int>& idx){ resetGroupEntry(); m_sel=idx; m_rotateMode=false; m_rotPivotSet=false; emit selectionChanged(); update(); }
 void Canvas::selectAll(){ m_sel.clear(); for(int i=0;i<m_doc.shapes.size();++i) m_sel.push_back(i); emit selectionChanged(); update(); }
 void Canvas::selectNone(){ if(m_sel.isEmpty())return; m_sel.clear(); emit selectionChanged(); update(); }
 
 void Canvas::pushUndo(const QString& label) {
-    m_undo.push_back(serialize());
+    m_cacheDirty = true;   // a mutation is about to happen (belt-and-suspenders with the documentChanged hook)
+    m_undo.push_back(captureSnap());   // COW snapshot: ~free here, detaches lazily on the coming mutation
     m_undoLabels.push_back(label);
     if (m_undo.size() > 200) { m_undo.removeFirst(); m_undoLabels.removeFirst(); }
     m_redo.clear(); m_redoLabels.clear();
 }
-QByteArray Canvas::serialize() const {
-    QJsonObject o = m_doc.toJson();
-    QJsonArray sel; for (int i : m_sel) sel.append(i); o["sel"]=sel;
-    return QJsonDocument(o).toJson(QJsonDocument::Compact);
+Canvas::UndoSnap Canvas::captureSnap() const {
+    UndoSnap s{ m_doc, m_sel };
+    // Give the snapshot its OWN copy of the mutable per-object containers, leaving m_doc's storage (and any
+    // live `Shape& s = m_doc.shapes[i]` references held across pushUndo) pointing at the original. Several edit
+    // paths grab such a reference BEFORE pushUndo and mutate through it afterwards (replacePhotoAt, text/cell/
+    // mask edits); without this, that write would bypass copy-on-write and corrupt the shared snapshot. The
+    // detach is an O(N) shallow copy of the struct array (~2 ms for 3000 objects) — still ~30× cheaper than the
+    // old whole-document JSON serialize, and each Shape's own image/text/path stays COW-shared until it changes.
+    s.doc.shapes.detach();
+    s.doc.layers.detach();
+    return s;
 }
-void Canvas::deserialize(const QByteArray& b) {
-    QJsonObject o = QJsonDocument::fromJson(b).object();
-    m_doc = Document::fromJson(o);
-    m_sel.clear(); for (auto v : o["sel"].toArray()){ int i=v.toInt(); if(i>=0&&i<m_doc.shapes.size()) m_sel.push_back(i);}
+void Canvas::applyUndoSnap(const UndoSnap& s) {
+    m_doc = s.doc;
+    m_sel.clear(); for (int i : s.sel) if(i>=0 && i<m_doc.shapes.size()) m_sel.push_back(i);
     m_nodeShape=-1; m_nodeChild=-1; m_nodeSub=-1; m_nodeIndex=-1; m_nodes.clear();  // path may have changed; re-parse on next edit
     resetCloneState(); resetMaskStroke();   // undo/redo restored a different doc state; clone/mask state may be stale
 }
-void Canvas::undo(){ if(m_undo.size()<1)return; if(m_cropMode) cancelCropMode(); resetGroupEntry(); m_redo.push_back(serialize()); m_redoLabels.push_back(m_undoLabels.isEmpty()?QString():m_undoLabels.takeLast()); deserialize(m_undo.takeLast()); syncTextEditToDoc(); emit selectionChanged(); emit documentChanged(); update(); }
-void Canvas::redo(){ if(m_redo.isEmpty())return; if(m_cropMode) cancelCropMode(); resetGroupEntry(); m_undo.push_back(serialize()); m_undoLabels.push_back(m_redoLabels.isEmpty()?QString():m_redoLabels.takeLast()); deserialize(m_redo.takeLast()); syncTextEditToDoc(); emit selectionChanged(); emit documentChanged(); update(); }
+void Canvas::undo(){ if(m_undo.size()<1)return; if(m_cropMode) cancelCropMode(); resetGroupEntry(); m_redo.push_back(captureSnap()); m_redoLabels.push_back(m_undoLabels.isEmpty()?QString():m_undoLabels.takeLast()); applyUndoSnap(m_undo.takeLast()); syncTextEditToDoc(); emit selectionChanged(); emit documentChanged(); update(); }
+void Canvas::redo(){ if(m_redo.isEmpty())return; if(m_cropMode) cancelCropMode(); resetGroupEntry(); m_undo.push_back(captureSnap()); m_undoLabels.push_back(m_redoLabels.isEmpty()?QString():m_redoLabels.takeLast()); applyUndoSnap(m_redo.takeLast()); syncTextEditToDoc(); emit selectionChanged(); emit documentChanged(); update(); }
 
 // Round every corner of a closed/open polyline: inset by `r` along both edges and arc through the vertex.
 static QPainterPath roundPolyCorners(const QPolygonF& poly, bool closed, double r) {
@@ -967,7 +1062,10 @@ void Canvas::addShapes(const QVector<Shape>& s, const QString& label) {
     pushUndo(label);
     QVector<int> nsel;
     for (Shape sh : s) { sh.layer=m_activeLayer; nsel.push_back(m_doc.addShape(sh)); }
-    m_sel = nsel;
+    // Don't auto-select thousands of freshly-imported objects: the per-selection UI (InfoBar bounds,
+    // Properties panel, gallery highlighting) doesn't scale to that many, so a big import (e.g. a 9k-object
+    // .cdr) would otherwise freeze on the selectionChanged refresh. A huge selection isn't useful anyway.
+    m_sel = (nsel.size() > 2000) ? QVector<int>() : nsel;
     emit documentChanged(); emit selectionChanged(); update();
 }
 
@@ -1091,19 +1189,25 @@ void Canvas::copySelection(){ if(m_sel.isEmpty())return; QJsonArray a;
             QGuiApplication::clipboard()->setImage(img); } } }
 // Paste a bitmap sitting on the OS clipboard (e.g. a screenshot) as a new photo object. Final fallback in
 // the Paste chain (after the internal shape clipboard and rich text).
+// Create a new photo (Bitmap-fill Rect) from a raw image, centred at centerDoc, and select it.
+// Single source of truth for the bitmap-fill parallelogram convention — see render.cpp bitmapTexXf:
+// image top-left maps to p2, bottom-left to p0, so p0=bottom-left / p1=bottom-right / p2=top-left is
+// upright. (p0=(0,0)/p2=(0,H) would negate the Y step and flip the image vertically.)
+int Canvas::placeBitmap(const QImage& src, const QPointF& centerDoc, const char* undoLabel){
+    if(src.isNull()) return -1;
+    QImage img = (src.format()==QImage::Format_ARGB32) ? src : src.convertToFormat(QImage::Format_ARGB32);
+    pushUndo(undoLabel);
+    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,img.width(),img.height());
+    s.fill.type=FillType::Bitmap; s.fill.image=img; s.fill.origImage=img;
+    s.fill.p0=QPointF(0,img.height()); s.fill.p1=QPointF(img.width(),img.height()); s.fill.p2=QPointF(0,0);
+    s.stroke.enabled=false; s.name="Pasted image";
+    s.transform=QTransform::fromTranslate(centerDoc.x()-img.width()/2.0, centerDoc.y()-img.height()/2.0);
+    m_doc.shapes.push_back(s); const int idx=m_doc.shapes.size()-1; m_sel={idx};
+    emit documentChanged(); emit selectionChanged(); update(); return idx; }
 bool Canvas::pasteBitmapFromClipboard(){
     QImage img=QGuiApplication::clipboard()->image();
     if(img.isNull()) return false;
-    if(img.format()!=QImage::Format_ARGB32) img=img.convertToFormat(QImage::Format_ARGB32);
-    pushUndo("Paste bitmap");
-    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,img.width(),img.height());
-    s.fill.type=FillType::Bitmap; s.fill.image=img; s.fill.origImage=img;
-    s.fill.p0=QPointF(0,0); s.fill.p1=QPointF(img.width(),0); s.fill.p2=QPointF(0,img.height());
-    s.stroke.enabled=false; s.name="Pasted image";
-    QPointF c=toDoc(QPointF(width()/2.0,height()/2.0));
-    s.transform=QTransform::fromTranslate(c.x()-img.width()/2.0, c.y()-img.height()/2.0);
-    m_doc.shapes.push_back(s); m_sel={m_doc.shapes.size()-1};
-    emit documentChanged(); emit selectionChanged(); update(); return true; }
+    return placeBitmap(img, toDoc(QPointF(width()/2.0,height()/2.0)), "Paste bitmap") >= 0; }
 void Canvas::cutSelection(){ if(m_sel.isEmpty())return; copySelection(); deleteSelection(); }
 bool Canvas::pasteClipboard(){ if(m_clip.isEmpty())return false; QJsonArray a=QJsonDocument::fromJson(m_clip).array(); if(a.isEmpty())return false;
     pushUndo("Paste"); QVector<int> ns;
@@ -1255,10 +1359,59 @@ void Canvas::maskDab(Shape& s, QPointF destImg, double targetGray){
         } }
 }
 
+// Collect the distinct <text> font families that Qt could NOT resolve to the requested family
+// (i.e. it substituted a fallback). Recurses into groups. Used to warn the user that a font the
+// document needs isn't available in THIS session — the usual cause is that the font was installed
+// after XarQ launched (Qt reads the system font database once, at process start).
+static void collectSubstitutedFonts(const QVector<Shape>& v, QSet<QString>& out){
+    for(const Shape& s : v){
+        if(s.type==ShapeType::Group){ collectSubstitutedFonts(s.children, out); continue; }
+        if(s.type!=ShapeType::Text) continue;
+        const QString want=s.font.family();
+        if(want.isEmpty()) continue;
+        if(QFontInfo(s.font).family().compare(want, Qt::CaseInsensitive)!=0) out.insert(want);
+    }
+}
+QStringList Canvas::substitutedFontFamilies(const QVector<Shape>& shapes){
+    QSet<QString> missing; collectSubstitutedFonts(shapes, missing);
+    QStringList names(missing.begin(), missing.end()); names.sort(Qt::CaseInsensitive);
+    return names;
+}
+void Canvas::warnMissingFonts(const QVector<Shape>& shapes){
+    const QStringList names = substitutedFontFamilies(shapes);
+    if(names.isEmpty()) return;
+    const QString msg = QStringLiteral("Substituted %1 not available in this session: %2 — install %3 and restart XarQ to render exactly.")
+        .arg(names.size()==1?"font":"fonts", names.join(", "), names.size()==1?"it":"them");
+    // Defer so it lands AFTER the importer's own \"Imported …\" status message (same event-loop turn).
+    QTimer::singleShot(0, this, [this,msg]{ emit statusMessage(msg); });
+}
 bool Canvas::importSvgFile(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
-    QString err; QVector<Shape> shapes=parseSvg(f.readAll(), &err, QFileInfo(path).absolutePath());
+    QVector<QRectF> pages;
+    QString err; QVector<Shape> shapes=parseSvg(f.readAll(), &err, QFileInfo(path).absolutePath(), &pages);
     if(shapes.isEmpty()) return false;
+    warnMissingFonts(shapes);
+
+    // Inkscape 1.2+ multi-page SVG (pages laid out horizontally on the infinite canvas): map each
+    // <inkscape:page> onto a real XarQ page (stacked vertically). Only when opening into a fresh document —
+    // File ▸ Import into an existing drawing keeps the current flat behaviour. Objects move from their source
+    // page's rect into the matching stacked page; the page size is the first page's.
+    if(pages.size()>=2 && m_doc.shapes.isEmpty()){
+        Document d; d.pageSize=pages[0].size(); d.pageCount=pages.size(); d.pageGap=50;
+        const double adv=d.pageSize.height()+d.pageGap;
+        for(Shape s : shapes){
+            const QPointF ctr=s.docBounds().center();
+            int pg=-1; for(int i=0;i<pages.size();++i) if(pages[i].contains(ctr)){ pg=i; break; }   // its home page
+            if(pg<0){ double best=1e300; for(int i=0;i<pages.size();++i){ double dd=QLineF(ctr,pages[i].center()).length(); if(dd<best){ best=dd; pg=i; } } }  // off-page → nearest
+            if(pg<0) pg=0;
+            const QPointF delta=QPointF(0.0, pg*adv) - pages[pg].topLeft();   // source-page → stacked XarQ page
+            s.transform = s.transform * QTransform::fromTranslate(delta.x(), delta.y());
+            d.addShape(s);
+        }
+        setDocument(d); refreshAll(); zoomFit();
+        return true;
+    }
+
     addShapes(shapes, "Import SVG");   // undo + select
     zoomFit();
     return true;
@@ -1266,15 +1419,73 @@ bool Canvas::importSvgFile(const QString& path){
 
 bool Canvas::importVectorFile(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
-    const QByteArray data=f.readAll();
+    QByteArray data=f.readAll();
+    // DOS/binary EPS wrapper (also what .ept is): a 30-byte header — magic C5 D0 D3 C6, then u32-LE
+    // offset+length for the PostScript section, the WMF preview and the TIFF preview. Unwrap to the
+    // PostScript so the EPS parser sees plain text; plain-text EPS files are unaffected.
+    QByteArray dosPreview;                       // TIFF/WMF preview carried by a DOS-wrapped EPS
+    if(data.size()>=30 && quint8(data[0])==0xC5 && quint8(data[1])==0xD0 && quint8(data[2])==0xD3 && quint8(data[3])==0xC6){
+        auto le32=[&](int o)->quint32{ return quint32(quint8(data[o])) | (quint32(quint8(data[o+1]))<<8)
+                                            | (quint32(quint8(data[o+2]))<<16) | (quint32(quint8(data[o+3]))<<24); };
+        const qint64 off=le32(4), len=le32(8);
+        const qint64 tOff=le32(20), tLen=le32(24);      // TIFF preview section
+        if(tOff>=30 && tLen>0 && tOff+tLen<=qint64(data.size())) dosPreview=data.mid(int(tOff), int(tLen));
+        if(off>=30 && len>0 && off+len<=qint64(data.size())) data=data.mid(int(off), int(len));
+    }
+    const bool pdfExt = path.endsWith(".pdf",Qt::CaseInsensitive) || path.endsWith(".epdf",Qt::CaseInsensitive) || path.endsWith(".pdfa",Qt::CaseInsensitive);
+    // Poppler reads the whole PDF language. A modern .ai is a PDF too. The built-in reader stays as the
+    // fallback for a build without it or a file it refuses.
+    if((pdfExt || (path.endsWith(".ai",Qt::CaseInsensitive) && data.startsWith("%PDF"))) && xara::pdfVectorAvailable()){
+        emit statusMessage(QStringLiteral("Importing PDF… %1").arg(QFileInfo(path).fileName()));
+        QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+        struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        xara::PdfVectorStats st;
+        const QStringList pages = xara::pdfToSvgPages(path, &st);
+        if(st.encrypted){ emit statusMessage("This PDF is password protected, so it can't be imported."); return false; }
+        if(importVectorSvgPages(pages, QStringLiteral("Import PDF"), QStringLiteral("Imported PDF"), QStringLiteral("poppler"))){
+            if(st.totalPages > st.pages) emit statusMessage(QStringLiteral("Imported the first %1 of %2 PDF pages.").arg(st.pages).arg(st.totalPages));
+            else if(st.softMasks > 0) emit statusMessage(QStringLiteral("Imported PDF: %1 soft mask(s) were drawn without their mask.").arg(st.softMasks));
+            return true;
+        }
+    }
     Document imported;
-    if(path.endsWith(".pdf",Qt::CaseInsensitive)) imported=importPdf(data);
+    if(pdfExt) imported=importPdf(data);
     else if(path.endsWith(".ai",Qt::CaseInsensitive)) imported=importAi(data);   // modern AI = PDF, classic = EPS
+    else if(path.endsWith(".dwg",Qt::CaseInsensitive)) imported=dwgToDocument(path);   // AutoCAD DWG via LibreDWG (reads by path)
     else if(path.endsWith(".dxf",Qt::CaseInsensitive)) imported=importDxf(data);
     else if(path.endsWith(".wmf",Qt::CaseInsensitive)) imported=importWmf(data);
     else if(path.endsWith(".emf",Qt::CaseInsensitive)) imported=importEmf(data);
     else imported=importEps(data);           // .eps
-    if(imported.shapes.isEmpty()) return false;
+    if(imported.shapes.isEmpty()){
+        // No vector content. A raster-only EPS needs a full PostScript interpreter to rasterise, but a
+        // DOS-wrapped one usually carries a TIFF preview of exactly that artwork — place it rather than
+        // failing outright.
+        if(!dosPreview.isEmpty()){
+            QImage prev; prev.loadFromData(dosPreview);
+            if(!prev.isNull()){
+                placeZipComposite(prev, QFileInfo(path).fileName()+QStringLiteral(" (preview)"),
+                                  QStringLiteral("Import EPS preview"));
+                emit statusMessage("Imported the EPS preview image (no vector content in the PostScript).");
+                return true;
+            }
+        }
+        // Raster-only PostScript whose pixels are a plain hex stream (ImageMagick's DisplayImage
+        // prologue) can be read without an interpreter.
+        { const QImage pras = pdfRasterImage(data);
+          if(!pras.isNull()){
+              placeZipComposite(pras, QFileInfo(path).fileName(), QStringLiteral("Import PDF image"));
+              emit statusMessage("Imported the raster image embedded in the PDF.");
+              return true;
+          } }
+        { const QImage ras = psDisplayImageRaster(data);
+          if(!ras.isNull()){
+              placeZipComposite(ras, QFileInfo(path).fileName(), QStringLiteral("Import PostScript image"));
+              emit statusMessage("Imported the raster image embedded in the PostScript.");
+              return true;
+          } }
+        return false;
+    }
     addShapes(imported.shapes, "Import vector");
     zoomFit();
     return true;
@@ -1437,21 +1648,66 @@ void Canvas::dropEvent(QDropEvent* e){
                : (path.isEmpty()? QImage() : QImage(path));
     if(!img.isNull()){
         if(replacePhotoAt(d, img)){ e->acceptProposedAction(); return; }
-        if(!path.isEmpty() && importImage(path)){ e->acceptProposedAction(); return; }
+        if(!path.isEmpty() && importImage(path)){ emit fileImported(path); e->acceptProposedAction(); return; }
+        // A raw image with no local file (e.g. dragged from a browser) → drop it as a new photo at the cursor.
+        if(placeBitmap(img, d, "Drop image") >= 0){ e->acceptProposedAction(); return; }
     }
     // A non-raster file was dropped (vector / document / e-book): route it by extension to the matching
     // importer instead of silently doing nothing (QImage(path) only handles raster formats).
-    if(!path.isEmpty() && dropImportByExtension(path)) e->acceptProposedAction();
+    if(!path.isEmpty() && dropImportByExtension(path)){ emit fileImported(path); e->acceptProposedAction(); }
 }
 // Dispatch a dropped file to the importer for its type. Reused by the canvas drop handler.
 bool Canvas::dropImportByExtension(const QString& p){
     auto ends=[&](const char* s){ return p.endsWith(QLatin1String(s), Qt::CaseInsensitive); };
     if(ends(".svg"))  return importSvgFile(p);
-    if(ends(".pdf")||ends(".ai")||ends(".eps")||ends(".dxf")) return importVectorFile(p);
+    if(ends(".pdf")||ends(".epdf")||ends(".pdfa")||ends(".ai")||ends(".eps")||ends(".epsi")||ends(".ept")||ends(".epsf")||ends(".eps2")||ends(".eps3")||ends(".epi")||ends(".ept2")||ends(".ept3")||ends(".ps")||ends(".ps2")||ends(".ps3")||ends(".dxf")||ends(".dwg")) return importVectorFile(p);   // .ps/.epsi = plain PostScript → the EPS path parser
     if(ends(".epub")) return importEpub(p);
     if(ends(".docx")) return importDocx(p);
+    if(ends(".fb2")||ends(".fb2.zip")||ends(".fbz")) return importFb2(p);   // FictionBook e-book
     if(ends(".cdr"))  return importCdr(p);
+    if(ends(".cmx"))  return importCmx(p);
     if(ends(".rtf"))  return importRtfFile(p);
+    if(ends(".cbz"))  return importCbz(p);
+    if(ends(".cbr")||ends(".cb7")||ends(".cbt")) return importCbr(p);
+    if(ends(".apng")) return importApng(p)||importImage(p);
+    if(ends(".odg")||ends(".odp")||ends(".odt")||ends(".ods")||ends(".otg")||ends(".otp")||ends(".ott")||
+       ends(".fodg")||ends(".fodp")||ends(".fodt")||ends(".sxd")||ends(".sxi")||ends(".sxw")||ends(".std")||ends(".sti"))
+        return importOdg(p);   // all OpenDocument + flat-ODF + OpenOffice.org 1.x → the shared ODF reader
+    if(ends(".wpg"))  return importWpg(p);
+    if(ends(".vsd")||ends(".vsdx")||ends(".vdx")||ends(".vss")||ends(".vssx")||ends(".vst")||ends(".vstx")||ends(".vsdm")) return importVisio(p);
+    if(ends(".fh")||ends(".fh4")||ends(".fh5")||ends(".fh6")||ends(".fh7")||ends(".fh8")||ends(".fh9")||ends(".fh10")||ends(".fh11")||ends(".fhd")||ends(".ft8")||ends(".ft9")||ends(".ft10")||ends(".ft11")) return importFreehand(p);
+    if(ends(".pub"))  return importMsPub(p);
+    if(ends(".pmd")||ends(".pm6")||ends(".pm5")||ends(".pm4")||ends(".p65")||ends(".t65")) return importPageMaker(p);
+    if(ends(".zmf"))  return importZmf(p);
+    if(ends(".qxp")||ends(".qxd")||ends(".qxb")||ends(".qxt")) return importQxp(p);
+    if(ends(".sda")||ends(".sdd")) return importStarOffice(p);
+    if(ends(".key")||ends(".pages")||ends(".numbers")) return importIWork(p);   // Keynote slides / Pages + Numbers text
+    if(ends(".cwk")||ends(".drw")) return importMwaw(p);
+    if(ends(".dgn")||ends(".tab")||ends(".mif")||ends(".gpkg")||ends(".gml")||ends(".s57")||ends(".000")) return importOgr(p);
+    if(ends(".gv")||ends(".dot")) return importDot(p);
+    if(ends(".tgs"))  return importTgs(p);
+    if(ends(".topojson")) return importTopoJson(p);
+    if(ends(".vml"))  return importVml(p);
+    if(ends(".xps")||ends(".oxps")) return importXps(p);
+    if(ends(".sla")||ends(".scd")) return importScribus(p);
+    if(ends(".afdesign")||ends(".afphoto")||ends(".afpub")||ends(".aftemplate")||ends(".afpackage")||ends(".af"))
+        return importAffinity(p);   // one container covers every Affinity file type
+    if(ends(".ora"))  return importOra(p);
+    if(ends(".kra"))  return importKra(p);
+    if(ends(".wmf")||ends(".apm")) return importWmfFile(p);   // .apm = Aldus Placeable Metafile (libwmf/native both detect the 0x9AC6CDD7 header)
+    if(ends(".geojson")) return importGeoJson(p);
+    if(ends(".kml")||ends(".kmz")) return importKml(p);
+    if(ends(".plt")||ends(".hpgl")||ends(".hgl")) return importHpgl(p);
+    if(ends(".shp"))  return importShapefile(p);
+    if(ends(".gpx"))  return importGpx(p);
+    if(ends(".fig"))  return importXfig(p);
+    if(ends(".cgm"))  return importCgm(p);
+    if(ends(".svgz")) return importSvgz(p);
+    if(ends(".gbr")||ends(".ger")||ends(".gtl")||ends(".gbl")||ends(".gts")||ends(".gbs")||ends(".gto")||ends(".gbo")||ends(".gko")||ends(".gm1")||ends(".gpt")||ends(".pho")) return importGerber(p);
+    if(ends(".drl")||ends(".xnc")||ends(".drd")||ends(".tap")||ends(".exc")||ends(".nc")) return importExcellon(p);
+    if(ends(".lottie")) return importLottie(p);
+    if(ends(".sketch")) return importSketch(p);
+    if(ends(".json")) return importLottie(p)||importGeoJson(p);
     if(ends(".gif"))  return importAnimatedGif(p);
     if(ends(".xar"))  return load(p);          // open a dropped native document
     return importImage(p);                      // last resort: let Qt's image plugins try (covers PSD etc.)
@@ -2295,6 +2551,16 @@ QString Canvas::selectionMenuTree() const {
 
 // Format a character range of the selected Text object: resolve to per-character attrs, apply
 // the overrides, then re-coalesce into contiguous runs. Robust to text edits (ranges clamped).
+// Rebuild s.textRuns from per-character attribute arrays, coalescing equal-attribute neighbours into runs.
+static void coalesceTextRuns(Shape& s, const QVector<QFont>& fonts, const QVector<QColor>& colors,
+                             const QVector<QString>& urls, const QVector<double>& bl){
+    const int n=s.text.size(); QVector<TextRun> runs; int i=0;
+    while(i<n){ int j=i+1; while(j<n && fonts[j]==fonts[i] && colors[j]==colors[i] && urls[j]==urls[i] && bl[j]==bl[i]) ++j;
+        TextRun r; r.start=i; r.len=j-i; r.font=fonts[i]; r.color=colors[i]; r.url=urls[i]; r.baseline=bl[i];
+        if(fonts[i].letterSpacingType()==QFont::AbsoluteSpacing) r.tracking=fonts[i].letterSpacing(); runs.push_back(r); i=j; }
+    s.textRuns=runs;
+}
+
 void Canvas::setTextRunAttr(int start, int len, const QFont* font, const QColor* color, const QString* url){
     Shape* s=firstSelected(); if(!s || s->type!=ShapeType::Text) { emit statusMessage("Select a text object first."); return; }
     const int n=s->text.size(); if(n==0) return;
@@ -2304,12 +2570,35 @@ void Canvas::setTextRunAttr(int start, int len, const QFont* font, const QColor*
     const QVector<double> bl=s->resolveBaselines();   // preserve any baseline shift across a font/colour edit
     for(int i=start;i<end;++i){ if(font) fonts[i]=*font; if(color) colors[i]=*color; if(url) urls[i]=*url; }
     pushUndo("Format text");
-    QVector<TextRun> runs; int i=0;
-    while(i<n){ int j=i+1; while(j<n && fonts[j]==fonts[i] && colors[j]==colors[i] && urls[j]==urls[i] && bl[j]==bl[i]) ++j;
-        TextRun r; r.start=i; r.len=j-i; r.font=fonts[i]; r.color=colors[i]; r.url=urls[i]; r.baseline=bl[i];
-        if(fonts[i].letterSpacingType()==QFont::AbsoluteSpacing) r.tracking=fonts[i].letterSpacing(); runs.push_back(r); i=j; }
-    s->textRuns=runs;
+    coalesceTextRuns(*s,fonts,colors,urls,bl);
     syncLiveCopies(); emit documentChanged(); emit selectionChanged(); update();
+}
+
+// Inkscape-style per-selection formatting: while editing text on-canvas with a selection, apply `mut` to each
+// selected character's font/colour and re-coalesce runs. No selection (or not editing) → returns false so the
+// caller falls back to formatting the whole object.
+bool Canvas::formatEditSelection(const std::function<void(QFont&,QColor&)>& mut, const QString& label){
+    if(!(editingText() && textHasSelection())) return false;
+    Shape& s=m_doc.shapes[m_textEdit]; const int n=s.text.size(); if(n==0) return false;
+    int a=qBound(0,qMin(m_caret,m_caretAnchor),n), b=qBound(0,qMax(m_caret,m_caretAnchor),n); if(b<=a) return false;
+    QVector<QFont> fonts; QVector<QColor> colors; QVector<QString> urls; s.resolveChars(fonts,colors,urls);
+    const QVector<double> bl=s.resolveBaselines();
+    for(int i=a;i<b;++i) mut(fonts[i],colors[i]);
+    pushUndo(label);
+    coalesceTextRuns(s,fonts,colors,urls,bl);
+    syncLiveCopies(); emit documentChanged(); emit selectionChanged(); update();
+    return true;
+}
+
+// Resolved font of the first selected character (for the InfoBar to reflect / toggle the selection's state).
+QFont Canvas::editSelectionFont() const {
+    if(editingText()){ const Shape& s=m_doc.shapes[m_textEdit];
+        int a=qMax(0,qMin(m_caret, m_caretAnchor>=0?m_caretAnchor:m_caret));
+        QVector<QFont> fonts; QVector<QColor> colors; QVector<QString> urls; s.resolveChars(fonts,colors,urls);
+        if(a<fonts.size()) return fonts[a];
+        if(!fonts.isEmpty()) return fonts.back();
+        return s.font; }
+    return QFont();
 }
 
 // Set per-run typography (baseline shift + letter-spacing) over a character range. baseline>0 raises
@@ -2397,7 +2686,14 @@ Shape Canvas::shapeFromRtf(const QByteArray& rtf){
     QString plain; QVector<QFont> fonts; QVector<QColor> colors; QVector<QString> urls;
     int depth=0, skipDepth=-1;   // skipDepth: inside a header/ignored group
     auto mkFont=[&]{ QFont f(baseFam, -1); f.setPointSizeF(fs>0?fs:baseSize); f.setBold(bold); f.setItalic(ital); return f; };
-    auto emitCh=[&](QChar ch){ plain+=ch; fonts.push_back(mkFont()); colors.push_back(col); urls.push_back(QString()); };
+    // Robustness: build ONE QFont per run (bold/italic/size change) and share it across the run's chars —
+    // Qt implicit sharing means push_back copies only the d-pointer, so a huge RTF can't allocate a fresh
+    // heavyweight QFontPrivate per character. Also cap total emitted chars so the parallel vectors stay bounded.
+    static const int kMaxRtfChars=2000000;
+    QFont curFont=mkFont(); bool fontDirty=false;
+    auto emitCh=[&](QChar ch){ if(plain.size()>=kMaxRtfChars) return;
+        if(fontDirty){ curFont=mkFont(); fontDirty=false; }
+        plain+=ch; fonts.push_back(curFont); colors.push_back(col); urls.push_back(QString()); };
     const int N=rtf.size();
     for(int i=0;i<N;){
         char c=rtf[i];
@@ -2418,12 +2714,12 @@ Shape Canvas::shapeFromRtf(const QByteArray& rtf){
             if(j<N && rtf[j]==' ') ++j;   // a single trailing space is a delimiter, not text
             if(cw=="fonttbl"||cw=="colortbl"||cw=="stylesheet"||cw=="info"||cw=="pict"||cw=="header"||cw=="footer"){ skipDepth=depth; }
             else if(skipDepth<0){
-                if(cw=="b") bold=!hasNum||num!=0;
-                else if(cw=="i") ital=!hasNum||num!=0;
-                else if(cw=="fs") fs=(hasNum?num:baseSize*2)/2.0;
+                if(cw=="b"){ bold=!hasNum||num!=0; fontDirty=true; }
+                else if(cw=="i"){ ital=!hasNum||num!=0; fontDirty=true; }
+                else if(cw=="fs"){ fs=(hasNum?num:baseSize*2)/2.0; fontDirty=true; }
                 else if(cw=="cf"){ int idx=hasNum?num:0; col=(idx>=0&&idx<ctab.size())?ctab[idx]:QColor(Qt::black); }
                 else if(cw=="par"||cw=="line") emitCh(QChar('\n'));
-                else if(cw=="plain"){ bold=false; ital=false; fs=baseSize; col=QColor(Qt::black); }
+                else if(cw=="plain"){ bold=false; ital=false; fs=baseSize; col=QColor(Qt::black); fontDirty=true; }
                 else if(cw=="tab") emitCh(QChar('\t'));
             }
             i=j; continue;
@@ -2524,7 +2820,7 @@ QString Canvas::fontFaceCss(const QStringList& families){
 
 // Built-in page/website templates (W4). Each returns a ready-made Document with shapes already
 // positioned + web-layout hints set, so "New from Template" + "Publish Website" produces a page.
-QStringList Canvas::templateNames(){ return {"Blank", "Landing Page", "Business Card", "Photo Portfolio"}; }
+QStringList Canvas::templateNames(){ return {"Blank", "Landing Page", "Business Card", "Photo Portfolio", "Presentation"}; }
 
 Document Canvas::templateDocument(int kind){
     Document d;
@@ -2564,6 +2860,13 @@ Document Canvas::templateDocument(int kind){
         for(int r=0;r<3;++r) for(int col=0;col<2;++col){ int i=r*2+col;
             Shape tile=rect(40+col*470, 120+r*360, 450, 330, tints[i]); tile.cornerRadius=8; d.addShape(tile);
             d.addShape(text(QString("Project %1").arg(i+1), 60+col*470, 130+r*360, 18, Qt::white)); }
+        break; }
+    case 4: {   // Presentation — a 16:9 title slide (1920×1080)
+        d.pageSize=QSizeF(1920,1080);
+        d.addShape(rect(0,0,1920,1080,QColor(24,27,34)));                 // dark slide background
+        d.addShape(rect(140,596,120,6,QColor(45,111,247)));               // accent rule under the title
+        d.addShape(text("Presentation title", 136, 430, 92, Qt::white, true, 1648, 0));
+        d.addShape(text("Subtitle · your name · date", 140, 636, 32, QColor(150,160,175), true, 1648, 0));
         break; }
     default: break;   // Blank
     }
@@ -3022,6 +3325,13 @@ void Canvas::syncTextEditToDoc(){
 // While a text caret is active, claim the keys the editor uses so window/menu shortcuts (Delete,
 // Ctrl+A/C/X/V) don't fire instead — accepting the ShortcutOverride routes them to keyPressEvent.
 bool Canvas::event(QEvent* e){
+    if((e->type()==QEvent::FocusOut || e->type()==QEvent::WindowDeactivate) && (m_radialActive || (m_radialTimer && m_radialTimer->isActive()))) radialDisarm();  // don't leave the pie stuck if focus leaves
+    // A modifier+<key> chord (e.g. the Ctrl+Alt+G Soft-Group shortcut) is consumed at the app/QAction level and
+    // never reaches keyPressEvent, but its ShortcutOverride IS delivered to the focused canvas first — use it to
+    // dismiss the pie so a held Ctrl+Alt during such a chord can't leave the menu blooming.
+    if(e->type()==QEvent::ShortcutOverride && (m_radialActive || (m_radialTimer && m_radialTimer->isActive()))){
+        const int kk=static_cast<QKeyEvent*>(e)->key(); if(kk!=Qt::Key_Control && kk!=Qt::Key_Alt) radialDisarm();
+    }
     if(e->type()==QEvent::ShortcutOverride && editingText()){
         auto* ke=static_cast<QKeyEvent*>(e); const int k=ke->key(); const bool ctrl=ke->modifiers()&Qt::ControlModifier;
         bool mine = k==Qt::Key_Delete||k==Qt::Key_Backspace||k==Qt::Key_Left||k==Qt::Key_Right||k==Qt::Key_Up
@@ -3262,7 +3572,24 @@ void Canvas::setRulerOrigin(const QPointF& docPt){ pushUndo("Ruler origin"); m_d
 void Canvas::resetRulerOrigin(){ if(m_doc.rulerOrigin.isNull())return; pushUndo("Ruler origin"); m_doc.rulerOrigin=QPointF(0,0); emit documentChanged(); update(); }
 
 // ---- view ------------------------------------------------------------------
-void Canvas::zoomTo(double z){ z=qBound(0.05,z,40.0); QPointF c=toDoc(QPointF(width()/2.0,height()/2.0)); m_zoom=z; QPointF nc=toView(c); m_origin+=QPointF(width()/2.0,height()/2.0)-nc; emit zoomChanged(z); update(); }
+// Arm the interactive bitmap-preview zoom + a debounce timer that does ONE crisp re-render once the gesture
+// settles. While armed, paintEvent blits the last rendered backdrop scaled to the current view instead of
+// re-rendering the document (instant). Adaptive: only engages when the previous full-quality frame was actually
+// slow (>40 ms ≈ under 25 fps) AND a usable cache exists — on light docs the crisp render is already instant, so
+// we skip the preview and never show a pixelated "pop".
+void Canvas::noteZoomPanInteraction(){
+    if (m_lastBackdropMs < 40.0 || m_screenCache.isNull()) return;
+    m_previewZoom = true;   // preview source is always m_screenCache @ m_cacheKey.xf (kept in sync by the cache rebuild)
+    if(!m_zoomSettleTimer){
+        m_zoomSettleTimer = new QTimer(this); m_zoomSettleTimer->setSingleShot(true);
+        connect(m_zoomSettleTimer, &QTimer::timeout, this, [this]{
+            if(!m_previewZoom) return;
+            m_previewZoom = false; m_cacheDirty = true; update();   // one crisp, full-quality frame after motion stops
+        });
+    }
+    m_zoomSettleTimer->start(150);
+}
+void Canvas::zoomTo(double z){ noteZoomPanInteraction(); z=qBound(0.05,z,40.0); QPointF c=toDoc(QPointF(width()/2.0,height()/2.0)); m_zoom=z; QPointF nc=toView(c); m_origin+=QPointF(width()/2.0,height()/2.0)-nc; emit zoomChanged(z); update(); }
 void Canvas::zoomIn(){ zoomTo(m_zoom*1.25); }
 void Canvas::zoomOut(){ zoomTo(m_zoom/1.25); }
 void Canvas::zoomReset(){ m_zoom=1.0; m_origin=QPointF(60,60); emit zoomChanged(1.0); update(); }
@@ -3524,13 +3851,16 @@ void Canvas::tableSplitCells() {
     }
     emit documentChanged(); update();
 }
-QVector<QPointF> Canvas::handlePoints() const {
-    QVector<QPointF> pts; QRectF b=selBoundsDoc(); if(b.isNull())return pts;
-    QPointF tl=toView(b.topLeft()), br=toView(b.bottomRight()); QRectF r(tl,br);
+QVector<QPointF> Canvas::handlePointsForRect(const QRectF& r) const {
+    QVector<QPointF> pts;
     pts<<r.topLeft()<<QPointF(r.center().x(),r.top())<<r.topRight()<<QPointF(r.right(),r.center().y())
        <<r.bottomRight()<<QPointF(r.center().x(),r.bottom())<<r.bottomLeft()<<QPointF(r.left(),r.center().y());
     pts<<QPointF(r.center().x(), r.top()-26);   // rotate handle
     return pts;
+}
+QVector<QPointF> Canvas::handlePoints() const {
+    QRectF b=selBoundsDoc(); if(b.isNull())return {};
+    return handlePointsForRect(QRectF(toView(b.topLeft()), toView(b.bottomRight())));
 }
 bool Canvas::smartHandle(QPointF& outView) const {
     if (m_sel.size()!=1) return false;
@@ -3813,9 +4143,335 @@ void Canvas::setSmartParam2(double p) {
 }
 
 // ---- painting --------------------------------------------------------------
+// Key capturing everything (besides document content) that changes the cached backdrop render.
+Canvas::DocCacheKey Canvas::currentCacheKey() const {
+    DocCacheKey k;
+    k.xf = viewXf();
+    k.pagesRect = m_doc.allPagesRect();
+    k.gridStep = m_gridStep;
+    k.pageColor = m_doc.pageColor.rgba();
+    k.tacLimit = m_tacLimit; k.pageCount = m_doc.pageCount;
+    k.outline = m_outlineView; k.softProof = m_softProof; k.gamut = m_gamutWarn; k.tac = m_tacWarn;
+    k.grid = m_showGrid; k.gridIso = m_gridIso;
+    k.enterTop = m_enterPath.isEmpty() ? -1 : m_enterPath.first();
+    return k;
+}
+// True while a live drag is actively mutating document geometry — the cached document is stale each frame,
+// so it must be rebuilt. Pure-overlay interactions (marquee, crop/straighten previews, pan) are excluded:
+// pan is caught by the view-transform key; the others don't touch document content.
+bool Canvas::manipulatingContent() const {
+    if (m_rubber || m_cropMode || m_straightenMode) return false;
+    if (!m_pressMoved) return false;    // a drag armed on press but not yet moved → geometry unchanged, cache still valid
+    return m_dragging || m_rotating || m_penHandleDrag || m_bendActive
+        || m_mouldDrag >= 0 || m_nodeSub >= 0 || !m_freePts.isEmpty();
+}
+
+// ---- Drag proxy (dynamic-object layer) ------------------------------------------------------------
+// The proxy applies ONLY to a whole-selection affine gesture: move (no handle), corner/side resize, rotate
+// or skew of a TOP-LEVEL selection. Those all rewrite each target's transform as startXf·M for one shared M,
+// so the moving pixels are a rigid picture we can capture once and re-blit under M every frame. Everything
+// else (node edits, SmartShape params, gradient/handle drags, in-group child edits, text-frame reflow, or a
+// document with resolved text fields/chains) keeps the existing per-frame full rebuild.
+bool Canvas::dragProxyEligible() const {
+    if (!m_dragProxyEnabled) return false;
+    if (m_tool != Tool::Select) return false;
+    if (inGroup()) return false;                 // in-group child render lives inside the group's paint; can't isolate by top-level address
+    if (m_sel.isEmpty()) return false;
+    if (hasTextFields() || hasTextChains()) return false;   // paintBackdrop renders a resolved COPY → addresses wouldn't match the skip/only set
+    switch (m_activeHandle) {                    // whole-selection affine handles only
+        case HNone: case TL: case T: case TR: case R: case BR: case B: case BL: case L:
+        case Rotate: case SkewH: case SkewV: break;
+        default: return false;                   // SmartParam/CornerRad/TextPathStart/gradient handles/etc.
+    }
+    // A side handle on a single text FRAME reflows the text (mutates rect, not transform) → M would be
+    // identity and the proxy would look frozen. Exclude it (corner handles still scale, so those stay eligible).
+    if (m_sel.size()==1 && m_sel[0]>=0 && m_sel[0]<m_doc.shapes.size()) {
+        const Shape& s = m_doc.shapes[m_sel[0]];
+        if (s.type==ShapeType::Text && s.textFrame &&
+            (m_activeHandle==T||m_activeHandle==R||m_activeHandle==B||m_activeHandle==L)) return false;
+    }
+    return true;
+}
+
+// Capture the static (rest-of-document) and moving (selection) bitmaps at the CURRENT geometry, which
+// becomes the proxy's baseline. Returns false (→ fall back to full rebuild) if ineligible, the reference
+// transform is singular, or the moving bitmap would be larger than the memory cap.
+bool Canvas::buildDragProxies() {
+    if (!dragProxyEligible()) return false;
+    QVector<Shape*> tg = selTargets();
+    if (tg.isEmpty()) return false;
+    bool inv=false; QTransform baseInv = tg[0]->transform.inverted(&inv);
+    if (!inv) return false;                      // zero-scale reference → can't define M
+    (void)baseInv;
+
+    QSet<const void*> movers;
+    for (Shape* s : tg) movers.insert(s);
+
+    // Moving selection doc-bounds + a conservative effect margin, so shadows/feather at the edge are captured.
+    QRectF db;
+    double margin = 4.0;
+    for (Shape* s : tg) { db = db.isNull() ? s->docBounds() : db.united(s->docBounds()); margin = qMax(margin, shapeRenderReach(*s)); }
+    if (db.isNull()) return false;
+    db = db.adjusted(-margin, -margin, margin, margin);
+
+    const qreal dpr = devicePixelRatioF();
+    const QRectF vb = viewXf().mapRect(db);      // view is translate+uniform-scale only ⇒ axis-aligned, tight
+    QSize dev(int(vb.width()*dpr + 0.5), int(vb.height()*dpr + 0.5));
+    if (dev.isEmpty()) return false;
+    // Cap the CAPTURE resolution so the one-time build stays fast regardless of content complexity or display
+    // DPI (a heavy group on a retina screen would otherwise take seconds to render once, freezing the UI). The
+    // bitmap is drawn back at the same LOGICAL size, so the only visible effect is a slightly softer live
+    // preview of a very large selection; the crisp vector render returns the instant the drag ends.
+    qreal pdpr = dpr;
+    const qint64 area = (qint64)dev.width()*dev.height();
+    if (area > kDragProxyBudgetPx) {
+        const qreal q = std::sqrt(double(kDragProxyBudgetPx)/double(area));
+        dev = QSize(qMax(1, int(dev.width()*q)), qMax(1, int(dev.height()*q)));
+        pdpr = dpr * q;                          // logical size = dev/pdpr stays == vb.size()
+    }
+
+    // Moving proxy: object-bounds, transparent, only the moving shapes at build-time geometry.
+    m_dragMovingProxy = QImage(dev, QImage::Format_ARGB32_Premultiplied);
+    m_dragMovingProxy.setDevicePixelRatio(pdpr);
+    m_dragMovingProxy.fill(Qt::transparent);
+    {
+        QPainter mp(&m_dragMovingProxy);
+        mp.translate(-vb.topLeft());             // logical view coords → image coords (shift vb.topLeft to 0,0)
+        mp.setTransform(viewXf(), true);
+        mp.setRenderHint(QPainter::Antialiasing, true);
+        mp.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        setOutlineRenderMode(m_outlineView);   // match the static proxy's view mode (wireframe drags stay wireframe)
+        setScreenRenderMode(true);
+        setRenderOnlySet(movers);
+        paintDocument(mp, m_doc);
+        setRenderOnlySet(QSet<const void*>());
+        setScreenRenderMode(false);
+        setOutlineRenderMode(false);
+    }
+    m_dragProxyOrigin = vb.topLeft();
+    m_dragProxyBaseXf = tg[0]->transform;
+
+    // Cache the selection silhouette (doc space, at this baseline geometry) so drawSelection can remap it by M
+    // each frame instead of rebuilding each selected shape's path — for a group that path traverses every child.
+    m_dragSelOutline = QPainterPath();
+    for (Shape* s : tg) m_dragSelOutline.addPath(Document::docPath(*s));
+
+    // Static proxy: screen-sized full backdrop with the moving shapes skipped.
+    const QSize sdev(int(width()*dpr + 0.5), int(height()*dpr + 0.5));
+    if (sdev.isEmpty()) return false;
+    m_dragStaticProxy = QImage(sdev, QImage::Format_ARGB32_Premultiplied);
+    m_dragStaticProxy.setDevicePixelRatio(dpr);
+    m_dragStaticProxy.fill(Qt::transparent);
+    {
+        m_dragProxySkip = movers;                // paintBackdrop's document layer honours this
+        QPainter sp(&m_dragStaticProxy);
+        paintBackdrop(sp);
+        sp.end();
+        m_dragProxySkip.clear();
+    }
+
+    m_dragProxyViewXf   = viewXf();
+    m_dragProxyViewSize = size();
+    m_dragProxyActive   = true;
+    return true;
+}
+
+double Canvas::snapAdjustProbeMs(int iters) {   // time the per-frame snap scan that the move drag runs
+    if (iters < 1) iters = 1;
+    QRectF bb = selBoundsDoc(); if (bb.isNull()) bb = QRectF(QPointF(0,0), m_doc.pageSize);
+    QVector<double> gx, gy; QElapsedTimer t; t.start();
+    for (int i=0;i<iters;++i){ gx.clear(); gy.clear(); volatile double s = snapAdjust(bb.translated(i%7,i%5), gx, gy).x(); (void)s; }
+    return t.nsecsElapsed()/1e6/iters;
+}
+
+void Canvas::clearDragProxy() {
+    if (!m_dragProxyActive && !m_dragProxyTried && m_dragStaticProxy.isNull() && m_dragMovingProxy.isNull()) return;
+    m_dragProxyActive = false;
+    m_dragProxyTried  = false;
+    m_dragStaticProxy = QImage();
+    m_dragMovingProxy = QImage();
+    m_dragSelOutline  = QPainterPath();
+    m_dragProxySkip.clear();
+    m_cacheDirty = true;                         // next paint does a full, correct vector re-render
+}
+
+// Blit the static backdrop, then the moving-selection bitmap transformed by S = viewInv·M·view (mapping its
+// build-time screen position to the current one), then the live overlays. No document rasterisation.
+void Canvas::paintDragProxy(QPainter& g) {
+    // The static proxy is the full backdrop (opaque graphite gradient covers the whole widget), so blit it as a
+    // straight copy rather than an alpha blend, then switch back to SourceOver for the moving bitmap + overlays.
+    g.setCompositionMode(QPainter::CompositionMode_Source);
+    g.drawImage(0, 0, m_dragStaticProxy);
+    g.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    QVector<Shape*> tg = selTargets();
+    if (!tg.isEmpty()) {
+        const QTransform M = m_dragProxyBaseXf.inverted() * tg[0]->transform;   // shared doc-space delta since build
+        const QTransform S = viewXf().inverted() * M * viewXf();                // drag-start view coords → current view coords
+        g.save();
+        g.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        g.setTransform(S, true);
+        g.drawImage(m_dragProxyOrigin, m_dragMovingProxy);
+        g.restore();
+    }
+    paintOverlays(g);
+}
+
+// Headless perf probe: build the proxy for the current selection, then time a proxy-composite frame vs a
+// full document rebuild (what a live drag used to cost every frame). Restores all state before returning.
+bool Canvas::dragProxyProbe(int iters, double& proxyMs, double& fullMs) {
+    proxyMs = fullMs = 0.0;
+    if (iters < 1) iters = 1;
+    if (m_sel.isEmpty()) return false;
+    const qreal dpr = devicePixelRatioF();
+    const QSize dev = size() * dpr;
+    if (dev.isEmpty()) return false;
+    QImage scratch(dev, QImage::Format_ARGB32_Premultiplied); scratch.setDevicePixelRatio(dpr);
+
+    const auto savedTool = m_tool; const auto savedH = m_activeHandle;
+    const bool savedDrag = m_dragging, savedRot = m_rotating;
+    m_tool = Tool::Select; m_activeHandle = HNone; m_dragging = true; m_rotating = false;   // simulate a move drag
+
+    QVector<Shape*> tg = selTargets();
+    QVector<QTransform> saved; for (Shape* s : tg) saved.push_back(s->transform);
+
+    const bool ok = buildDragProxies();          // baseline captured at the current geometry
+    if (ok) {
+        for (Shape* s : tg) s->transform = s->transform * QTransform::fromTranslate(40, 30);   // now M != identity
+        QElapsedTimer t; t.start();
+        for (int i = 0; i < iters; ++i) { QPainter g(&scratch); paintDragProxy(g); }
+        proxyMs = t.nsecsElapsed() / 1e6 / iters;
+        t.restart();                             // what the old per-frame path did: full reflow + backdrop + overlays
+        for (int i = 0; i < iters; ++i) { scratch.fill(Qt::transparent); QPainter g(&scratch); reflowText(); paintBackdrop(g); paintOverlays(g); }
+        fullMs = t.nsecsElapsed() / 1e6 / iters;
+    }
+
+    for (int k = 0; k < tg.size() && k < saved.size(); ++k) tg[k]->transform = saved[k];
+    clearDragProxy();
+    m_tool = savedTool; m_activeHandle = savedH; m_dragging = savedDrag; m_rotating = savedRot;
+    m_cacheDirty = true;
+    return ok;
+}
+
+// Isolate the selection-outline cost: time drawSelection using the cached outline vs the per-frame rebuild.
+bool Canvas::dragOutlineProbe(int iters, double& cachedMs, double& rebuiltMs) {
+    cachedMs = rebuiltMs = 0.0;
+    if (iters < 1) iters = 1;
+    if (m_sel.isEmpty()) return false;
+    const qreal dpr = devicePixelRatioF();
+    const QSize dev = size() * dpr;
+    if (dev.isEmpty()) return false;
+    QImage scratch(dev, QImage::Format_ARGB32_Premultiplied); scratch.setDevicePixelRatio(dpr);
+
+    const auto savedTool = m_tool; const auto savedH = m_activeHandle;
+    const bool savedDrag = m_dragging, savedRot = m_rotating;
+    m_tool = Tool::Select; m_activeHandle = HNone; m_dragging = true; m_rotating = false;
+
+    QVector<Shape*> tg = selTargets();
+    QVector<QTransform> saved; for (Shape* s : tg) saved.push_back(s->transform);
+
+    const bool ok = buildDragProxies();
+    if (ok) {
+        for (Shape* s : tg) s->transform = s->transform * QTransform::fromTranslate(30, 20);
+        QElapsedTimer t;
+        m_dragProxyActive = true;  t.start();                       // cached: remap the drag-start outline
+        for (int i = 0; i < iters; ++i) { QPainter g(&scratch); drawSelection(g); }
+        cachedMs = t.nsecsElapsed() / 1e6 / iters;
+        m_dragProxyActive = false; t.restart();                     // rebuilt: docPath()/selBoundsDoc() every frame
+        for (int i = 0; i < iters; ++i) { m_selCacheValid = false;   // force the UNCACHED cost (the static-outline cache would otherwise serve it)
+            QPainter g(&scratch); drawSelection(g); }
+        rebuiltMs = t.nsecsElapsed() / 1e6 / iters;
+        m_selCacheValid = false;                                     // leave the cache cold (the moved transforms above are transient)
+        m_dragProxyActive = true;                                   // restore so clearDragProxy tears down cleanly
+    }
+
+    for (int k = 0; k < tg.size() && k < saved.size(); ++k) tg[k]->transform = saved[k];
+    clearDragProxy();
+    m_tool = savedTool; m_activeHandle = savedH; m_dragging = savedDrag; m_rotating = savedRot;
+    m_cacheDirty = true;
+    return ok;
+}
+
+Canvas::RenderProbe Canvas::renderProbe(int iters) {
+    RenderProbe r;
+    if (iters < 1) iters = 1;
+    const qreal dpr = devicePixelRatioF();
+    const QSize dev = size() * dpr;
+    if (dev.isEmpty()) return r;
+    QImage scratch(dev, QImage::Format_ARGB32_Premultiplied); scratch.setDevicePixelRatio(dpr);
+    // Build the cache once so the cached path measures a realistic blit.
+    m_screenCache = QImage(dev, QImage::Format_ARGB32_Premultiplied); m_screenCache.setDevicePixelRatio(dpr);
+    m_screenCache.fill(Qt::transparent);
+    { QPainter g(&m_screenCache); paintBackdrop(g); }
+    m_cacheKey = currentCacheKey(); m_cacheDirty = false;
+    QElapsedTimer t;
+    t.start();                                              // uncached: reflow + full backdrop rasterise
+    for (int i = 0; i < iters; ++i) { scratch.fill(Qt::transparent); QPainter g(&scratch); reflowText(); paintBackdrop(g); }
+    r.fullMs = t.nsecsElapsed() / 1e6 / iters;
+    t.restart();                                            // cached: blit + cheap overlays
+    for (int i = 0; i < iters; ++i) { QPainter g(&scratch); g.drawImage(0, 0, m_screenCache); paintOverlays(g); }
+    r.cachedMs = t.nsecsElapsed() / 1e6 / iters;
+    return r;
+}
+
 void Canvas::paintEvent(QPaintEvent*) {
-    reflowText();                       // keep repel obstacles current (live during drags)
+    const qreal dpr = devicePixelRatioF();
+    const QSize dev(int(width()*dpr + 0.5), int(height()*dpr + 0.5));
+
+    // --- Drag proxy fast path: while a whole-selection affine drag is live, composite the two cached
+    // bitmaps instead of re-rasterising the whole document each frame.
+    if (!manipulatingContent()) {
+        if (m_dragProxyActive || m_dragProxyTried) clearDragProxy();   // drag ended (any path) → drop proxy state
+    } else if (m_dragProxyActive) {
+        // Bail out (and full-rebuild this frame) if the view panned/zoomed or the widget resized since the
+        // proxy was captured — the static bitmap and origin would no longer line up.
+        if (viewXf() != m_dragProxyViewXf || size() != m_dragProxyViewSize) clearDragProxy();
+        else { QPainter g(this); paintDragProxy(g); return; }
+    } else if (!m_dragProxyTried && dragProxyEligible()) {
+        // First frame of an eligible drag: try to build the proxy. On success, paint through it immediately.
+        m_dragProxyTried = true;
+        reflowText();
+        if (buildDragProxies()) { QPainter g(this); paintDragProxy(g); return; }
+        // else: ineligible/too big → fall through to the normal (full-rebuild) path below for the rest of the drag
+    }
+
+    // Interactive-zoom bitmap preview: while a wheel-zoom gesture is live, blit the last rendered backdrop scaled
+    // from the view it was rendered at (m_previewCacheXf) to the current view, instead of re-rendering the whole
+    // document (which can take ~1s at high zoom and freeze the UI). Near-instant; the settle timer does ONE crisp
+    // re-render when motion stops. Guarded so it never runs without a usable, same-size cache.
+    if (m_previewZoom && !m_screenCache.isNull() && m_screenCache.size()==dev
+        && m_cacheKey.xf != viewXf() && m_cacheKey.xf.isInvertible()) {   // only if there's an actual zoom delta to preview
+        QPainter g(this);
+        g.fillRect(rect(), QColor(0x2A,0x2D,0x34));                       // pasteboard fill for areas the scaled bitmap doesn't cover
+        g.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        g.setTransform(m_cacheKey.xf.inverted() * viewXf());             // cached (rendered-view) pixels → current view
+        g.drawImage(0, 0, m_screenCache);
+        g.resetTransform();
+        paintOverlays(g);
+        return;
+    }
+
+    const DocCacheKey key = currentCacheKey();
+    // Reuse the cached backdrop+document unless the content, view, widget size or a view-mode toggle
+    // changed, or a live geometry drag is mutating the document this frame.
+    if (m_cacheDirty || m_screenCache.size() != dev || !(m_cacheKey == key) || manipulatingContent()) {
+        reflowText();                   // keep text repel/anchor layout current (it feeds the render)
+        if (m_screenCache.size() != dev) m_screenCache = QImage(dev, QImage::Format_ARGB32_Premultiplied);
+        m_screenCache.setDevicePixelRatio(dpr);
+        m_screenCache.fill(Qt::transparent);
+        QElapsedTimer bt; bt.start();
+        QPainter cg(&m_screenCache);
+        paintBackdrop(cg);
+        cg.end();
+        m_lastBackdropMs = bt.nsecsElapsed()/1e6;   // wall-clock of this full render → adaptive preview trigger
+        m_cacheKey = key; m_cacheDirty = false;
+    }
     QPainter g(this);
+    g.drawImage(0, 0, m_screenCache);
+    paintOverlays(g);
+}
+
+// Background + page(s) + grid + the document content layer: the expensive part, rendered into the cache.
+void Canvas::paintBackdrop(QPainter& g) {
     // XarQ grad-canvas: a soft radial from the top-centre so the pasteboard reads as machined graphite.
     { const QRectF r=rect(); QRadialGradient cbg(QPointF(r.center().x(), r.top()), r.height()*1.25);
       cbg.setColorAt(0.0, QColor(0x32,0x36,0x3E)); cbg.setColorAt(1.0, QColor(0x22,0x25,0x2B));
@@ -3857,7 +4513,32 @@ void Canvas::paintEvent(QPaintEvent*) {
         lp.setRenderHint(QPainter::SmoothPixmapTransform, true);
         setOutlineRenderMode(m_outlineView);   // screen-only wireframe (reset right after so exports are unaffected)
         setScreenRenderMode(true);             // non-printing layers still show on the canvas (only print/export hide them)
+        // Viewport culling (canvas only): skip shapes wholly outside the visible doc rect. Worthwhile only when
+        // there are many shapes; cleared immediately after so export/thumbnail paths never cull.
+        const QRectF visibleDoc = viewXf().inverted().mapRect(QRectF(0,0,width(),height()));
+        if(m_cullEnabled && m_doc.shapes.size()>32)
+            setRenderCullRect(visibleDoc);   // culling compares against shape DOC bounds → doc-space rect
+        // Always clip live effect buffers (blur/feather/bevel/…) to the visible area on the canvas, so their
+        // per-frame cost is bounded by the screen — not the shape's device extent, which explodes at high zoom
+        // and froze the UI. This rect is in the painter's DEVICE space (the widget in logical px) — the same
+        // space the effect functions compute their device buffers in, for top-level AND grouped shapes — so it
+        // must NOT be transformed by any per-shape/group matrix. Export/thumbnail never sets it ⇒ byte-identical.
+        setRenderViewport(QRectF(0, 0, width(), height()));
+        setRenderSkipSet(m_dragProxySkip);     // non-empty only while building the static drag proxy (skip the movers)
         if(hasTextFields()||hasTextChains()){ Document rd=resolvedForRender(); paintDocument(lp, rd); } else paintDocument(lp, m_doc);
+        setRenderSkipSet(QSet<const void*>());
+        setRenderCullRect(QRectF());
+        setRenderViewport(QRectF());
+        // Group-isolation ("enter group") mode: dim the whole scene, then re-draw the entered group bright on top,
+        // so it's clear the user is editing INSIDE it. Clicking the faded area or pressing Esc leaves (input handler).
+        if (inGroup() && m_enterPath.first()>=0 && m_enterPath.first()<m_doc.shapes.size()) {
+            lp.fillRect(visibleDoc, QColor(16,18,23,140));                    // translucent scrim over everything (doc space)
+            setRenderViewport(QRectF(0,0,width(),height()));
+            setRenderOnlySet({ &m_doc.shapes[m_enterPath.first()] });         // draw ONLY the entered group, at full opacity
+            paintDocument(lp, m_doc);
+            setRenderOnlySet(QSet<const void*>());
+            setRenderViewport(QRectF());
+        }
         setScreenRenderMode(false);
         setOutlineRenderMode(false);
         lp.end();
@@ -3872,7 +4553,11 @@ void Canvas::paintEvent(QPaintEvent*) {
     }
 
     g.setPen(QPen(QColor(0,0,0,40),1)); g.setBrush(Qt::NoBrush); g.drawRect(page);
+}
 
+// Guides, selection, tool handles, crop/straighten overlays and rulers — cheap, redrawn every frame on
+// top of the cached backdrop so interaction (hover, selection, handle drags) never re-rasterises the document.
+void Canvas::paintOverlays(QPainter& g) {
     // persistent user guides (cyan), drawn over content
     if(!m_guideHpos.isEmpty() || !m_guideVpos.isEmpty()){
         g.setPen(QPen(QColor(0,190,210,170),1,Qt::DashLine));
@@ -3917,6 +4602,7 @@ void Canvas::paintEvent(QPaintEvent*) {
     }
 
     drawRulers(g);
+    drawRadialMenu(g);   // the Ctrl pie menu floats above everything, including the rulers
 }
 
 static const int kRuler = 18;   // ruler strip thickness in px
@@ -4042,7 +4728,13 @@ QPointF Canvas::snapAdjust(const QRectF& bb, QVector<double>& gX, QVector<double
     QVector<double> xs, ys;
     auto add=[&](const QRectF& r){ xs<<r.left()<<r.center().x()<<r.right(); ys<<r.top()<<r.center().y()<<r.bottom(); };
     add(QRectF(QPointF(0,0), m_doc.pageSize));      // page edges + centre
-    for (int i=0;i<m_doc.shapes.size();++i){ if(m_sel.contains(i)) continue; add(m_doc.shapes[i].docBounds()); }
+    // Snap the moving bbox to other objects' edges/centres. m_sel is a QVector ⇒ contains() is O(M), so a plain
+    // scan here would be O(N·M) and freeze a heavy doc during a drag — use a QSet for O(1) membership, and skip
+    // object snapping entirely past kSnapObjectCandidateCap objects (page/guides/grid still snap).
+    if (m_doc.shapes.size() <= kSnapObjectCandidateCap) {
+        QSet<int> selSet(m_sel.constBegin(), m_sel.constEnd());
+        for (int i=0;i<m_doc.shapes.size();++i){ if(selSet.contains(i)) continue; add(m_doc.shapes[i].docBounds()); }
+    }
     const double sx[3]={bb.left(),bb.center().x(),bb.right()};
     const double sy[3]={bb.top(),bb.center().y(),bb.bottom()};
     if (m_snapGrid && m_gridStep>1) {               // snap bbox edges to the on-screen grid
@@ -4069,15 +4761,17 @@ void Canvas::drawSelection(QPainter& g) {
     if (inGroup()) {
         const Shape* c=enteredContainer();
         if (c) { const QTransform cx=containerXf();
+            ensureSelOutlineCache();                                               // cached container silhouette (see header note)
             g.setPen(QPen(QColor(150,160,180),1,Qt::DashLine)); g.setBrush(Qt::NoBrush);
-            g.drawPath(viewXf().map(cx.map(c->localPath())));                       // "you are inside this group"
+            if (m_selOutlineDoc.elementCount() <= kDragOutlineStrokeCap)
+                g.drawPath(viewXf().map(m_selOutlineDoc));                          // "you are inside this group"
             g.setPen(QPen(kAccent,1.4)); g.setBrush(Qt::NoBrush);
             for (int ci:m_subSel){ if(ci<0||ci>=c->children.size())continue;
                 g.drawPath(viewXf().map((cx*c->children[ci].transform).map(c->children[ci].localPath()))); }
         }
         if (m_rubber){ g.setPen(QPen(kAccent,1,Qt::DashLine)); g.setBrush(QColor(70,150,245,30)); g.drawRect(m_rubberRect); }
         QVector<QPointF> pts=handlePoints(); if(pts.isEmpty()) return;              // nothing sub-selected yet
-        QRectF b=selBoundsDoc(); QRectF vr(toView(b.topLeft()),toView(b.bottomRight()));
+        QRectF b=m_selBoundsDoc; QRectF vr(toView(b.topLeft()),toView(b.bottomRight()));
         g.setPen(QPen(kAccent,1,Qt::SolidLine)); g.setBrush(Qt::NoBrush); g.drawRect(vr);
         if (m_rotateMode) {
             for (int i=0;i<8;++i){ const bool corner=(i==0||i==2||i==4||i==6); g.setPen(QPen(kAccent,1.4)); g.setBrush(corner?QColor(255,170,40):QColor(110,200,120));
@@ -4093,19 +4787,33 @@ void Canvas::drawSelection(QPainter& g) {
         }
         return;
     }
-    // outline each selected shape
+    // outline each selected shape, then the bbox + handles. During a whole-selection affine drag the proxy has
+    // cached the silhouette at drag start (doc space); remap it by the shared delta M and take its bounding rect,
+    // instead of rebuilding each selected shape's path — which, for a group, walks every child EVERY frame (it was
+    // rebuilt 3× per frame: outline + selBoundsDoc for the box + selBoundsDoc again for the handles).
     g.setPen(QPen(kAccent,1.2)); g.setBrush(Qt::NoBrush);
-    for (int i : m_sel) { QPainterPath dp=Document::docPath(m_doc.shapes[i]); g.drawPath(viewXf().map(dp)); }
-
-    // bbox + handles
-    QVector<QPointF> pts=handlePoints(); if(pts.isEmpty())return;
-    QRectF b=selBoundsDoc(); QRectF vr(toView(b.topLeft()),toView(b.bottomRight()));
+    QRectF vr;
+    if (m_dragProxyActive && !m_dragSelOutline.isEmpty()) {
+        QVector<Shape*> tg = selTargets();
+        const QTransform M = tg.isEmpty() ? QTransform() : (m_dragProxyBaseXf.inverted() * tg[0]->transform);
+        const QPainterPath viewOutline = (M * viewXf()).map(m_dragSelOutline);   // transform points only — no rasterisation
+        vr = viewOutline.boundingRect();
+        // Stroking the full silhouette each frame is the real cost (AA over every child edge). Keep it for a light
+        // selection; for a heavy one skip it — the bounding box + handles convey the selection and the moving proxy
+        // already shows the shapes. The exact silhouette returns the instant the drag ends.
+        if (m_dragSelOutline.elementCount() <= kDragOutlineStrokeCap) g.drawPath(viewOutline);
+    } else {
+        ensureSelOutlineCache();   // build the silhouette + bounds once (cached), not per-frame — see the header note
+        if (m_selOutlineDoc.elementCount() <= kDragOutlineStrokeCap) g.drawPath(viewXf().map(m_selOutlineDoc));
+        if (m_selBoundsDoc.isNull()) return; vr = QRectF(toView(m_selBoundsDoc.topLeft()),toView(m_selBoundsDoc.bottomRight()));
+    }
+    const QVector<QPointF> pts=handlePointsForRect(vr);
     g.setPen(QPen(kAccent,1,Qt::SolidLine)); g.setBrush(Qt::NoBrush); g.drawRect(vr);
     if (m_rotateMode) {   // rotate/skew handles: corners rotate (orange circles), mid-edges skew (green diamonds), + draggable pivot
         for (int i=0;i<8;++i){ const bool corner=(i==0||i==2||i==4||i==6); g.setPen(QPen(kAccent,1.4)); g.setBrush(corner?QColor(255,170,40):QColor(110,200,120));
             if(corner) g.drawEllipse(pts[i],5,5);
             else { QPolygonF dia; dia<<pts[i]+QPointF(0,-5)<<pts[i]+QPointF(5,0)<<pts[i]+QPointF(0,5)<<pts[i]+QPointF(-5,0); g.drawPolygon(dia); } }
-        const QPointF pv=toView(rotPivotDoc());
+        const QPointF pv = (m_dragProxyActive && !m_rotPivotSet) ? vr.center() : toView(rotPivotDoc());   // cached: avoid selBoundsDoc rebuild
         g.setPen(QPen(kAccent,1.4)); g.setBrush(Qt::white); g.drawEllipse(pv,5,5);
         g.setPen(QPen(kAccent,1.2)); g.drawLine(pv+QPointF(-7,0),pv+QPointF(7,0)); g.drawLine(pv+QPointF(0,-7),pv+QPointF(0,7));
     } else {
@@ -4474,3 +5182,4 @@ void Canvas::drawToolOverlay(QPainter& g) {
 
 #include "canvas_input.inc"
 #include "canvas_io.inc"
+#include "canvas_radial.inc"

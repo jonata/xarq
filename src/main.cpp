@@ -2,22 +2,37 @@
 // Applies the XarQ design system (dark-first brushed-graphite theme, Montserrat + Ubuntu Mono,
 // signal-blue accent) and the application shell. Supports a headless --shot mode for UI testing.
 #include <QApplication>
+#include <QMouseEvent>
+#include <QElapsedTimer>
 #include <QPalette>
 #include <QStyleFactory>
 #include <QFile>
 #include <QTimer>
 #include <QFontDatabase>
 #include <QFont>
+#include <QFontInfo>
+#include <QFileInfo>
+#include <QMap>
+#include <QSet>
+#include <QDir>
+#include <QDirIterator>
+#include <QStandardPaths>
 #include <QIcon>
 #include <QDialog>
 #include <QProcessEnvironment>
 #include <QMenu>
 #include <QEvent>
+#include <QKeyEvent>
+#include <QVariant>
 #include "mainwindow.h"
 #include "splash.h"
 #include "canvas.h"
+#include "rasterextra.h"
+#include "extcodecs.h"
 #include "photoops.h"
 #include "xar.h"
+#include "svgimport.h"
+#include "prepress.h"
 #include <functional>
 #include <cstdio>
 
@@ -178,12 +193,29 @@ static void applyTheme(QApplication& app) {
         QScrollArea#railScroll QScrollBar::handle:vertical { background:rgba(255,255,255,0.14); border-radius:2px; min-height:24px; }
         QScrollArea#railScroll QScrollBar::handle:vertical:hover { background:rgba(255,255,255,0.24); }
 
-        /* DS TitleBar — custom widget (setMenuWidget): wordmark + menus + centered doc + Share/cloud */
-        QWidget#titleBar { background:#111318; border-bottom:1px solid rgba(255,255,255,0.06); }
-        QToolButton#tlClose { background:#FF5F57; border:none; border-radius:6px; }
-        QToolButton#tlMin   { background:#FEBC2E; border:none; border-radius:6px; }
-        QToolButton#tlMax   { background:#28C840; border:none; border-radius:6px; }
-        QToolButton#tlClose:hover { background:#FF7B74; } QToolButton#tlMin:hover { background:#FFCB55; } QToolButton#tlMax:hover { background:#45D65F; }
+        /* Frameless "App title bar design": quick actions | title⇄menu hover-swap | wordmark + window controls */
+        QWidget#titleBar { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #22262c, stop:1 #191c21);
+                           border-bottom:1px solid rgba(255,255,255,0.10); border-top-left-radius:10px; border-top-right-radius:10px; }
+        QWidget#titleBar[maxed="true"] { border-top-left-radius:0; border-top-right-radius:0; }
+        QFrame#titleHair { background: rgba(255,255,255,0.07); border:none; }
+        QWidget#titleCenter, QWidget#titleBar QWidget { background:transparent; }
+        /* ...but a QMenu popped from the embedded menu bar is a QObject-descendant of #titleBar, so the
+           blanket rule above (an ID selector, higher specificity than a plain `QMenu`) would win and make
+           the whole translucent popup see-through. Re-assert the menu body at equal specificity, after it. */
+        QWidget#titleBar QMenu { background:#1D2027; }
+        QToolButton#titleSave, QToolButton#titleQuick { background:transparent; border:none; border-radius:8px; }
+        QToolButton#titleSave:hover, QToolButton#titleQuick:hover { background:#2a2f36; }
+        QToolButton#titleSave[dirty="true"] { background: rgba(55,178,77,0.20); }
+        QToolButton#titleSave[dirty="true"]:hover { background: rgba(55,178,77,0.30); }
+        QToolButton#winBtn, QToolButton#winClose { background:transparent; border:none; }
+        QToolButton#winBtn:hover { background:#2a2f36; }
+        QToolButton#winClose { border-top-right-radius:10px; }
+        QToolButton#winClose:hover { background:#e5484d; }
+        QWidget#titleBar[maxed="true"] QToolButton#winClose { border-top-right-radius:0; }
+        QLabel#titlePath  { color:#7d838c; font-size:9px; background:transparent; }
+        QLabel#titleName  { color:#e8eaed; font-size:12px; font-weight:700; background:transparent; }
+        QLabel#brandWord  { color:#aeb3ba; font-size:13px; font-weight:800; letter-spacing:0.5px; background:transparent; }
+        QLabel#brandVer   { color:#6f757e; font-size:9px; font-weight:600; background:transparent; }
         /* DS Canvas Toolbar — floating glass pan/fit/guides/grid pill */
         QWidget#zoomPill { background: rgba(23,26,32,0.80); border:1px solid rgba(255,255,255,0.08); border-radius:5px; }
         QToolButton#pillBtn { background:transparent; border:none; border-radius:4px; padding:4px; }
@@ -191,16 +223,9 @@ static void applyTheme(QApplication& app) {
         QToolButton#pillBtn:checked { background: rgba(45,111,247,0.28); }
         QFrame#pillSep { max-width:1px; background: rgba(255,255,255,0.12); margin:8px 3px; border:none; }
         QMenuBar, QMenuBar#embeddedMenu { background:transparent; border:none; padding:0; }
-        QMenuBar::item { padding:4px 8px; background:transparent; color:#D2D8E0; border-radius:3px; }
-        QToolButton#titleGhost { background:transparent; border:none; color:#D2D8E0; padding:5px 11px; border-radius:4px; font-size:13px; font-weight:600; }
-        QToolButton#titleGhost:hover { background: rgba(255,255,255,0.08); color:#EEF1F5; }
-        QLabel#docName { color:#D2D8E0; font-size:13px; font-weight:600; background:transparent; }
-        /* radius must live in the SAME rule as the background (from the [tone] selector) or Qt won't clip it */
-        QLabel#docBadge { font-size:10px; font-weight:700; padding:2px 9px; letter-spacing:0.3px; }
-        QLabel#docBadge[tone="warning"] { color:#F5B23D; background:rgba(245,178,61,0.16); border-radius:9px; }
-        QLabel#docBadge[tone="ok"] { color:#8B94A3; background:rgba(255,255,255,0.06); border-radius:9px; }
-        QMenuBar::item:selected { background:#2A2F38; border-radius:3px; }
-        QMenuBar::item:pressed { background:rgba(45,111,247,0.24); border-radius:3px; }
+        QMenuBar::item { padding:5px 11px; background:transparent; color:#aeb3ba; border-radius:6px; font-size:13px; font-weight:600; }
+        QMenuBar::item:selected { background:#2a2f36; color:#e8eaed; border-radius:6px; }
+        QMenuBar::item:pressed { background:rgba(45,111,247,0.24); color:#e8eaed; border-radius:6px; }
         QMenu { background:#1D2027; border:1px solid rgba(255,255,255,0.10); border-radius:5px; padding:4px; }
         QMenu::item { padding:4px 24px 4px 14px; border-radius:3px; color:#D2D8E0; }
         QMenu::item:selected { background:rgba(45,111,247,0.24); color:#EEF1F5; }
@@ -275,6 +300,78 @@ protected:
     }
 };
 
+// XarQ's single-key tool shortcuts (V/N/M/E/P/B/L/F/T/G/Y/K…) are Qt::WindowShortcut QActions. Qt's
+// ShortcutOverride mechanism lets a *focused* editable QLineEdit swallow a plain letter so typing wins —
+// but a NON-editable QComboBox does NOT accept the override, so pressing e.g. "T" while a dropdown had
+// focus fired the Text tool instead of doing a type-ahead / accepting the keystroke. Claim the
+// ShortcutOverride ourselves for any *text-entry* control on a *bare* (no Ctrl/Alt/Meta) printable key, so
+// a single-key shortcut can never steal a keystroke meant for a widget. Deliberately NOT item views
+// (galleries/lists/trees): clicking a layer row and then pressing "T"/"V"/"E" should still switch tools the
+// way vector-editor users expect, so those keep their single-key shortcuts. Modifier combos (Ctrl+Z/S/C…)
+// and non-printable keys (Enter/Escape/arrows/F-keys) fall through so global shortcuts, dialogs and
+// navigation keep working. The on-canvas text caret is handled separately by Canvas::event().
+class ShortcutGuard : public QObject {
+public:
+    using QObject::QObject;
+    static bool isInputControl(QWidget* w){
+        if(!w) return false;
+        // A read-only text field won't consume the key, so claiming it would only turn the tool shortcut
+        // into a dead key — let those fall through (matches native QLineEdit/QTextEdit, which don't accept
+        // the override when read-only). property() covers QLineEdit/QTextEdit/QPlainTextEdit/QAbstractSpinBox;
+        // widgets without a readOnly property (QComboBox/QKeySequenceEdit) return an invalid variant.
+        { const QVariant ro=w->property("readOnly"); if(ro.isValid() && ro.toBool()) return false; }
+        // String-based inherits() so no widget headers are pulled into main.cpp; each base covers its
+        // subclasses (QComboBox⊃QFontComboBox, QAbstractSpinBox⊃Q(Double)SpinBox/QDateTimeEdit).
+        static const char* kinds[]={"QLineEdit","QComboBox","QAbstractSpinBox","QTextEdit",
+                                    "QPlainTextEdit","QKeySequenceEdit"};
+        for(const char* k : kinds) if(w->inherits(k)) return true;
+        return false;
+    }
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if(e->type()==QEvent::ShortcutOverride){
+            auto* ke=static_cast<QKeyEvent*>(e);
+            if(!(ke->modifiers() & (Qt::ControlModifier|Qt::AltModifier|Qt::MetaModifier))){
+                const QString t=ke->text();
+                if(!t.isEmpty() && t.at(0).isPrint() && isInputControl(QApplication::focusWidget())){
+                    ke->accept(); return true;   // suppress the single-key shortcut; the KeyPress still reaches the input
+                }
+            }
+        }
+        return QObject::eventFilter(o,e);
+    }
+};
+
+// Load user-installed fonts (~/.local/share/fonts, ~/.fonts) directly via addApplicationFont, so a font
+// installed AFTER the system fontconfig cache was last built is still available THIS session — no relaunch
+// or `fc-cache` needed. Qt reads the fontconfig database once at launch, so without this a freshly-dropped
+// font would be invisible until the next run. Only a file whose family is NOT already in the database is
+// kept (one fontconfig already knows is loaded, checked, then dropped), so a font present the normal way is
+// never double-registered and rendering is unchanged. GUI-only: never called on the headless export/save/
+// shot/selftest paths, so the byte-identical corpus renders are untouched. Returns the families it added.
+static QStringList loadUserApplicationFonts(){
+    QSet<QString> known; for(const QString& f : QFontDatabase::families()) known.insert(f.toLower());
+    QStringList added;
+    QStringList dirs; dirs << QStandardPaths::writableLocation(QStandardPaths::FontsLocation)
+                          << QDir::homePath()+QStringLiteral("/.fonts");
+    QSet<QString> seenDir;
+    for(const QString& d : dirs){
+        if(d.isEmpty() || seenDir.contains(d) || !QDir(d).exists()) continue; seenDir.insert(d);
+        QDirIterator it(d, {QStringLiteral("*.ttf"),QStringLiteral("*.otf"),QStringLiteral("*.ttc"),
+                            QStringLiteral("*.otc"),QStringLiteral("*.pfb")}, QDir::Files, QDirIterator::Subdirectories);
+        while(it.hasNext()){
+            const QString path=it.next();
+            const int id=QFontDatabase::addApplicationFont(path);
+            if(id<0) continue;
+            const QStringList fams=QFontDatabase::applicationFontFamilies(id);
+            bool novel=false; for(const QString& fam: fams) if(!known.contains(fam.toLower())){ novel=true; break; }
+            if(!novel){ QFontDatabase::removeApplicationFont(id); continue; }   // fontconfig already had it
+            for(const QString& fam: fams){ if(!known.contains(fam.toLower())) added<<fam; known.insert(fam.toLower()); }
+        }
+    }
+    return added;
+}
+
 int main(int argc, char** argv) {
     QApplication app(argc, argv);
     app.setApplicationName("XarQ");
@@ -282,6 +379,7 @@ int main(int argc, char** argv) {
     app.setOrganizationName("XarQ");
     applyTheme(app);
     app.installEventFilter(new RoundPopups(&app));   // translucent (rounded) menu + dropdown popups
+    app.installEventFilter(new ShortcutGuard(&app)); // single-key tool shortcuts never steal a keystroke from a focused input
 
     QString shotPath, exportPath, openPath, savePath, shotNodePath;
     for (int i=1;i<argc;++i){ QString a(argv[i]);
@@ -291,13 +389,177 @@ int main(int argc, char** argv) {
         else if(a=="--save"&&i+1<argc) savePath=argv[++i];
         else if(a=="--shotnode"&&i+1<argc) shotNodePath=argv[++i];
         else if(a=="--selftest"){ extern int runSelfTest(); return runSelfTest(); }
+        else if(a=="--svgfontdump"&&i+1<argc){ // diagnostic: parse an SVG and report each Text shape's requested vs Qt-resolved font
+            QString p=argv[++i]; QFile f(p);
+            if(!f.open(QIODevice::ReadOnly)){ fprintf(stderr,"svgfontdump: cannot open %s\n", qPrintable(p)); return 1; }
+            QString err; QVector<xara::Shape> shapes = xara::parseSvg(f.readAll(), &err, QFileInfo(p).absolutePath());
+            if(!err.isEmpty()) fprintf(stderr,"svgfontdump: parse warning: %s\n", qPrintable(err));
+            int nText=0; QMap<QString,int> reqTally, resTally;
+            std::function<void(const QVector<xara::Shape>&)> walk=[&](const QVector<xara::Shape>& v){
+                for(const auto& s: v){
+                    if(s.type==xara::ShapeType::Group){ walk(s.children); continue; }
+                    if(s.type!=xara::ShapeType::Text) continue;
+                    ++nText;
+                    const QString req=s.font.family();
+                    QFontInfo fi(s.font);
+                    const QString res=fi.family();
+                    reqTally[req]++; resTally[res]++;
+                    if(nText<=40)
+                        fprintf(stderr,"  #%d req=\"%s\" (w=%d i=%d px=%d) -> resolved=\"%s\" style=\"%s\" exact=%d  text=\"%.24s\"\n",
+                            nText, qPrintable(req), s.font.weight(), s.font.italic(), s.font.pixelSize(),
+                            qPrintable(res), qPrintable(QFontInfo(s.font).styleName()), s.font.exactMatch(), qPrintable(QString(s.text).replace('\n',' ')));
+                }
+            };
+            walk(shapes);
+            fprintf(stderr,"svgfontdump %s: %d text shapes\n", qPrintable(p), nText);
+            fprintf(stderr,"  REQUESTED families: "); for(auto it=reqTally.begin();it!=reqTally.end();++it) fprintf(stderr,"[%s×%d] ", qPrintable(it.key()), it.value()); fprintf(stderr,"\n");
+            fprintf(stderr,"  RESOLVED families: "); for(auto it=resTally.begin();it!=resTally.end();++it) fprintf(stderr,"[%s×%d] ", qPrintable(it.key()), it.value()); fprintf(stderr,"\n");
+            return 0; }
         else if(a=="--xarinfo"&&i+1<argc){ // diagnostic: load a .xar and report what was read
             QString p=argv[++i]; xara::Document d;
             bool ok=xara::loadXar(d,p);
             std::function<int(const QVector<xara::Shape>&)> cnt=[&](const QVector<xara::Shape>& v){ int n=0; for(auto&s:v){ n++; if(s.type==xara::ShapeType::Group) n+=cnt(s.children); } return n; };
             fprintf(stderr,"%s: ok=%d shapes=%d (deep=%d) page=%.0fx%.0f\n",
                 qPrintable(p), ok, (int)d.shapes.size(), ok?cnt(d.shapes):0, d.pageSize.width(), d.pageSize.height());
-            return ok?0:1; } }
+            return ok?0:1; }
+        else if(a=="--import-check"&&i+2<argc){ // dev: decode an image the way importImage does, write a PNG, print WxH (for real-file testing)
+            QString in=argv[++i], out=argv[++i];
+            QImage img; QString via="qt";
+            // Whole-slide formats prefer OpenSlide (mirrors importImage) so a real gigapixel base isn't read by Qt.
+            { static const char* const sx[]={".svs",".ndpi",".scn",".mrxs",".vms",".vmu",".svslide",".bif"};
+              for(const char* e : sx) if(in.endsWith(QString::fromLatin1(e),Qt::CaseInsensitive)){ img=xara::ExtCodec::decode(in); via="extcodec"; break; } }
+            if(img.isNull()){ img=QImage(in); via="qt"; }     // Qt plugins first (mirrors importImage)
+            if(img.isNull()){ img=xara::RasterExtra::decode(in); via="rasterextra"; }
+            if(img.isNull()){ img=xara::ExtCodec::decode(in);    via="extcodec"; }
+            if(img.isNull() && (in.endsWith(".psd",Qt::CaseInsensitive)||in.endsWith(".psb",Qt::CaseInsensitive))){
+                QFile pf(in); if(pf.open(QIODevice::ReadOnly)){ img=xara::importPsd(pf.readAll()); via="psd"; } }
+            if(img.isNull()){ fprintf(stderr,"import-check FAIL: %s could not be decoded\n", qPrintable(in)); return 1; }
+            bool ok=img.convertToFormat(QImage::Format_ARGB32).save(out,"PNG");
+            fprintf(stdout,"%dx%d via=%s saved=%d %s\n", img.width(), img.height(), qPrintable(via), ok?1:0, qPrintable(out));
+            return ok?0:1; }
+        else if(a=="--import-vec"&&i+1<argc){ // dev: import a vector/page file via dropImportByExtension, report shape/page counts
+            QString in=argv[++i];
+            QString outPng; if(i+1<argc && argv[i+1][0]!='-') outPng=argv[++i];   // optional: render the imported page to a PNG
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1200,800); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            const bool ok=c->dropImportByExtension(in);
+            fprintf(stdout,"import-vec %s: ok=%d shapes=%d pages=%d pagesize=%.1fx%.1f\n", qPrintable(in), ok?1:0,
+                    (int)c->doc().shapes.size(), c->doc().pageCount,
+                    c->doc().pageSize.width(), c->doc().pageSize.height());
+            const auto& sh=c->doc().shapes;                                // dump first/last bitmap fills for content checks
+            if(!sh.isEmpty() && sh.first().fill.type==xara::FillType::Bitmap && !sh.first().fill.image.isNull())
+                sh.first().fill.image.save(in+".f0.png");
+            if(sh.size()>=2 && sh.last().fill.type==xara::FillType::Bitmap && !sh.last().fill.image.isNull())
+                sh.last().fill.image.save(in+".fN.png");
+            if(ok && !outPng.isEmpty()){ QApplication::processEvents(); c->exportPng(outPng,2); }
+            return ok?0:1; }
+        else if(a=="--snapbench"&&i+1<argc){ // diagnostic: time one move-frame's snapAdjust on a real file (move ONE object)
+            QString p=argv[++i];
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1400,900); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            if(p.endsWith(".cdr",Qt::CaseInsensitive)) c->importCdr(p);
+            else if(p.endsWith(".svg",Qt::CaseInsensitive)) c->importSvgFile(p);
+            else c->load(p);
+            QApplication::processEvents(); c->setSnap(true); c->zoomTo(1.0); QApplication::processEvents();
+            const int n=c->doc().shapes.size();
+            if(n<1){ fprintf(stderr,"snapbench: no shapes in %s\n", qPrintable(p)); return 1; }
+            c->select(QVector<int>{ n/2 });   // move ONE object ⇒ the other n-1 are snap candidates (the real move-drag cost)
+            const double ms=c->snapAdjustProbeMs(120);
+            double proxyMs=0, fullMs=0; bool ok=c->dragProxyProbe(20, proxyMs, fullMs);
+            fprintf(stderr,"snapbench %s: shapes=%d  snapAdjust=%.3f  proxyPaint=%.3f  fullPaint=%.3f ms/frame (proxyOK=%d)\n",
+                    qPrintable(p), n, ms, proxyMs, fullMs, ok?1:0);
+            // also time the whole-selection case (select all, move together) — the classic heavy drag
+            { QVector<int> allv; for(int i=0;i<n;++i) allv<<i; c->select(allv);
+              double pm=0, fm=0; bool ok2=c->dragProxyProbe(20, pm, fm);
+              fprintf(stderr,"  select-all move: proxyPaint=%.3f  fullPaint=%.3f ms/frame (proxyOK=%d)\n", pm, fm, ok2?1:0); }
+            return 0; }
+        else if(a=="--zoombench"&&i+1<argc){ // diagnostic: time one full canvas repaint at increasing zoom on a real file
+            QString p=argv[++i];
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1400,900); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            if(p.endsWith(".cdr",Qt::CaseInsensitive)) c->importCdr(p);
+            else if(p.endsWith(".svg",Qt::CaseInsensitive)) c->importSvgFile(p);
+            else c->load(p);
+            QApplication::processEvents();
+            const int n=c->doc().shapes.size();
+            if(n<1){ fprintf(stderr,"zoombench: no shapes in %s\n", qPrintable(p)); return 1; }
+            c->zoomFit(); QApplication::processEvents();   // frame the doc so its (effect-bearing) content stays centred as we zoom in
+            auto timeAt=[&](double z)->double{
+                double best=1e18;
+                for(int k=0;k<4;++k){
+                    c->zoomTo(z + k*2e-4);            // tiny jitter ⇒ cache key changes ⇒ a fresh FULL repaint each sample (keeps the view centre)
+                    c->benchForceCrisp();             // measure the crisp document render, not the interactive preview blit
+                    QElapsedTimer t; t.start(); c->repaint(); const double ms=t.nsecsElapsed()/1e6;
+                    QApplication::processEvents(); if(ms<best) best=ms;
+                }
+                return best;
+            };
+            fprintf(stderr,"zoombench %s (shapes=%d): full (crisp) canvas repaint at increasing zoom —\n", qPrintable(p), n);
+            for(double z : {1.0, 4.0, 10.0, 20.0, 40.0})
+                fprintf(stderr,"    zoom=%5.1fx   fullRepaint=%8.2f ms\n", z, timeAt(z));
+            return 0; }
+        else if(a=="--previewshot"&&i+2<argc){ // diagnostic: capture an interactive zoom-PREVIEW frame (scaled-bitmap, mid-gesture)
+            QString p=argv[++i]; QString out=argv[++i];
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1400,900); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            if(p.endsWith(".cdr",Qt::CaseInsensitive)) c->importCdr(p);
+            else if(p.endsWith(".svg",Qt::CaseInsensitive)) c->importSvgFile(p);
+            else if(p.endsWith(".dwg",Qt::CaseInsensitive)) c->importVectorFile(p);
+            else c->load(p);
+            c->zoomFit(); QApplication::processEvents();   // builds the crisp cache (sets m_lastBackdropMs, so the preview arms)
+            c->repaint();                                  // ensure a crisp cache exists before the gesture
+            c->zoomIn(); c->zoomIn();                      // two wheel-equivalent steps → arms the bitmap-preview path
+            const QImage frame=c->grab().toImage();        // synchronous repaint → takes the preview branch
+            frame.save(out);
+            fprintf(stderr,"previewshot %s: preview=%d saved %s (%dx%d)\n", qPrintable(p), c->previewActiveForTest()?1:0, qPrintable(out), frame.width(), frame.height());
+            return 0; }
+        else if(a=="--groupshot"&&i+2<argc){ // diagnostic: capture the group-isolation ("enter group") fade overlay
+            QString p=argv[++i]; QString out=argv[++i];
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1400,900); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            if(p.endsWith(".svg",Qt::CaseInsensitive)) c->importSvgFile(p);
+            else if(p.endsWith(".cdr",Qt::CaseInsensitive)) c->importCdr(p);
+            else c->load(p);
+            c->zoomFit(); QApplication::processEvents();
+            const int gi=c->firstTopLevelGroup();
+            if(gi<0){ fprintf(stderr,"groupshot: no top-level group in %s\n", qPrintable(p)); return 1; }
+            c->enterGroupForTest(gi); QApplication::processEvents();
+            c->grab().toImage().save(out);
+            fprintf(stderr,"groupshot %s: entered group #%d → %s\n", qPrintable(p), gi, qPrintable(out));
+            return 0; }
+        else if(a=="--dragbench"&&i+1<argc){ // faithfully simulate a real MOVE and a real SCALE drag (mouse events), timing each frame's repaint
+            QString p=argv[++i];
+            xara::MainWindow w; w.setShowWelcome(false); w.resize(1400,900); w.show(); QApplication::processEvents();
+            xara::Canvas* c=w.canvas(); c->newDocument();
+            if(p.endsWith(".cdr",Qt::CaseInsensitive)) c->importCdr(p);
+            else if(p.endsWith(".svg",Qt::CaseInsensitive)) c->importSvgFile(p);
+            else c->load(p);
+            QApplication::processEvents(); c->setSnap(true); c->zoomTo(1.0); QApplication::processEvents();
+            const int n=c->doc().shapes.size();
+            if(n<1){ fprintf(stderr,"dragbench: no shapes in %s\n", qPrintable(p)); return 1; }
+            const int si=n/2; const QRectF db=c->doc().shapes[si].docBounds();
+            { QElapsedTimer t; t.start(); c->pushUndo("bench"); const double us=t.nsecsElapsed()/1e6;
+              fprintf(stderr,"  pushUndo (undo snapshot, runs once at drag-start) = %.2f ms\n", us); }
+            auto send=[&](QEvent::Type ty, QPointF lp, Qt::MouseButton b, Qt::MouseButtons bs){
+                QMouseEvent ev(ty, lp, c->mapToGlobal(lp.toPoint()), b, bs, Qt::NoModifier); QApplication::sendEvent(c, &ev); };
+            auto runDrag=[&](const char* name, QPointF startView, QPointF stepView){
+                c->select(QVector<int>{ si }); QApplication::processEvents();
+                send(QEvent::MouseButtonPress, startView, Qt::LeftButton, Qt::LeftButton);
+                double sum=0, mx=0, mvSum=0; const int frames=12;
+                for(int k=1;k<=frames;++k){
+                    QElapsedTimer tm; tm.start();
+                    send(QEvent::MouseMove, startView+stepView*k, Qt::NoButton, Qt::LeftButton);  // fires documentChanged slots synchronously
+                    const double mvMs=tm.nsecsElapsed()/1e6;
+                    QElapsedTimer t; t.start(); c->repaint(); const double pMs=t.nsecsElapsed()/1e6;
+                    QApplication::processEvents();                                                // let debounced gallery/panel rebuilds fire
+                    const double ms=mvMs+pMs; if(k>1){ sum+=ms; mvSum+=mvMs; if(ms>mx)mx=ms; } }
+                send(QEvent::MouseButtonRelease, startView+stepView*frames, Qt::LeftButton, Qt::NoButton);
+                fprintf(stderr,"  %-6s per-frame (move-event + repaint): mean=%.2f  max=%.2f ms/frame  [move-event slots alone: mean=%.2f]\n",
+                        name, sum/(frames-1), mx, mvSum/(frames-1)); };
+            fprintf(stderr,"dragbench %s: shapes=%d (dragging shape #%d)\n", qPrintable(p), n, si);
+            runDrag("MOVE",  c->toView(db.center()),   QPointF(6,4));   // press on the shape body → move
+            runDrag("SCALE", c->toView(db.topLeft()),  QPointF(6,4));   // press on the TL corner handle → scale
+            return 0; } }
 
     // Is this a genuine interactive launch, or any headless / scripted / screenshot mode?
     // (A capture CLI flag, any XARA_* test/screenshot env var, or the offscreen platform ⇒ not interactive.)
@@ -315,12 +577,20 @@ int main(int argc, char** argv) {
     xara::LaunchSplash* splash=nullptr;
     if(interactive){ splash=new xara::LaunchSplash; splash->show(); splash->raise(); app.processEvents(); splash->start(); }
 
+    // Pick up user-installed fonts the system font cache may not carry yet — BEFORE the UI (font pickers,
+    // galleries) is built and BEFORE any document opens, so a freshly-installed font resolves this session
+    // with no relaunch/fc-cache. GUI only: skipped on every headless output path (export/save/shot), which
+    // keeps the byte-identical corpus renders untouched (--selftest already returned during arg parsing).
+    const bool headlessOutput = !exportPath.isEmpty() || !savePath.isEmpty() || !shotPath.isEmpty() || !shotNodePath.isEmpty();
+    if(!headlessOutput){ const QStringList af=loadUserApplicationFonts();
+        if(!af.isEmpty()) qInfo("XarQ: loaded %d user font family(ies) not in the system font cache: %s", (int)af.size(), qUtf8Printable(af.join(", "))); }
+
     xara::MainWindow w;   // heavy construction — the splash above stays up covering it
     // Non-interactive ⇒ suppress the launch dialogs (recovery + the *modal* welcome screen, which would
     // otherwise block the event loop and hang every scripted grab).
     if(!interactive) w.setShowWelcome(false);
     w.setDeferStartup(interactive);   // the splash drives recovery+welcome once it fades
-    if(!openPath.isEmpty()){ if(openPath.endsWith(".svg",Qt::CaseInsensitive)){ w.canvas()->newDocument(); w.canvas()->importSvgFile(openPath); } else w.canvas()->load(openPath); }
+    if(!openPath.isEmpty()){ if(openPath.endsWith(".svg",Qt::CaseInsensitive)){ w.canvas()->newDocument(); w.canvas()->importSvgFile(openPath); } else if(openPath.endsWith(".cdr",Qt::CaseInsensitive)){ w.canvas()->newDocument(); w.canvas()->importCdr(openPath); } else if(openPath.endsWith(".dwg",Qt::CaseInsensitive)){ w.canvas()->newDocument(); w.canvas()->importVectorFile(openPath); } else w.canvas()->load(openPath); }
 
     if (!savePath.isEmpty()) return w.canvas()->save(savePath)?0:2;   // headless save self-test
     if (!exportPath.isEmpty()) {   // headless export self-test
@@ -368,6 +638,15 @@ int main(int argc, char** argv) {
     if (!shotNodePath.isEmpty()) {   // deterministic node-editor screenshot
         extern void injectNodeDemo(xara::Canvas*);
         QTimer::singleShot(350,[&]{ injectNodeDemo(w.canvas()); w.grab().save(shotNodePath); app.quit(); });
+    }
+    if (!qEnvironmentVariableIsEmpty("XARA_SHOTEXPORT")) {   // screenshot the Export bitmap dialog
+        const QString sp=qEnvironmentVariable("XARA_SHOTEXPORT");
+        extern void injectGradientDemo(xara::Canvas*);
+        QTimer::singleShot(250,[&,sp]{
+            injectGradientDemo(w.canvas());
+            QTimer::singleShot(600,[&,sp]{ for(QDialog* d : w.findChildren<QDialog*>()) if(d->objectName()=="exportDlg"){ d->grab().save(sp); d->reject(); } app.quit(); });
+            w.bitmapExportDialog("/tmp/xarq_shotexport.png");   // blocking exec(); the inner timer fires inside it
+        });
     }
     if (!qEnvironmentVariableIsEmpty("XARA_SHOTSNAP")) {   // smart-guide screenshot
         extern void injectSnapDemo(xara::Canvas*);

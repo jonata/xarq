@@ -94,143 +94,22 @@ void tacWarnImage(QImage& im, int limitPct){
 }
 
 // ============================================================================
-// PSD (Photoshop) flattened composite import. Reads the header + the merged image
-// data (RAW or PackBits/RLE, planar per channel) for 8-bit RGB / Grayscale / CMYK.
-// ============================================================================
-QImage importPsd(const QByteArray& d){
-    if(d.size()<26 || d.left(4)!="8BPS") return QImage();
-    const qint64 N=d.size();
-    // Bounds-SAFE big-endian readers: any read past the buffer yields 0 (never OOB).
-    auto u16=[&](qint64 o)->int{ if(o<0||o+1>=N) return 0; return (quint8(d[o])<<8)|quint8(d[o+1]); };
-    auto u32=[&](qint64 o)->qint64{ if(o<0||o+3>=N) return 0; return (qint64(quint8(d[o]))<<24)|(quint8(d[o+1])<<16)|(quint8(d[o+2])<<8)|quint8(d[o+3]); };
-    if(u16(4)!=1) return QImage();                       // version 1 (PSD, not PSB)
-    const int channels=u16(12); const int H=int(u32(14)), W=int(u32(18)); const int depth=u16(22); const int mode=u16(24);
-    if(depth!=8 || W<=0 || H<=0 || W>30000 || H>30000 || channels<1 || channels>56) return QImage();
-    // Skip the three variable-length sections, validating each length in 64-bit (avoids the
-    // negative/overflow offsets that a hostile length field would otherwise smuggle past the guards).
-    qint64 o=26;
-    for(int sect=0;sect<3;++sect){ if(o+4>N) return QImage(); qint64 len=u32(o); if(len<0 || o+4+len>N) return QImage(); o+=4+len; }
-    if(o+2>N) return QImage();
-    const int compression=u16(o); o+=2;
-    const int nCh=channels; const qint64 planeSz=qint64(W)*H;
-    QVector<QByteArray> plane(nCh);
-    if(compression==0){                                  // RAW planar
-        for(int c=0;c<nCh;++c){ if(o+planeSz>N) return QImage(); plane[c]=d.mid(o,planeSz); o+=planeSz; }
-    } else if(compression==1){                           // PackBits RLE
-        const qint64 nCounts=qint64(nCh)*H;              // 64-bit: nCh(≤56)*H(≤30000) can't overflow
-        if(o+2*nCounts>N) return QImage();
-        QVector<int> counts; counts.resize(int(nCounts)); qint64 co=o; for(qint64 i=0;i<nCounts;++i){ counts[int(i)]=u16(co); co+=2; }
-        qint64 p=co;
-        for(int c=0;c<nCh;++c){ QByteArray pl; pl.reserve(planeSz);
-            for(int y=0;y<H;++y){ qint64 rowEnd=p+counts[c*H+y]; if(rowEnd>N) return QImage();
-                while(p<rowEnd){ qint8 n=qint8(d[p++]);
-                    if(n>=0){ int cnt=n+1; for(int k=0;k<cnt && p<N;++k) pl.append(d[p++]); }
-                    else if(n!=-128){ int cnt=1-n; if(p>=N)break; char v=d[p++]; for(int k=0;k<cnt;++k) pl.append(v); }
-                } }
-            if(pl.size()<planeSz) pl.append(QByteArray(planeSz-pl.size(),0)); plane[c]=pl; }
-    } else return QImage();
-
-    QImage img(W,H,QImage::Format_ARGB32);
-    auto ch=[&](int c,qint64 i)->int{ return (c<nCh && i<plane[c].size())? quint8(plane[c][i]) : 0; };
-    for(int y=0;y<H;++y){ QRgb* line=reinterpret_cast<QRgb*>(img.scanLine(y));
-        for(int x=0;x<W;++x){ qint64 i=qint64(y)*W+x; int r,g,b,a=255;
-            if(mode==1 || nCh==1){ int v=ch(0,i); r=g=b=v; }                                   // grayscale
-            else if(mode==4){ double C=(255-ch(0,i))/255.0,M=(255-ch(1,i))/255.0,Y=(255-ch(2,i))/255.0,K=(255-ch(3,i))/255.0;
-                QColor cc=cmykToRgb(C,M,Y,K); r=cc.red(); g=cc.green(); b=cc.blue(); if(nCh>=5) a=ch(4,i); }
-            else { r=ch(0,i); g=ch(1,i); b=ch(2,i); if(nCh>=4) a=ch(3,i); }                     // RGB(+alpha)
-            line[x]=qRgba(r,g,b,a); } }
-    return img;
-}
-
-// Decode one PSD channel plane (W*H bytes) at [o,end): compression 0=raw, 1=PackBits RLE
-// (H 2-byte scanline counts then packbits). Bounds-safe; pads short data with 0.
-static QByteArray psdChannelPlane(const QByteArray& d, qint64 o, qint64 end, int comp, int W, int H){
-    const qint64 planeSz=qint64(W)*H; QByteArray pl; pl.reserve(planeSz);
-    const qint64 N=d.size(); end=qMin(end,N);
-    if(comp==0){ for(qint64 i=o;i<end && pl.size()<planeSz;++i) pl.append(d[i]); }
-    else if(comp==1){ qint64 p=o+qint64(2)*H;   // skip the per-row byte-count table
-        for(int y=0;y<H && p<end;++y){ qint64 rowStop=end; int col=0;
-            while(p<rowStop && col<W){ qint8 n=qint8(d[p++]);
-                if(n>=0){ int cnt=n+1; for(int k=0;k<cnt && p<end && col<W;++k){ pl.append(d[p++]); ++col; } }
-                else if(n!=-128){ int cnt=1-n; if(p>=end)break; char v=d[p++]; for(int k=0;k<cnt && col<W;++k){ pl.append(v); ++col; } } }
-            while(col<W){ pl.append(char(0)); ++col; } } }
-    if(pl.size()<planeSz) pl.append(QByteArray(planeSz-pl.size(),0));
-    return pl;
-}
-
-Document importPsdDocument(const QByteArray& d){
-    Document doc;
-    if(d.size()<26 || d.left(4)!="8BPS") return doc;
-    const qint64 N=d.size();
-    auto u8 =[&](qint64 o)->int{ return (o<0||o>=N)?0:quint8(d[o]); };
-    auto u16=[&](qint64 o)->int{ return (o<0||o+1>=N)?0:((quint8(d[o])<<8)|quint8(d[o+1])); };
-    auto u32=[&](qint64 o)->qint64{ return (o<0||o+3>=N)?0:((qint64(quint8(d[o]))<<24)|(quint8(d[o+1])<<16)|(quint8(d[o+2])<<8)|quint8(d[o+3])); };
-    if(u16(4)!=1) return doc;
-    const int channels=u16(12), H=int(u32(14)), W=int(u32(18)), depth=u16(22);
-    if(depth!=8 || W<=0 || H<=0 || W>30000 || H>30000 || channels<1) return doc;
-    doc.pageSize=QSizeF(W,H);
-    qint64 o=26;
-    for(int sect=0;sect<2;++sect){ if(o+4>N) return doc; qint64 len=u32(o); if(len<0||o+4+len>N) return doc; o+=4+len; }   // colour-mode + resources
-    // Layer & Mask Information section
-    if(o+4<=N){ const qint64 lmLen=u32(o); const qint64 lmEnd=qMin(N,o+4+lmLen); o+=4;
-        if(lmLen>0 && o+4<=lmEnd){ /*qint64 layerInfoLen=*/u32(o); o+=4;
-            int count=(qint16)u16(o); o+=2; const int nLayers=qAbs(count);
-            struct LChan{ int id; qint64 len; }; struct Lay{ int t,l,b,r; QVector<LChan> chans; int opacity; QByteArray blend; bool visible; };
-            QVector<Lay> layers; bool ok=true;
-            for(int i=0;i<nLayers && ok;++i){ Lay L; L.t=int(qint32(u32(o))); L.l=int(qint32(u32(o+4))); L.b=int(qint32(u32(o+8))); L.r=int(qint32(u32(o+12))); o+=16;
-                int nc=u16(o); o+=2; if(nc<0||nc>64){ ok=false; break; }
-                for(int c=0;c<nc;++c){ LChan ch; ch.id=(qint16)u16(o); ch.len=u32(o+2); o+=6; L.chans.push_back(ch); }
-                o+=4;                                   // "8BIM"
-                L.blend=d.mid(o,4); o+=4;
-                L.opacity=u8(o); o+=1; o+=1;            // clipping
-                const int flags=u8(o); o+=1; o+=1;      // + filler
-                L.visible=!(flags&0x02);
-                const qint64 extraLen=u32(o); o=o+4+extraLen;   // skip mask/ranges/name/additional
-                if(o>lmEnd){ ok=false; break; }
-                layers.push_back(L);
-            }
-            auto mapBlend=[](const QByteArray& b)->QPainter::CompositionMode{
-                if(b=="mul ") return QPainter::CompositionMode_Multiply; if(b=="scrn") return QPainter::CompositionMode_Screen;
-                if(b=="over"||b=="hLit") return QPainter::CompositionMode_HardLight; if(b=="sLit") return QPainter::CompositionMode_SoftLight;
-                if(b=="dark") return QPainter::CompositionMode_Darken; if(b=="lite") return QPainter::CompositionMode_Lighten;
-                if(b=="diff") return QPainter::CompositionMode_Difference; return QPainter::CompositionMode_SourceOver; };
-            // channel image data follows: per layer, per channel: compression(2) + data
-            for(int i=0;i<nLayers && ok && i<layers.size();++i){ const Lay& L=layers[i];
-                const int lw=L.r-L.l, lh=L.b-L.t;
-                if(lw<=0||lh<=0||lw>30000||lh>30000){ for(const LChan& ch:L.chans) o+=ch.len; continue; }
-                QHash<int,QByteArray> planes;
-                for(const LChan& ch:L.chans){ const qint64 chEnd=qMin(N,o+ch.len); const int comp=u16(o);
-                    planes[ch.id]=psdChannelPlane(d, o+2, chEnd, comp, lw, lh); o=chEnd; }
-                const bool hasA=planes.contains(-1);
-                QImage img(lw,lh,QImage::Format_ARGB32);
-                auto ch=[&](int id,qint64 idx)->int{ auto it=planes.find(id); return (it!=planes.end() && idx<it->size())? quint8((*it)[idx]) : 0; };
-                for(int y=0;y<lh;++y){ QRgb* row=reinterpret_cast<QRgb*>(img.scanLine(y));
-                    for(int x=0;x<lw;++x){ const qint64 idx=qint64(y)*lw+x;
-                        row[x]=qRgba(ch(0,idx),ch(1,idx),ch(2,idx), hasA?ch(-1,idx):255); } }
-                Shape s; s.type=ShapeType::Rect; s.name=QStringLiteral("Layer %1").arg(i+1); s.rect=QRectF(0,0,lw,lh);
-                s.fill.type=FillType::Bitmap; s.fill.image=img; s.fill.origImage=img; s.fill.tiled=false;
-                s.fill.p0=QPointF(0,lh); s.fill.p1=QPointF(lw,lh); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
-                s.transform=QTransform::fromTranslate(L.l, L.t);
-                s.opacity=qBound(0.0, L.opacity/255.0, 1.0); s.visible=L.visible; s.blend=mapBlend(L.blend);
-                doc.shapes.push_back(s);
-            }
-        }
-    }
-    if(doc.shapes.isEmpty()){                          // no parseable layers → the flattened composite
-        const QImage comp=importPsd(d);
-        if(!comp.isNull()){ Shape s; s.type=ShapeType::Rect; s.name=QStringLiteral("PSD"); s.rect=QRectF(0,0,comp.width(),comp.height());
-            s.fill.type=FillType::Bitmap; s.fill.image=comp; s.fill.origImage=comp; s.fill.tiled=false;
-            s.fill.p0=QPointF(0,comp.height()); s.fill.p1=QPointF(comp.width(),comp.height()); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
-            doc.shapes.push_back(s); }
-    }
-    return doc;
-}
-
 // ============================================================================
 // Shared PostScript-family path interpreter. EPS (postfix names) and PDF (short
 // operators) both drive it: they tokenise differently but map to the same ops.
 // ============================================================================
 namespace {
+// Hard cap on shapes any single vector import may emit. A malformed PDF/EPS content stream (e.g. a
+// FlateDecode body of millions of 're f' ops) must not push an unbounded number of heavyweight Shapes
+// and OOM the app. Chosen far above any real document.
+static constexpr int kMaxImportShapes = 500000;
+// True only if every path point is finite — a crafted 'nan'/'inf' coordinate must not enter the model.
+static bool pathAllFinite(const QPainterPath& p){
+    const int n=p.elementCount();
+    for(int i=0;i<n;++i){ const QPainterPath::Element e=p.elementAt(i);
+        if(!qIsFinite(e.x)||!qIsFinite(e.y)) return false; }
+    return true;
+}
 struct GState { QTransform ctm; QColor fill = Qt::black; QColor stroke = Qt::black; double lineW = 1.0; bool evenOdd=false; };
 
 struct Interp {
@@ -260,6 +139,9 @@ struct Interp {
 
     void emitPath(bool doFill, bool doStroke){
         if(path.isEmpty()){ path=QPainterPath(); return; }
+        // Robustness: never emit past the cap (malformed streams can request millions of fills), and
+        // drop paths with non-finite coordinates (crafted 'nan'/'inf' operands) so they can't enter the model.
+        if(doc.shapes.size() >= kMaxImportShapes || !pathAllFinite(path)){ path=QPainterPath(); return; }
         Shape s; s.type=ShapeType::Path;
         s.path = base.map(path);
         s.fillRule = gs.evenOdd ? Qt::OddEvenFill : Qt::WindingFill;
@@ -294,6 +176,7 @@ Document importEps(const QByteArray& data){
         if(ch=='%'){ while(p<end && *p!='\n' && *p!='\r') ++p; continue; }               // comment
         if(ch=='(' ){ int depth=1; ++p; while(p<end&&depth){ if(*p=='\\')++p; else if(*p=='(')++depth; else if(*p==')')--depth; ++p; } continue; } // string
         if(ch=='{'){ int depth=1; ++p; while(p<end&&depth){ if(*p=='{')++depth; else if(*p=='}')--depth; ++p; } continue; }   // proc: skip
+        if(ch=='}'){ ++p; continue; }   // stray/unbalanced '}' at top level — skip it (else the token scanner below stalls, hanging forever)
         if(ch=='['||ch==']'){ ++p; continue; }
         if(isspace((unsigned char)ch)){ ++p; continue; }
         // token
@@ -502,18 +385,28 @@ Document importPdf(const QByteArray& data){
     // fall inside a binary stream body are ignored (so stream bytes can't forge a fake object).
     QHash<int,QByteArray> objs;
     { const int n=data.size();
-      QVector<QPair<int,int>> streamSpans;                                        // [stream keyword .. endstream end)
+      const int kMaxObjs=500000;                                                  // reject pathological object counts
+      QVector<QPair<int,int>> streamSpans;                                        // [stream keyword .. endstream end), position-ordered
       { int q=0; while(q<n){ int sPos=data.indexOf("stream", q); if(sPos<0) break;
           if(sPos>=3 && data.mid(sPos-3,3)=="end"){ q=sPos+6; continue; }          // this is 'endstream', not a stream start
           int e=data.indexOf("endstream", sPos+6); int end=(e<0)? n : e+9;
           streamSpans.push_back({sPos, end}); q=end; } }
-      auto inStream=[&](int pos)->bool{ for(const auto& sp: streamSpans) if(pos>=sp.first && pos<sp.second) return true; return false; };
+      // Spans are ascending + non-overlapping → binary search membership (was a linear scan per match: O(matches*spans)).
+      auto inStream=[&](int pos)->bool{ int lo=0,hi=streamSpans.size();
+          while(lo<hi){ int mid=(lo+hi)/2; if(streamSpans[mid].first<=pos) lo=mid+1; else hi=mid; }
+          return lo>0 && pos < streamSpans[lo-1].second; };
       QRegularExpression re("\\b(\\d+)\\s+\\d+\\s+obj\\b"); const QString s=QString::fromLatin1(data);
+      // Collect header positions first (capped), then bound each object body by the NEXT header. A missing
+      // 'endobj' must not make every object deep-copy the whole tail-to-EOF (O(N^2) memory bomb from a tiny file).
+      struct Hdr{ int num; int bodyStart; int matchStart; };
+      QVector<Hdr> hdrs;
       auto it=re.globalMatch(s);
-      while(it.hasNext()){ auto m=it.next(); if(inStream(m.capturedStart(0))) continue;
-          int num=m.captured(1).toInt();
-          int bs=m.capturedEnd(0); int e=data.indexOf("endobj", bs); if(e<0) e=data.size();
-          objs.insert(num, data.mid(bs, e-bs)); } }                               // insert (not insert-if-absent) → last wins
+      while(it.hasNext() && hdrs.size()<kMaxObjs){ auto m=it.next(); if(inStream(m.capturedStart(0))) continue;
+          hdrs.push_back({ m.captured(1).toInt(), int(m.capturedEnd(0)), int(m.capturedStart(0)) }); }
+      for(int k=0;k<hdrs.size();++k){ const int bs=hdrs[k].bodyStart;
+          const int limit=(k+1<hdrs.size())? hdrs[k+1].matchStart : n;
+          int e=data.indexOf("endobj", bs); if(e<0 || e>limit) e=limit;           // clamp to the next header when 'endobj' is absent/misnested
+          objs.insert(hdrs[k].num, data.mid(bs, qMax(0, e-bs))); } }               // insert (not insert-if-absent) → last def wins
 
     QRegularExpression refRe("(\\d+)\\s+\\d+\\s+R");
     QRegularExpression pagesRe("/Type\\s*/Pages\\b"), pageRe("/Type\\s*/Page\\b"), catRe("/Type\\s*/Catalog\\b");
@@ -627,6 +520,172 @@ Document importAi(const QByteArray& data){
 }
 
 // AutoCAD ASCII DXF → stroked Path shapes from the ENTITIES section.
+// ---- raster-only PostScript written by ImageMagick's "DisplayImage" prologue ----------------------
+// Such a file carries no drawing operators at all: after %%EndProlog it calls DisplayImage and then
+// feeds it a fixed run of parameter lines followed by the pixels as ASCII hex. Rasterising a general
+// PostScript image would need an interpreter, but this one shape is regular enough to read directly,
+// and it is what `convert x.png x.eps` (and .ps/.eps2/.eps3/.epsf/.epi) produces.
+//   DisplayImage / "x y" / "x y" / pointsize / "columns rows" / class / compression / <hex data>
+// class 0 = DirectClass (RGB triples). compression 0 = raw triples, 1 = packets of RGB + a repeat
+// count byte (the run covers count+1 pixels).
+// ---- raster-only PDF: the page content is one image XObject -------------------------------------
+// importPdf reads content-stream vectors; a PDF whose page is just a photograph has none. Rather
+// than a full PDF engine, find an image XObject, decode the stream through the filters we already
+// have, and infer the component count from the payload size (the ColorSpace is usually an indirect
+// reference we would otherwise have to resolve).
+QImage pdfRasterImage(const QByteArray& data){
+    int scan = 0, guard = 0;
+    while(guard++ < 256){
+        int i = data.indexOf("/Subtype", scan);
+        if(i < 0) break;
+        const int imgTok = data.indexOf("/Image", i);
+        if(imgTok < 0 || imgTok > i + 12){ scan = i + 8; continue; }
+        const int dictStart = data.lastIndexOf("<<", i);
+        const int strTok    = data.indexOf("stream", imgTok);
+        if(dictStart < 0 || strTok < 0){ scan = i + 8; continue; }
+        const QByteArray dict = data.mid(dictStart, strTok - dictStart);
+        scan = strTok;
+        auto intOf=[&](const char* key)->int{
+            const int k = dict.indexOf(key); if(k < 0) return -1;
+            int j = k + int(qstrlen(key));
+            while(j < dict.size() && (dict[j]==' '||dict[j]=='\t')) ++j;
+            int v = 0; bool any=false;
+            while(j < dict.size() && isdigit(static_cast<unsigned char>(dict[j]))){ v = v*10 + (dict[j]-'0'); ++j; any=true;
+                if(v > 100000) return -1; }
+            return any ? v : -1; };
+        const int W = intOf("/Width"), H = intOf("/Height"), bpc = intOf("/BitsPerComponent");
+        if(W <= 0 || H <= 0 || bpc != 8 || qint64(W)*H > 100000000ll) continue;
+        // Stream payload: skip the EOL after the `stream` keyword.
+        int sp = strTok + 6;
+        if(sp < data.size() && data[sp]=='\r') ++sp;
+        if(sp < data.size() && data[sp]=='\n') ++sp;
+        int ep = data.indexOf("endstream", sp);
+        if(ep < 0) ep = data.size();
+        const QByteArray raw = data.mid(sp, ep - sp);
+        if(raw.isEmpty()) continue;
+        const bool flate = dict.contains("FlateDecode");
+        const bool dct   = dict.contains("DCTDecode");
+        if(dct){                                            // the stream is a JPEG as-is
+            QImage j; if(j.loadFromData(raw, "JPEG") && !j.isNull()) return j;
+            continue;
+        }
+        const QByteArray px = flate ? inflateZlib(raw) : raw;
+        const qint64 need = qint64(W)*H;
+        int comps = 0;
+        if(px.size() >= need*3 && px.size() < need*4) comps = 3;
+        else if(px.size() >= need*4) comps = 4;             // CMYK
+        else if(px.size() >= need)   comps = 1;
+        if(!comps) continue;
+        QImage img(W, H, QImage::Format_ARGB32);
+        if(img.isNull()) continue;
+        for(qint64 k = 0; k < need; ++k){
+            const unsigned char* s2 = reinterpret_cast<const unsigned char*>(px.constData()) + k*comps;
+            QRgb v;
+            if(comps == 1)      v = qRgb(s2[0], s2[0], s2[0]);
+            else if(comps == 3) v = qRgb(s2[0], s2[1], s2[2]);
+            else { const int c=s2[0], m=s2[1], y2=s2[2], kk=s2[3];   // CMYK, additive-inverted
+                   v = qRgb((255-c)*(255-kk)/255, (255-m)*(255-kk)/255, (255-y2)*(255-kk)/255); }
+            reinterpret_cast<QRgb*>(img.scanLine(int(k / W)))[k % W] = v;
+        }
+        return img;
+    }
+    return QImage();
+}
+
+QImage psDisplayImageRaster(const QByteArray& data){
+    const int di = data.indexOf("\nDisplayImage");
+    if(di < 0) return QImage();
+    // The parameter block differs by PostScript level (Level 3 interleaves `false` tokens), but in
+    // every variant the THIRD "<int> <int>" line is the pixel size, so key off that rather than a
+    // fixed line count. Everything after the last parameter line is the payload, whose encoding is
+    // then sniffed: zlib (Level 3 Flate), ASCII hex (Level 1) or binary RunLength (Level 2).
+    int W=0, H=0, pairs=0, pos=di+1, guard=0;
+    while(pos < data.size() && guard++ < 24){
+        const int nl = data.indexOf('\n', pos);
+        // A binary payload may contain no newline at all; that simply means the parameters have
+        // ended and everything from here on is data.
+        if(nl < 0) break;
+        const QByteArray line = data.mid(pos, nl-pos).trimmed();
+        const int next = nl + 1;
+        if(line.isEmpty() || line == "DisplayImage" || line.startsWith('%')
+           || line == "false" || line == "true"){ pos = next; continue; }
+        const QList<QByteArray> tk = line.split(' ');
+        bool allNum = !tk.isEmpty();
+        for(const QByteArray& t : tk){ if(t.isEmpty()) continue;
+            for(char c : t) if(!isdigit(static_cast<unsigned char>(c))) { allNum=false; break; }
+            if(!allNum) break; }
+        if(!allNum) break;                                  // first non-parameter line: payload starts here
+        if(tk.size() >= 2){
+            bool a1=false,b1=false; const int a=tk[0].toInt(&a1), b=tk[1].toInt(&b1);
+            if(a1&&b1){ ++pairs; if(pairs==3){ W=a; H=b; } }
+        }
+        pos = next;
+        if(pairs>=3 && guard>=12) break;
+    }
+    if(W <= 0 || H <= 0 || W > 20000 || H > 20000 || qint64(W)*H > 100000000ll) return QImage();
+    auto makeImage=[&](const QByteArray& rgb)->QImage{
+        if(rgb.size() < 3) return QImage();
+        QImage img(W, H, QImage::Format_ARGB32);
+        if(img.isNull()) return QImage();
+        img.fill(Qt::white);
+        const qint64 tot = qint64(W)*H;
+        for(qint64 k = 0; k < tot && (k*3+2) < rgb.size(); ++k)
+            reinterpret_cast<QRgb*>(img.scanLine(int(k / W)))[k % W] =
+                qRgb(static_cast<unsigned char>(rgb[k*3]), static_cast<unsigned char>(rgb[k*3+1]),
+                     static_cast<unsigned char>(rgb[k*3+2]));
+        return img;
+    };
+    // (a) Level 3: Flate-compressed binary RGB.
+    for(int z = pos; z < qMin(data.size()-1, pos+96); ++z){
+        if(static_cast<unsigned char>(data[z]) != 0x78) continue;
+        const unsigned char z1 = static_cast<unsigned char>(data[z+1]);
+        if(z1!=0xDA && z1!=0x9C && z1!=0x01) continue;
+        const QImage img = makeImage(inflateZlib(data.mid(z)));
+        if(!img.isNull()) return img;
+        break;
+    }
+    // (b) Level 1: ASCII hex, either raw RGB triples or RGB + a repeat-count byte.
+    {   QByteArray hex; hex.reserve(data.size()-pos);
+        for(int i = pos; i < data.size(); ++i){
+            const char c = data[i];
+            if(isxdigit(static_cast<unsigned char>(c))) hex.append(c);
+            else if(c=='\n'||c=='\r'||c==' '||c=='\t') continue;
+            else break;
+        }
+        if(hex.size() >= 6){
+            auto hv=[](char c)->int{ return (c<='9') ? c-'0' : ((c|0x20)-'a'+10); };
+            for(int mode = 0; mode < 2; ++mode){          // 0 = raw triples, 1 = RGB + count
+                const int per = mode? 8 : 6;
+                QByteArray rgb; rgb.reserve(qint64(W)*H*3);
+                int hp = 0; qint64 px = 0; const qint64 tot = qint64(W)*H;
+                while(px < tot && hp + per <= hex.size()){
+                    const char r=char(hv(hex[hp])*16+hv(hex[hp+1]));
+                    const char g=char(hv(hex[hp+2])*16+hv(hex[hp+3]));
+                    const char b=char(hv(hex[hp+4])*16+hv(hex[hp+5]));
+                    hp += 6;
+                    qint64 run = 1;
+                    if(mode){ run = hv(hex[hp])*16 + hv(hex[hp+1]) + 1; hp += 2; }
+                    for(qint64 k=0;k<run && px<tot;++k,++px){ rgb.append(r); rgb.append(g); rgb.append(b); }
+                }
+                if(px == tot) return makeImage(rgb);           // only accept a complete image
+            }
+        }
+    }
+    // (c) Level 2: binary RGB through a RunLengthDecode filter.
+    {   QByteArray rgb; rgb.reserve(qint64(W)*H*3);
+        int i = pos;
+        while(i < data.size() && rgb.size() < qint64(W)*H*3){
+            const int nb = static_cast<unsigned char>(data[i++]);
+            if(nb == 128) break;
+            if(nb < 128){ const int cnt = nb+1; if(i+cnt > data.size()) break;
+                rgb.append(data.constData()+i, cnt); i += cnt; }
+            else { if(i >= data.size()) break; const char v = data[i++]; rgb.append(QByteArray(257-nb, v)); }
+        }
+        if(rgb.size() >= qint64(W)*H*3) return makeImage(rgb);
+    }
+    return QImage();
+}
+
 Document importDxf(const QByteArray& data){
     Document doc;
     const QStringList lines=QString::fromLatin1(data).split(QRegularExpression("\\r\\n|\\r|\\n"));
@@ -657,17 +716,50 @@ Document importDxf(const QByteArray& data){
         if(type=="LINE"){ path.moveTo(val(10),flip(val(20))); path.lineTo(val(11),flip(val(21))); }
         else if(type=="CIRCLE"){ path.addEllipse(QPointF(val(10),flip(val(20))), val(40), val(40)); }
         else if(type=="ARC"){ const double cx=val(10),cy=flip(val(20)),r=val(40),a0=val(50),a1=val(51);
-            QRectF rc(cx-r,cy-r,2*r,2*r); double span=a1-a0; while(span<=0) span+=360;   // DXF CCW; flipped y → negate angles
-            path.arcMoveTo(rc,-a0); path.arcTo(rc,-a0,-span); }
+            // Guard non-finite operands, and normalise the span with fmod: `while(span<=0) span+=360`
+            // never terminates for a huge start angle (360 falls below the ULP near 1e300 → infinite loop).
+            if(qIsFinite(cx)&&qIsFinite(cy)&&qIsFinite(r)&&r>0 && qIsFinite(a0)&&qIsFinite(a1)){
+                QRectF rc(cx-r,cy-r,2*r,2*r); double span=std::fmod(a1-a0,360.0); if(span<=0) span+=360;
+                const double s0=std::fmod(a0,360.0);                                  // DXF CCW; flipped y → negate angles
+                path.arcMoveTo(rc,-s0); path.arcTo(rc,-s0,-span); } }
         else if(type=="LWPOLYLINE"){ const QVector<double> xs=vals(10), ys=vals(20); const int flags=ival(70);
             for(int k=0;k<xs.size()&&k<ys.size();++k){ QPointF p(xs[k],flip(ys[k])); if(k==0)path.moveTo(p); else path.lineTo(p); }
             if(flags&1) path.closeSubpath(); }
+        else if(type=="TEXT"||type=="MTEXT"){
+            // Real text, not outlines: DXF group 1 is the string (MTEXT continues in 3), 10/20 the
+            // insertion point, 40 the cap height, 50 the rotation in degrees (CCW on a y-up page).
+            QString txt; for(const Pair& p:ent){ if(p.code==3) txt+=p.val; }
+            for(const Pair& p:ent){ if(p.code==1){ txt+=p.val; break; } }
+            txt.replace("\\P","\n").replace("\\~"," ");
+            static const QRegularExpression mtextFmt("\\\\[A-Za-z][^;\\\\]*;|[{}]");   // strip MTEXT inline codes
+            txt.remove(mtextFmt);
+            txt=txt.trimmed();
+            if(!txt.isEmpty()){
+                // Clamp in the double domain: group 40 is file-supplied, and int() on an
+                // out-of-range double is UB (the UBSan build traps) — a post-cast qBound is too late.
+                const double raw40 = val(40,10.0);
+                const double h = (qIsFinite(raw40) && raw40 > 0) ? qBound(1.0, raw40, 4000.0) : 10.0;
+                Shape t; t.type=ShapeType::Text; t.name=type; t.text=txt;
+                t.font=QFont("DejaVu Sans"); t.font.setPixelSize(int(h+0.5));
+                t.fill.type=FillType::Solid; t.fill.color=QColor(30,30,30); t.stroke.enabled=false;
+                t.rect=QRectF(0,0, qMax(1.0,h*0.62*txt.length()), h*1.25);
+                // DXF rotates about the INSERTION point (the baseline-left), so translate there
+                // first, rotate, and only then lift by the cap height to the frame's top-left.
+                QTransform tr; tr.translate(val(10), flip(val(20)));
+                const double rot=val(50); if(qIsFinite(rot) && qAbs(rot)>1e-9) tr.rotate(-rot);
+                tr.translate(0, -h);
+                t.transform=tr;
+                shapes.push_back(t);
+            }
+        }
         emitPath(path, type);
     }
     if(shapes.isEmpty()) return doc;
-    QRectF bb; for(const Shape& s:shapes) bb = bb.isNull()? s.path.boundingRect() : bb.united(s.path.boundingRect());
+    QRectF bb;
+    auto bounds=[](const Shape& s){ return s.type==ShapeType::Text ? s.transform.mapRect(s.rect) : s.path.boundingRect(); };
+    for(const Shape& s:shapes){ const QRectF r=bounds(s); if(r.isNull()) continue; bb = bb.isNull()? r : bb.united(r); }
     const QTransform norm=QTransform::fromTranslate(-bb.left(),-bb.top());   // shift bbox to origin
-    for(Shape& s:shapes) s.path=norm.map(s.path);
+    for(Shape& s:shapes){ if(s.type==ShapeType::Text) s.transform = s.transform * norm; else s.path=norm.map(s.path); }
     doc.pageSize=QSizeF(qMax(1.0,bb.width()), qMax(1.0,bb.height()));
     doc.shapes=shapes;
     return doc;

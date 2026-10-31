@@ -5,6 +5,15 @@
 #include <QFileInfo>
 #include <QFile>
 #include <QTextDocument>
+#include <QEventLoop>
+#include <QGuiApplication>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonValue>
+#include <QXmlStreamReader>
+#include <QPainter>
+#include <dlfcn.h>
 #include <zlib.h>
 #include "xar.h"
 #include "gif.h"
@@ -20,24 +29,25 @@ static QString safeHref(const QString& u){
 
 // Native format is XAR (the real Xara binary format) — see xar.cpp.
 bool Canvas::save(const QString& path) {
+    m_doc.guidesH=m_guideHpos; m_doc.guidesV=m_guideVpos;
     if(!xara::saveXar(m_doc, path)) return false;
     m_path=path; return true;
 }
 bool Canvas::load(const QString& path) {
     Document d; d.pageSize=m_doc.pageSize;
     if(!xara::loadXar(d, path)) return false;
-    setDocument(d, path); zoomFit(); return true;
+    setDocument(d, path); m_guideHpos=d.guidesH; m_guideVpos=d.guidesV; zoomFit(); return true;
 }
 // Write the current document to `path` WITHOUT retargeting the file path — used for autosave/recovery
 // snapshots, which must not hijack the tab's real file identity.
 bool Canvas::saveSnapshot(const QString& path) const { return xara::saveXar(m_doc, path); }
-bool Canvas::saveCompressed(const QString& path) { if(!xara::saveXar(m_doc, path, true)) return false; m_path=path; return true; }
+bool Canvas::saveCompressed(const QString& path) { m_doc.guidesH=m_guideHpos; m_doc.guidesV=m_guideVpos; if(!xara::saveXar(m_doc, path, true)) return false; m_path=path; return true; }
 
 bool Canvas::exportPng(const QString& path, int scale) {
     reflowText();
     QRectF b = m_doc.contentBounds(); if(b.isNull()) b=QRectF(QPointF(0,0),m_doc.pageSize);
     b.adjust(-8,-8,8,8);
-    if(qEnvironmentVariableIsSet("XARA_PAGEEXPORT")){ b=QRectF(QPointF(0,0),m_doc.pageSize); scale=1; }  // diag: full-page @1x for oracle compare
+    if(qEnvironmentVariableIsSet("XARA_PAGEEXPORT")){ b=m_doc.pageRect(qEnvironmentVariableIntValue("XARA_PAGEINDEX")); scale=1; }  // diag: full-page @1x for oracle compare
     QImage img(QSize(int(b.width()*scale), int(b.height()*scale)), QImage::Format_ARGB32_Premultiplied);
     img.fill(Qt::transparent);
     QPainter g(&img); g.setRenderHint(QPainter::Antialiasing); g.setRenderHint(QPainter::SmoothPixmapTransform);
@@ -49,23 +59,36 @@ bool Canvas::exportPng(const QString& path, int scale) {
 
 // Bitmap Export with options (the Export dialog's engine): area (0 Page / 1 Drawing / 2 Selection),
 // an output scale, JPEG quality (-1 = default), and a transparent-vs-white-matte background.
-bool Canvas::exportRaster(const QString& path, int areaMode, double scale, int quality, bool transparent, bool indexed, bool dither){
-    reflowText();
+// Doc-space rectangle for a given export area: 0=Page(chosen/current), 1=Drawing(content), 2=Selection.
+QRectF Canvas::exportAreaRect(int areaMode, int pageIndex){
     QRectF b;
     if(areaMode==2){ b=selectionBoundsDoc(); if(b.isNull()) b=m_doc.contentBounds(); }         // Selection
     else if(areaMode==1){ b=m_doc.contentBounds(); if(!b.isNull()) b.adjust(-8,-8,8,8); }      // Drawing (content)
-    else b=QRectF(QPointF(0,0), m_doc.pageSize);                                                // Page
+    else { const int pg=qBound(0, pageIndex>=0? pageIndex : currentPage(), qMax(0, m_doc.pageCount-1));
+           b=m_doc.pageRect(pg); }                                                              // Page (chosen, else the current page — not always page 1)
     if(b.isNull() || b.width()<1 || b.height()<1) b=QRectF(QPointF(0,0), m_doc.pageSize);
+    return b;
+}
+// Render an export area to an ARGB image (no format encoding). maxDim>0 caps the longest side so the
+// Export dialog's live preview stays responsive; the real export passes 0 (full resolution).
+QImage Canvas::exportRasterImage(int areaMode, double scale, bool transparent, int pageIndex, int maxDim){
+    reflowText();
+    const QRectF b = exportAreaRect(areaMode, pageIndex);
     if(scale<=0) scale=1;
     int W=qMax(1,int(b.width()*scale)), H=qMax(1,int(b.height()*scale));
     const qint64 cap=64LL*1024*1024;                                                            // pixel cap → avoid runaway allocations
     if(qint64(W)*H>cap){ double f=std::sqrt(double(cap)/(double(W)*double(H))); W=qMax(1,int(W*f)); H=qMax(1,int(H*f)); }
+    if(maxDim>0 && qMax(W,H)>maxDim){ double f=double(maxDim)/qMax(W,H); W=qMax(1,int(W*f)); H=qMax(1,int(H*f)); }
     QImage img(QSize(W,H), QImage::Format_ARGB32_Premultiplied);
     img.fill(transparent? Qt::transparent : Qt::white);
     QPainter g(&img); g.setRenderHint(QPainter::Antialiasing); g.setRenderHint(QPainter::SmoothPixmapTransform);
     g.scale(double(W)/b.width(), double(H)/b.height()); g.translate(-b.topLeft());
     if(hasTextFields()||hasTextChains()){ Document rd=resolvedForRender(); paintDocument(g, rd); } else paintDocument(g, m_doc);
     g.end();
+    return img;
+}
+bool Canvas::exportRaster(const QString& path, int areaMode, double scale, int quality, bool transparent, bool indexed, bool dither, int pageIndex){
+    QImage img = exportRasterImage(areaMode, scale, transparent, pageIndex, 0);
     const bool jpeg = path.endsWith(".jpg",Qt::CaseInsensitive)||path.endsWith(".jpeg",Qt::CaseInsensitive);
     QImage out = (transparent && !jpeg)? img : img.convertToFormat(QImage::Format_RGB32);       // JPEG has no alpha → always matte
     if(indexed && !jpeg)   // optimiser: reduce to a ≤256-colour indexed palette (PNG-8/GIF), with optional Floyd–Steinberg dithering
@@ -88,6 +111,9 @@ static QMap<QString,QByteArray> readZipEntries(const QByteArray& z){
     quint32 cdOff=u32(eocd+16); int cnt=u16(eocd+10);
     if(cdOff>=(quint32)n) return out;
     int pos=(int)cdOff;
+    // Aggregate decompression-bomb guard: the per-entry 64 MB cap alone lets a small archive with many
+    // central-directory records (optionally all pointing at one local file) expand to terabytes of RAM.
+    qint64 totalDec=0; const qint64 kZipAggCap=256LL*1024*1024;
     for(int e=0; e<cnt && pos>=0 && pos+46<=n; ++e){
         if(u32(pos)!=0x02014b50u) break;
         const int method=u16(pos+10);
@@ -112,6 +138,8 @@ static QMap<QString,QByteArray> readZipEntries(const QByteArray& z){
             if(ret!=Z_STREAM_END && ret!=Z_OK){ continue; }
             dec.resize((int)(uncomp - zs.avail_out));
         } else continue;
+        if(totalDec + dec.size() > kZipAggCap) break;    // stop before the cumulative decoded size runs away
+        totalDec += dec.size();
         out.insert(name, dec);
     }
     return out;
@@ -165,21 +193,49 @@ bool Canvas::importEpub(const QString& path){
 }
 
 bool Canvas::importImage(const QString& path) {
-    if(path.endsWith(".psd",Qt::CaseInsensitive)){
+    if(path.endsWith(".apng",Qt::CaseInsensitive) || path.endsWith(".png",Qt::CaseInsensitive)){
+        QFile af(path); if(af.open(QIODevice::ReadOnly)){ const QByteArray head=af.read(1<<16); af.close();
+            if(head.contains(QByteArray("acTL")) && importApng(path)) return true; } }   // animated PNG → frames
+    if(path.endsWith(".psd",Qt::CaseInsensitive) || path.endsWith(".psb",Qt::CaseInsensitive)){
+        const bool psb=path.endsWith(".psb",Qt::CaseInsensitive);   // Photoshop "Large Document Format"
         QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
-        Document pd=importPsdDocument(f.readAll()); if(pd.shapes.isEmpty()) return false;
+        PsdImportStats st;
+        Document pd=importPsdDocument(f.readAll(),&st); if(pd.shapes.isEmpty()) return false;
+        const QString fileName=QFileInfo(path).fileName();
+        QStringList notes;
+        if(st.rasterText) notes<<QStringLiteral("%1 text layer(s) kept as pixels (font missing or warped)").arg(st.rasterText);
+        if(st.skippedAdjustments) notes<<QStringLiteral("%1 colour lookup(s) in an unsupported format not applied").arg(st.skippedAdjustments);
+        const QString noteText=notes.isEmpty()?QString():QStringLiteral(" %1.").arg(notes.join(QStringLiteral(", ")));
+        if(m_doc.shapes.isEmpty()){       // an empty document takes the file's page, like every other vector import
+            m_doc.pageSize=pd.pageSize; m_doc.pageCount=1;
+            warnMissingFonts(pd.shapes);
+            m_guideHpos+=st.guidesH; m_guideVpos+=st.guidesV;
+            if(pd.shapes.size()>1){ Shape g; g.type=ShapeType::Group; g.name=fileName; g.children=pd.shapes; addShapes({g}, psb?"Import PSB":"Import PSD"); }
+            else addShapes(pd.shapes, psb?"Import PSB":"Import PSD");
+            zoomFit();
+            emit statusMessage(QStringLiteral("Imported %1.%2").arg(fileName,noteText));
+            return true;
+        }
         QRectF b; for(const Shape& s: pd.shapes) b = b.isNull()? s.docBounds() : b.united(s.docBounds());
         if(b.isNull()||b.width()<1||b.height()<1) return false;
         const double maxW=m_doc.pageSize.width()*0.9, maxH=m_doc.pageSize.height()*0.9;
         const double sc=qMin(1.0, qMin(maxW/b.width(), maxH/b.height()));
         const QPointF pc(m_doc.pageSize.width()/2, m_doc.pageSize.height()/2), bc=b.center();
         QTransform place; place.translate(pc.x(),pc.y()); place.scale(sc,sc); place.translate(-bc.x(),-bc.y());
+        const char* lbl = psb ? "Import PSB" : "Import PSD";
         if(pd.shapes.size()>1){ Shape g; g.type=ShapeType::Group; g.name=QFileInfo(path).fileName(); g.children=pd.shapes; g.transform=place;
-            addShapes({g}, "Import PSD"); }
-        else { Shape s=pd.shapes[0]; s.name=QFileInfo(path).fileName(); s.transform = s.transform * place; addShapes({s}, "Import PSD"); }
+            addShapes({g}, lbl); }
+        else { Shape s=pd.shapes[0]; s.name=QFileInfo(path).fileName(); s.transform = s.transform * place; addShapes({s}, lbl); }
         return true;
     }
-    QImage img = (xara::Raw::isRawFile(path) && xara::Raw::available()) ? xara::Raw::decode(path) : QImage(path);
+    QImage img;
+    // Whole-slide microscopy (.svs/.ndpi/…): prefer OpenSlide's bounded pyramid overview over Qt's TIFF
+    // plugin, which would otherwise try to read the full gigapixel base level of a real slide.
+    { static const char* const slideExt[]={".svs",".ndpi",".scn",".mrxs",".vms",".vmu",".svslide",".bif"};
+      for(const char* e : slideExt) if(path.endsWith(QLatin1String(e),Qt::CaseInsensitive)){ img=xara::ExtCodec::decode(path); break; } }
+    if(img.isNull()) img = (xara::Raw::isRawFile(path) && xara::Raw::available()) ? xara::Raw::decode(path) : QImage(path);
+    if(img.isNull()) img = xara::RasterExtra::decode(path);   // native decoders for formats Qt can't read (QOI/PCX/SGI/HDR/PFM/PAM/DDS)
+    if(img.isNull()) img = xara::ExtCodec::decode(path);       // runtime-optional libs: JPEG 2000 (OpenJPEG), JPEG XL (libjxl)
     if(img.isNull()) return false;
     // EXIF orientation: auto-rotate/mirror a camera photo to its intended upright form (every mainstream
     // viewer does this; the tag was decoded but ignored before).
@@ -227,7 +283,7 @@ bool Canvas::importAnimatedGif(const QString& path) {
     const double maxW=m_doc.pageSize.width()*0.9, maxH=m_doc.pageSize.height()*0.9;
     const double sc=qMin(1.0, qMin(maxW/W, maxH/H));
     const QTransform place = QTransform::fromScale(sc,sc) * QTransform::fromTranslate((m_doc.pageSize.width()-W*sc)/2,(m_doc.pageSize.height()-H*sc)/2);
-    m_doc.layers.clear();
+    m_doc.layers.clear(); m_doc.shapes.clear();   // a GIF animation replaces the document — clear old artwork too, else it bleeds onto the frame-layers
     const QString base=QFileInfo(path).completeBaseName();
     for(int i=0;i<frames.size();++i){
         Layer L; L.name=QString("%1 %2").arg(base).arg(i+1); L.visible=(i==0); L.frameDelayMs=(i<perFrameMs.size()?perFrameMs[i]:100); m_doc.layers.push_back(L);
@@ -358,22 +414,152 @@ bool Canvas::importDocx(const QString& path){
     addShapes({s},"Import DOCX");
     return true;
 }
+
+// Import a FictionBook .fb2 (or a zipped .fb2.zip/.fbz): a single XML file whose <body> holds the
+// prose as <section>/<p>. Flattened into an editable wrapping text frame, like importDocx. The
+// <binary> elements (base64 cover/illustrations, often tens of MB) are skipped wholesale.
+bool Canvas::importFb2(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    QByteArray data=f.readAll(); f.close();
+    if(data.size()>=2 && data[0]=='P' && data[1]=='K'){            // .fb2.zip / .fbz wrapper
+        const QMap<QString,QByteArray> zip=readZipEntries(data);
+        QByteArray inner;
+        for(auto it=zip.begin(); it!=zip.end(); ++it)
+            if(it.key().endsWith(".fb2",Qt::CaseInsensitive)){ inner=it.value(); break; }
+        if(inner.isEmpty() && !zip.isEmpty()) inner=zip.begin().value();
+        if(inner.isEmpty()){ emit statusMessage("Not a readable FictionBook archive."); return false; }
+        data=inner;
+    }
+    // Feed the RAW bytes to QXmlStreamReader — FB2 is commonly encoding="windows-1251", and the
+    // declaration must drive the codec (converting to QString up front would corrupt it).
+    QString title, text; bool inBody=false;
+    QXmlStreamReader r(data); r.setNamespaceProcessing(false);
+    while(!r.atEnd()){ r.readNext();
+        if(r.isStartElement()){
+            const QString el=r.name().toString().section(':',-1);
+            if(el=="binary"){ r.skipCurrentElement(); continue; }   // base64 image payloads: never read
+            // IncludeChildElements: a <book-title> containing inline markup would otherwise raise
+            // ErrorOnUnexpectedElement and abort the whole parse, losing the entire book.
+            if(el=="book-title" && title.isEmpty()){ title=r.readElementText(QXmlStreamReader::IncludeChildElements).simplified(); continue; }
+            if(el=="body") inBody=true;
+            else if(inBody && (el=="empty-line")) text+='\n';
+        } else if(r.isEndElement()){
+            const QString el=r.name().toString().section(':',-1);
+            if(el=="body") inBody=false;
+            else if(inBody && (el=="p"||el=="title"||el=="subtitle"||el=="section"||el=="v")) text+='\n';
+        } else if(r.isCharacters() && inBody) text += r.text();     // keep whitespace runs: they separate inline markup
+    }
+    text.replace(QRegularExpression("[ \\t]+")," ");
+    text.replace(QRegularExpression("\n{3,}"),"\n\n");
+    text=text.trimmed();
+    if(text.isEmpty()){ emit statusMessage("FictionBook contained no readable text."); return false; }
+    if(!title.isEmpty()) text = title + "\n\n" + text;
+    Shape s; s.type=ShapeType::Text; s.text=text; s.textFrame=true;
+    s.name = title.isEmpty()? QFileInfo(path).fileName() : title;
+    s.fill.type=FillType::Solid; s.fill.color=Qt::black; s.stroke.enabled=false;
+    const double w=qMin(m_doc.pageSize.width()*0.8, 520.0);
+    s.rect=QRectF(0,0,w,qMax(80.0,m_doc.pageSize.height()*0.8));
+    s.transform=QTransform::fromTranslate(m_doc.pageSize.width()*0.1, m_doc.pageSize.height()*0.08);
+    addShapes({s},"Import FictionBook");
+    emit statusMessage("Imported FictionBook text.");
+    return true;
+}
+// Reconstruct a QImage from a CF_DIB payload (a BITMAPINFOHEADER + palette + pixels, with NO 14-byte
+// BITMAPFILEHEADER — as stored in a RIFF DISP chunk). We synthesise the file header so QImage can decode it.
+static QImage cdrDibToImage(const QByteArray& dib){
+    if(dib.size()<40) return QImage();
+    const uchar* p=(const uchar*)dib.constData();
+    auto u16=[&](int o)->quint32{ return (quint32)(p[o] | (p[o+1]<<8)); };
+    auto u32=[&](int o)->quint32{ return (quint32)(p[o] | (p[o+1]<<8) | (p[o+2]<<16) | ((quint32)p[o+3]<<24)); };
+    const quint32 biSize=u32(0);
+    if(biSize<40 || biSize>124 || (int)biSize>dib.size()) return QImage();   // BITMAPINFOHEADER..V5
+    const int bpp=(int)u16(14); const quint32 comp=u32(16); const quint32 clrUsed=u32(32);
+    quint32 clr = (bpp<=8) ? (clrUsed ? clrUsed : (1u<<bpp)) : clrUsed;
+    quint32 colorBytes = clr*4 + ((comp==3 && biSize==40) ? 12u : 0u);       // BI_BITFIELDS masks follow a v3 header
+    const quint32 off = 14u + biSize + colorBytes;
+    const quint32 fileSize = 14u + (quint32)dib.size();
+    QByteArray bmp; bmp.reserve(14+dib.size());
+    auto le32=[&](quint32 v){ char b[4]={char(v&0xff),char((v>>8)&0xff),char((v>>16)&0xff),char((v>>24)&0xff)}; bmp.append(b,4); };
+    bmp.append("BM",2); le32(fileSize); le32(0); le32(off); bmp.append(dib);
+    QImage im; im.loadFromData(bmp, "BMP"); return im;
+}
+// Find the first RIFF chunk with the given 4-char id (walking into nested RIFF/LIST containers).
+static QByteArray cdrRiffChunk(const QByteArray& d, const char id[4]){
+    const int n=d.size(); if(n<12 || qstrncmp(d.constData(),"RIFF",4)!=0) return QByteArray();
+    const uchar* p=(const uchar*)d.constData();
+    auto u32=[&](int o)->quint32{ return (o>=0 && o+3<n)? (quint32)(p[o]|(p[o+1]<<8)|(p[o+2]<<16)|((quint32)p[o+3]<<24)) : 0u; };
+    QByteArray found;
+    std::function<void(int,int,int)> walk=[&](int off,int end,int depth){
+        if(depth>64) return;                            // bound recursion: deeply nested LIST containers must not overflow the stack
+        while(off+8<=end && found.isEmpty()){
+            const char* cid=d.constData()+off; const quint32 size=u32(off+4); const int body=off+8;
+            if(body+(qint64)size>end) break;
+            if(qstrncmp(cid,id,4)==0){ found=QByteArray(d.constData()+body,(int)size); return; }
+            if(qstrncmp(cid,"RIFF",4)==0 || qstrncmp(cid,"LIST",4)==0) walk(body+4, body+(int)size, depth+1);
+            off = body + (int)size + ((int)size & 1);   // chunks are word-aligned
+        }
+    };
+    walk(12, qMin(n, 8+(int)u32(4)), 0);
+    return found;
+}
 // Best-effort CorelDRAW .cdr import: real .cdr vector parsing is proprietary/huge, so we extract the
-// embedded preview bitmap (ZIP-based .cdr → previews/*.png|jpg; RIFF .cdr → largest embedded JPEG/PNG)
-// and place it as a photo placeholder. Honest fallback, mirroring how apps handle unknown .cdr versions.
+// embedded preview bitmap and place it as a photo placeholder. Order of preference:
+//   1) RIFF .cdr (v7–X5): the CF_DIB thumbnail in the DISP chunk — the document's own preview;
+//   2) newer ZIP-wrapped .cdr (X6+): previews/thumbnail.png|jpg;
+//   3) last resort: any standalone JPEG/PNG embedded in the bytes.
 bool Canvas::importCdr(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
     const QByteArray data=f.readAll(); f.close();
+    const QString name=QFileInfo(path).fileName();
+
+    // A .cdr can take a second or two to parse. Unlike our other importers, libcdr is single-threaded and is
+    // NOT safe to run on a worker thread (it hangs off the GUI thread), so the parse blocks the UI. To keep
+    // the app from ever *looking* hung/crashed, show a wait cursor + a status message and PAINT them before
+    // the blocking parse. Pathological/malformed files are bounded by the riffDepthOk pre-check inside
+    // cdrToSvgPages + the RIFF/embedded-scan caps, so this can't spin forever.
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard { ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cursorGuard;
+    emit statusMessage(QStringLiteral("Importing CorelDRAW file… %1").arg(name));
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);   // let the cursor + message paint first
+
+    // Preferred: editable vectors via libcdr (parses .cdr → SVG → our SVG importer). No-op without libcdr.
+    if(xara::cdrVectorAvailable()){
+        const QStringList pages = xara::cdrToSvgPages(data);
+        if(!pages.isEmpty()){
+            QVector<Shape> imported;
+            if(pages.size()==1){ QString err; imported = parseSvg(pages[0].toUtf8(), &err, QString()); }
+            else {   // multi-page .cdr: stack the pages vertically so nothing overlaps
+                double stackTop=0;
+                for(const QString& svg : pages){ QString err; QVector<Shape> sh=parseSvg(svg.toUtf8(), &err, QString());
+                    if(sh.isEmpty()) continue;
+                    QRectF b; for(const Shape& s : sh){ const QRectF db=s.docBounds(); b=b.isNull()?db:b.united(db); }
+                    if(!b.isNull()){ const QTransform t=QTransform::fromTranslate(0, stackTop-b.top()); for(Shape& s:sh) s.transform=s.transform*t; stackTop+=b.height()+60; }
+                    imported += sh; }
+            }
+            if(!imported.isEmpty()){
+                addShapes(imported, "Import CDR");
+                zoomFit();
+                emit statusMessage(QStringLiteral("Imported CorelDRAW vectors — %1 objects%2 (via libcdr).")
+                    .arg(imported.size()).arg(pages.size()>1?QStringLiteral(", %1 pages").arg(pages.size()):QString()));
+                return true;
+            }
+        }
+        // libcdr present but this file yielded no vectors → fall through to the preview extractor.
+    }
+    // Preview-bitmap fallback: DISP DIB / zip thumbnail / embedded JPEG-PNG.
     QImage best;
-    auto consider=[&](const QByteArray& b){ QImage im; if(im.loadFromData(b) && !im.isNull()
+    auto considerImg=[&](const QImage& im){ if(!im.isNull()
         && (qint64)im.width()*im.height() > (qint64)best.width()*best.height()) best=im; };
-    const QMap<QString,QByteArray> zip=readZipEntries(data);   // newer zip-wrapped .cdr
-    if(!zip.isEmpty()) for(auto it=zip.begin(); it!=zip.end(); ++it){ const QString n=it.key().toLower();
-        if(n.contains("preview")||n.endsWith(".png")||n.endsWith(".jpg")||n.endsWith(".jpeg")) consider(it.value()); }
-    if(best.isNull()){   // RIFF .cdr: scan for embedded JPEG (FFD8FF..FFD9) / PNG signatures
+    auto consider=[&](const QByteArray& b){ QImage im; if(im.loadFromData(b)) considerImg(im); };
+    if(data.size()>=12 && qstrncmp(data.constData(),"RIFF",4)==0){
+        const QByteArray disp=cdrRiffChunk(data,"DISP");
+        if(disp.size()>4) considerImg(cdrDibToImage(disp.mid(4)));
+    }
+    if(best.isNull()){ const QMap<QString,QByteArray> zip=readZipEntries(data);
+        if(!zip.isEmpty()) for(auto it=zip.begin(); it!=zip.end(); ++it){ const QString n=it.key().toLower();
+            if(n.contains("preview")||n.contains("thumbnail")||n.endsWith(".png")||n.endsWith(".jpg")||n.endsWith(".jpeg")) consider(it.value()); } }
+    if(best.isNull()){   // last resort — scan for an embedded standalone JPEG (FFD8FF..FFD9) / PNG, decode-capped
         const QByteArray png=QByteArray::fromHex("89504E470D0A1A0A"), jpg=QByteArray::fromHex("FFD8FF");
-        // Cap decode attempts: a crafted .cdr densely packed with signatures (e.g. megabytes of repeated
-        // FFD8FF) would otherwise trigger millions of multi-MB copies + decodes and hang the app.
         int tries=0; const int MAX_TRIES=64;
         for(int i=data.indexOf(png); i>=0 && tries<MAX_TRIES; i=data.indexOf(png,i+8)){ ++tries; consider(data.mid(i, qMin(data.size()-i, 8<<20))); }
         for(int i=data.indexOf(jpg); i>=0 && tries<MAX_TRIES; i=data.indexOf(jpg,i+3)){ ++tries; consider(data.mid(i, qMin(data.size()-i, 8<<20))); }
@@ -381,12 +567,444 @@ bool Canvas::importCdr(const QString& path){
     if(best.isNull()){ emit statusMessage("No importable preview found in the .cdr (vector .cdr parsing is unsupported)."); return false; }
     const double W=best.width(), H=best.height();
     const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/W, m_doc.pageSize.height()*0.9/H));
-    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=QFileInfo(path).fileName()+" (preview)";
+    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=name+" (preview)";
     s.fill.type=FillType::Bitmap; s.fill.image=best; s.fill.origImage=best; s.fill.tiled=false;
     s.fill.p0=QPointF(0,H); s.fill.p1=QPointF(W,H); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
     s.transform=QTransform::fromScale(sc,sc)*QTransform::fromTranslate((m_doc.pageSize.width()-W*sc)/2,(m_doc.pageSize.height()-H*sc)/2);
     addShapes({s},"Import CDR preview");
     emit statusMessage("Imported the .cdr preview bitmap (vector content isn't parsed).");
+    return true;
+}
+// Shared consumer for the librevenge-backed vector importers (WPG/Visio/FreeHand/Publisher): take one
+// standard-SVG string per page, run each through parseSvg, stack multi-page documents vertically so
+// nothing overlaps, and add the whole lot as a single undo-able import. Mirrors importCdr's vector path.
+bool Canvas::importVectorSvgPages(const QStringList& pages, const QString& undoLabel,
+                                  const QString& statusVerb, const QString& viaLib){
+    if(pages.isEmpty()) return false;
+
+    // The page we adopt must be the VIEWPORT the content is laid out in, not the viewBox extent:
+    // parseSvg maps viewBox -> width/height, and librevenge writes those in DIFFERENT units (width in
+    // inches, viewBox in points), so taking the viewBox would size the page 33% — or, for a WPG, 21x —
+    // wrong. Only adopt into an EMPTY document; File > Import into an existing drawing is unchanged.
+    const bool adoptPage = m_doc.shapes.isEmpty();
+    QSizeF pageSz = svgViewportSize(pages[0].toUtf8());
+    if(!(pageSz.width() > 1.0 && pageSz.height() > 1.0 && pageSz.width() < 1e7 && pageSz.height() < 1e7))
+        pageSz = QSizeF();
+
+    QVector<Shape> imported;
+    if(pages.size()==1){ QString err; imported = parseSvg(pages[0].toUtf8(), &err, QString()); }
+    else if(adoptPage && !pageSz.isEmpty()){
+        // Real pages: lay each one out on ITS OWN XarQ page, using the same advance Document::pageRect
+        // uses. Re-basing to each page's content bounding box (what we used to do) both destroys the
+        // page margins and drifts out of step with the page rects, so page 2's artwork lands on page 1.
+        const double adv = pageSz.height() + m_doc.pageGap;
+        for(int i = 0; i < pages.size(); ++i){
+            QString err; QVector<Shape> sh = parseSvg(pages[i].toUtf8(), &err, QString());
+            if(sh.isEmpty()) continue;                       // a blank page still consumes its slot
+            const QTransform t = QTransform::fromTranslate(0, i * adv);
+            for(Shape& s : sh) s.transform = s.transform * t;
+            imported += sh;
+        }
+    }
+    else {   // importing into an existing drawing: stack by content so nothing overlaps what is there
+        double stackTop=0;
+        for(const QString& svg : pages){ QString err; QVector<Shape> sh=parseSvg(svg.toUtf8(), &err, QString());
+            if(sh.isEmpty()) continue;
+            QRectF b; for(const Shape& s : sh){ const QRectF db=s.docBounds(); b=b.isNull()?db:b.united(db); }
+            if(!b.isNull()){ const QTransform t=QTransform::fromTranslate(0, stackTop-b.top()); for(Shape& s:sh) s.transform=s.transform*t; stackTop+=b.height()+60; }
+            imported += sh; }
+    }
+    if(imported.isEmpty()) return false;
+    // Every format that comes through this bridge can name fonts the machine does not have; the
+    // warning used to fire only for a directly-opened .svg, so an Affinity or CDR document silently
+    // reflowed in a substitute face with no explanation.
+    warnMissingFonts(imported);
+
+    // This bridge only ever called addShapes(), so every library-routed import (Affinity, CDR, Visio,
+    // PageMaker, ODF, iWork…) landed on a default A4 page no matter what the file said — an
+    // 18773x4080 banner included — while the status line still reported "N pages".
+    if(adoptPage && !pageSz.isEmpty()){
+        // Sanity-check the declared page against what actually came out. Some librevenge writers emit
+        // a viewport wildly inconsistent with their own content (a .wpg here declares 5x4 units for
+        // artwork 82x61 units across); adopting that would put the whole drawing off the page. Keep
+        // the default rather than a page the source itself contradicts.
+        QRectF b;
+        for(const Shape& s2 : imported){ const QRectF db=s2.docBounds(); b = b.isNull()? db : b.united(db); }
+        const bool sane = b.isNull()
+                       || (b.width() <= pageSz.width()*8.0 && b.height() <= pageSz.height()*8.0*qMax(1,pages.size()));
+        if(sane){
+            m_doc.pageSize  = pageSz;
+            m_doc.pageCount = qBound(1, pages.size(), 4096);
+        }
+    }
+    addShapes(imported, undoLabel);
+    zoomFit();
+    emit statusMessage(QStringLiteral("%1 — %2 objects%3 (via %4).")
+        .arg(statusVerb).arg(imported.size())
+        .arg(pages.size()>1?QStringLiteral(", %1 pages").arg(pages.size()):QString()).arg(viaLib));
+    return true;
+}
+
+// WordPerfect Graphics / Visio / FreeHand / Publisher — editable vectors via their DLP libraries
+// (libwpg/libvisio/libfreehand/libmspub) → librevenge SVG → our SVG importer. Like libcdr these parsers
+// are single-threaded and block the GUI, so we show a wait cursor + status and paint them before the
+// blocking parse. Each is a no-op (reports unsupported) when its -dev package wasn't present at build.
+bool Canvas::importWpg(const QString& path){
+    if(!xara::wpgVectorAvailable()){ emit statusMessage("WordPerfect Graphics import needs libwpg (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing WordPerfect Graphics… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);   // paint the cursor + message before the blocking parse
+    if(importVectorSvgPages(xara::wpgToSvgPages(data), QStringLiteral("Import WPG"),
+                            QStringLiteral("Imported WordPerfect Graphics"), QStringLiteral("libwpg"))) return true;
+    emit statusMessage("No importable vector content found in the WPG file."); return false;
+}
+bool Canvas::importVisio(const QString& path){
+    if(!xara::visioVectorAvailable()){ emit statusMessage("Visio import needs libvisio (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing Visio drawing… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::visioToSvgPages(data), QStringLiteral("Import Visio"),
+                            QStringLiteral("Imported Visio drawing"), QStringLiteral("libvisio"))) return true;
+    emit statusMessage("No importable vector content found in the Visio file."); return false;
+}
+bool Canvas::importFreehand(const QString& path){
+    if(!xara::freehandVectorAvailable()){ emit statusMessage("FreeHand import needs libfreehand (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing FreeHand drawing… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::freehandToSvgPages(data), QStringLiteral("Import FreeHand"),
+                            QStringLiteral("Imported FreeHand drawing"), QStringLiteral("libfreehand"))) return true;
+    emit statusMessage("No importable vector content found in the FreeHand file."); return false;
+}
+bool Canvas::importMsPub(const QString& path){
+    if(!xara::mspubVectorAvailable()){ emit statusMessage("Publisher import needs libmspub (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing Publisher document… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::mspubToSvgPages(data), QStringLiteral("Import Publisher"),
+                            QStringLiteral("Imported Publisher document"), QStringLiteral("libmspub"))) return true;
+    emit statusMessage("No importable vector content found in the Publisher file."); return false;
+}
+// More DLP-library vector importers — all share the wait-cursor pattern (librevenge parsers block the GUI)
+// and are no-ops (report unsupported) when their -dev package wasn't present at build.
+bool Canvas::importPageMaker(const QString& path){
+    if(!xara::pagemakerVectorAvailable()){ emit statusMessage("PageMaker import needs libpagemaker (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing PageMaker document… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::pagemakerToSvgPages(data), QStringLiteral("Import PageMaker"),
+                            QStringLiteral("Imported PageMaker document"), QStringLiteral("libpagemaker"))) return true;
+    emit statusMessage("No importable vector content found in the PageMaker file."); return false;
+}
+bool Canvas::importZmf(const QString& path){
+    if(!xara::zmfVectorAvailable()){ emit statusMessage("Zoner Draw import needs libzmf (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing Zoner Draw drawing… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::zmfToSvgPages(data), QStringLiteral("Import Zoner Draw"),
+                            QStringLiteral("Imported Zoner Draw drawing"), QStringLiteral("libzmf"))) return true;
+    emit statusMessage("No importable vector content found in the Zoner Draw file."); return false;
+}
+bool Canvas::importQxp(const QString& path){
+    if(!xara::qxpVectorAvailable()){ emit statusMessage("QuarkXPress import needs libqxp (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing QuarkXPress document… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::qxpToSvgPages(data), QStringLiteral("Import QuarkXPress"),
+                            QStringLiteral("Imported QuarkXPress document"), QStringLiteral("libqxp"))) return true;
+    emit statusMessage("No importable vector content found in the QuarkXPress file."); return false;
+}
+bool Canvas::importStarOffice(const QString& path){
+    if(!xara::starofficeVectorAvailable()){ emit statusMessage("StarOffice import needs libstaroffice (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing StarOffice drawing… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::starofficeToSvgPages(data), QStringLiteral("Import StarOffice"),
+                            QStringLiteral("Imported StarOffice drawing"), QStringLiteral("libstaroffice"))) return true;
+    emit statusMessage("No importable vector content found in the StarOffice file."); return false;
+}
+bool Canvas::importIWork(const QString& path){
+    if(!xara::iworkVectorAvailable()){ emit statusMessage("iWork import needs libetonyek (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const int kind = xara::iworkDocumentKind(data);      // 1=Keynote, 2=Pages, 3=Numbers
+    const QString name=QFileInfo(path).fileName();
+    emit statusMessage(QStringLiteral("Importing %1… %2")
+        .arg(kind==2?"Pages document": kind==3?"Numbers spreadsheet":"Keynote presentation", name));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(kind==2 || kind==3){                              // word-processor / spreadsheet → an editable text frame
+        QString label; const QString text=xara::iworkToText(data,&label).trimmed();
+        if(text.isEmpty()){ emit statusMessage(QStringLiteral("No readable text found in the %1 file.").arg(label.isEmpty()?"iWork":label)); return false; }
+        Shape s; s.type=ShapeType::Text; s.text=text; s.textFrame=true; s.name=name;
+        s.fill.type=FillType::Solid; s.fill.color=Qt::black; s.stroke.enabled=false;
+        const double w=qMin(m_doc.pageSize.width()*0.8, 520.0);
+        s.rect=QRectF(0,0,w,qMax(80.0,m_doc.pageSize.height()*0.8));
+        s.transform=QTransform::fromTranslate(m_doc.pageSize.width()*0.1, m_doc.pageSize.height()*0.08);
+        addShapes({s}, QStringLiteral("Import %1").arg(label.isEmpty()?"iWork":label));
+        emit statusMessage(QStringLiteral("Imported %1 text.").arg(label.isEmpty()?"iWork":label));
+        return true;
+    }
+    if(importVectorSvgPages(xara::iworkToSvgPages(data), QStringLiteral("Import Keynote"),
+                            QStringLiteral("Imported Keynote presentation"), QStringLiteral("libetonyek"))) return true;
+    emit statusMessage("No importable content found in the iWork file."); return false;
+}
+bool Canvas::importMwaw(const QString& path){
+    if(!xara::mwawVectorAvailable()){ emit statusMessage("Legacy Mac import needs libmwaw (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing legacy Mac drawing… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::mwawToSvgPages(data), QStringLiteral("Import Mac Drawing"),
+                            QStringLiteral("Imported legacy Mac drawing"), QStringLiteral("libmwaw"))) return true;
+    emit statusMessage("No importable vector content found in the file."); return false;
+}
+// GDAL/OGR geospatial vector — GDAL opens the FILE itself (many GIS formats are multi-file), so this takes
+// a path, not bytes. Can be slow on large datasets → wait cursor. No-op without libgdal.
+bool Canvas::importOgr(const QString& path){
+    if(!xara::ogrAvailable()){ emit statusMessage("GIS vector import needs GDAL (not built in)."); return false; }
+    emit statusMessage(QStringLiteral("Importing GIS vector… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    const QString svg=xara::ogrToSvg(path);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import GIS Vector"),
+                            QStringLiteral("Imported GIS vector data"), QStringLiteral("GDAL"))) return true;
+    emit statusMessage("No importable vector features found in the file."); return false;
+}
+// Graphviz DOT — libgvc runs the `dot` layout engine then renders SVG. No-op without libgvc.
+bool Canvas::importDot(const QString& path){
+    if(!xara::dotAvailable()){ emit statusMessage("DOT import needs Graphviz (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::dotToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import DOT graph"),
+                            QStringLiteral("Imported Graphviz graph"), QStringLiteral("graphviz"))) return true;
+    emit statusMessage("Could not lay out the DOT graph."); return false;
+}
+bool Canvas::importWmfFile(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    // Preferred: libwmf plays the metafile through its SVG device → our SVG importer (best fidelity).
+    if(xara::wmfAvailable()){
+        const QByteArray svg=xara::wmfToSvg(data);
+        if(!svg.isEmpty() && importVectorSvgPages(QStringList{QString::fromUtf8(svg)}, QStringLiteral("Import WMF"),
+                                QStringLiteral("Imported Windows Metafile"), QStringLiteral("libwmf"))) return true;
+    }
+    // Fallback: XarQ's own native WMF parser (prepress.cpp).
+    const Document d=xara::importWmf(data);
+    if(!d.shapes.isEmpty()){ addShapes(d.shapes, QStringLiteral("Import WMF")); zoomFit();
+        emit statusMessage(QStringLiteral("Imported Windows Metafile — %1 objects (native).").arg(d.shapes.size())); return true; }
+    emit statusMessage("No importable vector content found in the WMF file."); return false;
+}
+// Native single-file vector importers (vecextra.cpp): each parses the file into an SVG document string,
+// then reuses importVectorSvgPages → parseSvg → editable Shapes. All bounds-hardened, no external process.
+bool Canvas::importShapefile(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::shapefileToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Shapefile"),
+                            QStringLiteral("Imported ESRI Shapefile"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable geometry found in the Shapefile."); return false;
+}
+bool Canvas::importGpx(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::gpxToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import GPX"),
+                            QStringLiteral("Imported GPX track"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable tracks/routes/waypoints found in the GPX file."); return false;
+}
+bool Canvas::importXfig(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::xfigToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Xfig"),
+                            QStringLiteral("Imported Xfig drawing"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable content found in the Xfig file."); return false;
+}
+bool Canvas::importCgm(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::cgmToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import CGM"),
+                            QStringLiteral("Imported CGM metafile"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable primitives found in the CGM file."); return false;
+}
+bool Canvas::importSvgz(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::svgzToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import SVGZ"),
+                            QStringLiteral("Imported compressed SVG"), QStringLiteral("native"))) return true;
+    // Some writers (ImageMagick among them) store a plain raster under the .svgz name. If the
+    // decompressed payload is not SVG but is an image we can read, place it rather than failing.
+    { const QByteArray inner = xara::gunzipBytes(data);
+      QImage ras; if(!inner.isEmpty()) ras.loadFromData(inner);
+      if(!ras.isNull()){
+          placeZipComposite(ras, QFileInfo(path).fileName(), QStringLiteral("Import SVGZ image"));
+          emit statusMessage("Imported the raster image stored inside the .svgz.");
+          return true; } }
+    emit statusMessage("Could not decompress the SVGZ file."); return false;
+}
+// Corel Presentation Exchange (.cmx): editable vectors via libcdr's CMXDocument → SVG → our importer.
+// Like .cdr, libcdr is single-threaded and blocks the GUI, so paint a wait cursor first. No-op without libcdr.
+bool Canvas::importCmx(const QString& path){
+    if(!xara::cdrVectorAvailable()){ emit statusMessage("CMX import needs libcdr (not built in)."); return false; }
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    emit statusMessage(QStringLiteral("Importing Corel CMX… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    if(importVectorSvgPages(xara::cmxToSvgPages(data), QStringLiteral("Import CMX"),
+                            QStringLiteral("Imported Corel Presentation Exchange"), QStringLiteral("libcdr"))) return true;
+    emit statusMessage("No importable vector content found in the CMX file."); return false;
+}
+bool Canvas::importGerber(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::gerberToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Gerber"),
+                            QStringLiteral("Imported Gerber PCB layer"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable image found in the Gerber file."); return false;
+}
+bool Canvas::importExcellon(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::excellonToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Excellon"),
+                            QStringLiteral("Imported Excellon drill file"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable holes found in the Excellon file."); return false;
+}
+bool Canvas::importLottie(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::lottieToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Lottie"),
+                            QStringLiteral("Imported Lottie animation (static)"), QStringLiteral("native"))) return true;
+    return false;   // quiet: .json fall-through handles the not-Lottie case
+}
+bool Canvas::importSketch(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::sketchToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Sketch"),
+                            QStringLiteral("Imported Sketch document"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable content found in the Sketch file."); return false;
+}
+bool Canvas::importTgs(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::tgsToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Sticker"),
+                            QStringLiteral("Imported Telegram sticker (static)"), QStringLiteral("native"))) return true;
+    return false;   // quiet: not our format
+}
+bool Canvas::importTopoJson(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::topojsonToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import TopoJSON"),
+                            QStringLiteral("Imported TopoJSON map"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable geometry found in the TopoJSON file."); return false;
+}
+bool Canvas::importVml(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::vmlToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import VML"),
+                            QStringLiteral("Imported VML drawing"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable content found in the VML file."); return false;
+}
+bool Canvas::importXps(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::xpsToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import XPS"),
+                            QStringLiteral("Imported XPS page"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable content found in the XPS file."); return false;
+}
+bool Canvas::importScribus(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::scribusToSvg(data);
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import Scribus"),
+                            QStringLiteral("Imported Scribus document"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable content found in the Scribus file."); return false;
+}
+// Serif Affinity (.afdesign/.afphoto/.afpub/.aftemplate/.af) — the REAL artwork: the container's
+// doc.dat object tree becomes one SVG per spread (paths, live shapes, fills, gradients, strokes,
+// groups, text, placed images) and goes through the normal SVG importer. Pixel layers come across
+// too: their 256x256 channel planes are reassembled from the d/* tile streams and embedded as PNGs.
+// Anything still undecoded (layer masks on a raster, adjustment layers) is counted and reported
+// rather than dropped in silence, and any document we cannot parse at all (including v11 files on a
+// build without zstd) falls back to the page preview the file carries, exactly like importCdr does.
+bool Canvas::importAffinity(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    if(!xara::affinityIsContainer(data)){ emit statusMessage("Not an Affinity document."); return false; }
+    emit statusMessage(QStringLiteral("Importing Affinity document… %1").arg(QFileInfo(path).fileName()));
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    struct CursorGuard{ ~CursorGuard(){ QGuiApplication::restoreOverrideCursor(); } } _cg;
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+    xara::AffinityStats st;
+    const QStringList pages=xara::affinityToSvgPages(data,&st);
+    const bool freshDoc=m_doc.shapes.isEmpty();
+    if(!pages.isEmpty() && importVectorSvgPages(pages, QStringLiteral("Import Affinity"),
+                            QStringLiteral("Imported Affinity document"), QStringLiteral("native"))){
+        // A fresh document takes the file's guides, margins (as guides, per page) and bleed.
+        if(freshDoc){
+            for(int i=0;i<st.pageInfo.size();++i){
+                const xara::AffinityPageInfo& pi=st.pageInfo[i];
+                const QRectF pr=m_doc.pageRect(i);
+                auto addH=[&](double y){ if(!m_guideHpos.contains(y)) m_guideHpos.push_back(y); };
+                auto addV=[&](double x){ if(!m_guideVpos.contains(x)) m_guideVpos.push_back(x); };
+                for(double y: pi.guidesH) addH(pr.top()+y);
+                for(double x: pi.guidesV) addV(pr.left()+x);
+                if(pi.marginL>0||pi.marginT>0||pi.marginR>0||pi.marginB>0){
+                    addV(pr.left()+pi.marginL); addV(pr.left()+pi.width-pi.marginR);
+                    addH(pr.top()+pi.marginT); addH(pr.top()+pi.height-pi.marginB);
+                }
+            }
+            m_doc.bleed=st.bleed;
+            update();
+        }
+        // Report what actually happened. The stats have always recorded skipped SHAPES (live-shape
+        // kinds we draw as their bounding box, layers whose clip we could not express) as well as
+        // skipped rasters, but only the raster count was ever shown — so the commonest silent loss
+        // was also the one the user was never told about.
+        QStringList detail;
+        if(st.rasters>0)       detail << QStringLiteral("%1 pixel layer%2").arg(st.rasters).arg(st.rasters==1?"":"s");
+        if(st.masks>0)         detail << QStringLiteral("%1 mask%2").arg(st.masks).arg(st.masks==1?"":"s");
+        if(st.skippedRaster>0) detail << QStringLiteral("%1 raster layer%2 not decoded").arg(st.skippedRaster).arg(st.skippedRaster==1?"":"s");
+        if(st.skippedShape>0)  detail << QStringLiteral("%1 object%2 approximated").arg(st.skippedShape).arg(st.skippedShape==1?"":"s");
+        if(st.ignoredAdjustments>0) detail << QStringLiteral("%1 adjustment%2 not applied").arg(st.ignoredAdjustments).arg(st.ignoredAdjustments==1?"":"s");
+        if(st.ignoredFilters>0) detail << QStringLiteral("%1 live filter%2 not applied").arg(st.ignoredFilters).arg(st.ignoredFilters==1?"":"s");
+        if(st.extraMasks>0)    detail << QStringLiteral("%1 extra mask%2 not applied").arg(st.extraMasks).arg(st.extraMasks==1?"":"s");
+        if(!st.exactParse)     detail << QStringLiteral("document structure only partly readable");
+        if(!detail.isEmpty())
+            emit statusMessage(QStringLiteral("Imported Affinity document — %1 objects, %2 pages (%3).")
+                .arg(st.shapes).arg(st.pages).arg(detail.join(QStringLiteral(", "))));
+        return true;
+    }
+    // Fallback: the document's own 512px preview, located exactly from the header (never by scanning
+    // for a PNG signature — placed images are stored verbatim and would be found instead).
+    QImage prev; prev.loadFromData(xara::affinityPreviewPng(data), "PNG");
+    if(prev.isNull()){
+        emit statusMessage(xara::affinityZstdAvailable()
+            ? QStringLiteral("Could not read this Affinity document (no artwork and no embedded preview).")
+            : QStringLiteral("Could not read this Affinity document — Affinity 2.x files need zstd, which this build lacks."));
+        return false;
+    }
+    const double W=prev.width(), H=prev.height();
+    if(!(W>0)||!(H>0)) return false;
+    const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/W, m_doc.pageSize.height()*0.9/H));
+    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=QFileInfo(path).fileName()+" (preview)";
+    s.fill.type=FillType::Bitmap; s.fill.image=prev; s.fill.origImage=prev; s.fill.tiled=false;
+    s.fill.p0=QPointF(0,H); s.fill.p1=QPointF(W,H); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
+    s.transform=QTransform::fromScale(sc,sc)*QTransform::fromTranslate((m_doc.pageSize.width()-W*sc)/2,(m_doc.pageSize.height()-H*sc)/2);
+    addShapes({s},"Import Affinity preview");
+    emit statusMessage("Imported the Affinity page preview (the artwork could not be parsed).");
     return true;
 }
 // Data/mail merge: the current page is a TEMPLATE containing {{Field}} placeholders; a CSV whose first
@@ -1375,4 +1993,647 @@ bool Canvas::exportEps(const QString& path) {
     ps += "showpage\n%%EOF\n";
     QFile f(path); if(!f.open(QIODevice::WriteOnly|QIODevice::Text)) return false;
     return f.write(ps.toLatin1()) > 0;
+}
+
+// ---- Batch 3 importers: comic archives + geometry (GeoJSON / KML / HP-GL) → editable vectors ----
+
+// Map a source-space bounding box into a page rect (centred, aspect-preserving, optional Y-flip for
+// data whose Y grows upward — geographic lat / plotter units).
+static QTransform xqFitTransform(const QRectF& b, QSizeF page, double margin, bool flipY){
+    if(b.isEmpty() || b.width()<=0 || b.height()<=0) return QTransform();
+    const double availW=page.width()-2*margin, availH=page.height()-2*margin;
+    double sc=qMin(availW/b.width(), availH/b.height());
+    if(!std::isfinite(sc) || sc<=0) sc=1;
+    const double offx=(availW-b.width()*sc)/2, offy=(availH-b.height()*sc)/2;
+    QTransform t;
+    t.translate(margin+offx, margin+offy);
+    t.scale(sc,sc);
+    if(flipY){ t.translate(0,b.height()); t.scale(1,-1); }
+    t.translate(-b.left(),-b.top());
+    return t;
+}
+
+// Shared comic-archive page builder: image entries in filename order → one full-page Bitmap per image.
+bool Canvas::importComicEntries(const QMap<QString,QByteArray>& entries, const QString& srcName){
+    QStringList names;
+    for(auto it=entries.begin(); it!=entries.end(); ++it){ const QString l=it.key().toLower();
+        if(l.endsWith(".jpg")||l.endsWith(".jpeg")||l.endsWith(".png")||l.endsWith(".gif")
+         ||l.endsWith(".webp")||l.endsWith(".bmp")||l.endsWith(".tif")||l.endsWith(".tiff"))
+            names<<it.key(); }
+    names.sort(Qt::CaseInsensitive);
+    if(names.isEmpty()) return false;
+    Document d; QVector<Shape> shapes; int page=0; double advH=0;
+    for(const QString& n: names){ if(page>=1000) break;
+        QImage img=QImage::fromData(entries.value(n)); if(img.isNull()) continue;
+        if(page==0){ d.pageSize=QSizeF(img.width(),img.height()); advH=d.pageSize.height()+d.pageGap; }
+        const double W=img.width(), H=img.height();
+        const double sc=qMin(1.0, qMin(d.pageSize.width()/W, d.pageSize.height()/H));   // fit within the page
+        Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=QFileInfo(n).fileName();
+        s.fill.type=FillType::Bitmap; s.fill.image=img; s.fill.origImage=img; s.fill.tiled=false;
+        s.fill.p0=QPointF(0,H); s.fill.p1=QPointF(W,H); s.fill.p2=QPointF(0,0);
+        s.stroke.enabled=false;
+        s.transform = QTransform::fromScale(sc,sc)
+                    * QTransform::fromTranslate((d.pageSize.width()-W*sc)/2, page*advH + (d.pageSize.height()-H*sc)/2);
+        shapes<<s; ++page;
+    }
+    if(shapes.isEmpty()) return false;
+    d.pageCount=page; d.shapes=shapes;
+    setDocument(d); zoomFit();
+    emit statusMessage(QString("Imported %1: %2 page(s).").arg(srcName).arg(page));
+    return true;
+}
+
+bool Canvas::importCbz(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    if(zip.isEmpty()) return false;
+    return importComicEntries(zip, "comic");
+}
+
+// Extract every entry of a RAR/7z/tar/zip archive via dlopen'd libarchive (reads what its filters
+// support; absent lib → empty). First-party policy: link a library, never shell out to unrar.
+static QMap<QString,QByteArray> xqLibarchiveExtract(const QByteArray& data){
+    QMap<QString,QByteArray> out;
+    struct LA { void* lib=nullptr; bool ok=false;
+        void* (*read_new)()=nullptr;
+        int (*sup_filter)(void*)=nullptr; int (*sup_format)(void*)=nullptr;
+        int (*open_mem)(void*,const void*,size_t)=nullptr;
+        int (*next_header)(void*,void**)=nullptr;
+        const char* (*entry_path)(void*)=nullptr; long long (*entry_size)(void*)=nullptr;
+        long (*read_data)(void*,void*,size_t)=nullptr; int (*read_free)(void*)=nullptr;
+        LA(){ lib=dlopen("libarchive.so.13",RTLD_NOW|RTLD_LOCAL); if(!lib) lib=dlopen("libarchive.so",RTLD_NOW|RTLD_LOCAL); if(!lib) return;
+            read_new    =(void*(*)())               dlsym(lib,"archive_read_new");
+            sup_filter  =(int(*)(void*))             dlsym(lib,"archive_read_support_filter_all");
+            sup_format  =(int(*)(void*))             dlsym(lib,"archive_read_support_format_all");
+            open_mem    =(int(*)(void*,const void*,size_t))dlsym(lib,"archive_read_open_memory");
+            next_header =(int(*)(void*,void**))      dlsym(lib,"archive_read_next_header");
+            entry_path  =(const char*(*)(void*))     dlsym(lib,"archive_entry_pathname");
+            entry_size  =(long long(*)(void*))       dlsym(lib,"archive_entry_size");
+            read_data   =(long(*)(void*,void*,size_t))dlsym(lib,"archive_read_data");
+            read_free   =(int(*)(void*))             dlsym(lib,"archive_read_free");
+            ok=read_new&&sup_filter&&sup_format&&open_mem&&next_header&&entry_path&&entry_size&&read_data&&read_free; } };
+    static LA la; if(!la.ok) return out;
+    void* a=la.read_new(); if(!a) return out;
+    la.sup_filter(a); la.sup_format(a);
+    if(la.open_mem(a, data.constData(), size_t(data.size()))==0){   // ARCHIVE_OK == 0
+        void* entry=nullptr; int guard=0;
+        while(la.next_header(a,&entry)==0 && guard++<20000){
+            const char* nm=la.entry_path(entry); if(!nm) continue;
+            long long sz=la.entry_size(entry); if(sz<=0 || sz>256LL*1024*1024) continue;
+            QByteArray buf; buf.resize(int(sz)); long long got=0;
+            while(got<sz){ long r=la.read_data(a, buf.data()+got, size_t(sz-got)); if(r<=0) break; got+=r; }
+            if(got==sz) out.insert(QString::fromUtf8(nm), buf);
+        }
+    }
+    la.read_free(a);
+    return out;
+}
+
+bool Canvas::importCbr(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    QMap<QString,QByteArray> entries=xqLibarchiveExtract(data);
+    if(entries.isEmpty()){ const QMap<QString,QByteArray> zip=readZipEntries(data); if(!zip.isEmpty()) entries=zip; }  // fallback: zip-based .cbr
+    if(entries.isEmpty()) return false;
+    return importComicEntries(entries, "comic");
+}
+
+// ---- Animated PNG (APNG): rebuild each frame as a standalone PNG (Qt decodes it), composite per fcTL ----
+bool Canvas::importApng(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    const uchar SIG[8]={0x89,'P','N','G',0x0D,0x0A,0x1A,0x0A};
+    if(data.size()<8 || memcmp(data.constData(),SIG,8)!=0) return false;
+    const uchar* p=reinterpret_cast<const uchar*>(data.constData()); const qint64 n=data.size();
+    auto be32=[&](qint64 o)->quint32{ return (quint32(p[o])<<24)|(quint32(p[o+1])<<16)|(quint32(p[o+2])<<8)|p[o+3]; };
+    QByteArray ihdr, plte, trns; quint32 fullW=0, fullH=0; bool sawActl=false;
+    struct AFrame { quint32 w=0,h=0,x=0,y=0; int delayMs=100, dispose=0, blend=0; QByteArray dat; };
+    QVector<AFrame> frames;
+    qint64 o=8;
+    while(o+12<=n){
+        const quint32 len=be32(o); const char* type=reinterpret_cast<const char*>(p+o+4); const qint64 dOff=o+8;
+        if(dOff+qint64(len)+4>n) break;
+        const uchar* d=p+dOff;
+        if(!memcmp(type,"IHDR",4)){ ihdr=QByteArray(reinterpret_cast<const char*>(d), qMin<quint32>(len,13));
+            if(len>=8){ fullW=be32(dOff); fullH=be32(dOff+4); } }
+        else if(!memcmp(type,"PLTE",4)) plte=QByteArray(reinterpret_cast<const char*>(d),len);
+        else if(!memcmp(type,"tRNS",4)) trns=QByteArray(reinterpret_cast<const char*>(d),len);
+        else if(!memcmp(type,"acTL",4)) sawActl=true;
+        else if(!memcmp(type,"fcTL",4)){ if(len>=26){ AFrame fr; fr.w=be32(dOff+4); fr.h=be32(dOff+8); fr.x=be32(dOff+12); fr.y=be32(dOff+16);
+            const int dn=(d[20]<<8)|d[21], dd=(d[22]<<8)|d[23]; fr.delayMs = dd? qMax(10, dn*1000/dd) : (dn>0?dn:100); if(fr.delayMs<=0) fr.delayMs=100;
+            fr.dispose=d[24]; fr.blend=d[25]; if(frames.size()<512) frames.push_back(fr); } }   // cap frame count (crafted-file OOM guard)
+        else if(!memcmp(type,"IDAT",4)){ if(!frames.isEmpty()) frames.last().dat.append(reinterpret_cast<const char*>(d),len); }
+        else if(!memcmp(type,"fdAT",4)){ if(len>=4 && !frames.isEmpty()) frames.last().dat.append(reinterpret_cast<const char*>(d+4),len-4); }
+        else if(!memcmp(type,"IEND",4)) break;
+        o = dOff + len + 4;
+    }
+    if(!sawActl || frames.size()<2 || ihdr.size()<13 || fullW==0 || fullH==0 || (qint64)fullW*fullH>256LL*1024*1024)
+        return false;                                  // not an animation → single still
+    // Standalone-PNG-per-frame builder (Qt does the actual inflate + unfilter).
+    auto chunk=[](QByteArray& out,const char* type,const QByteArray& d){
+        const quint32 len=d.size(); out.append(char(len>>24));out.append(char(len>>16));out.append(char(len>>8));out.append(char(len));
+        QByteArray td; td.append(type,4); td.append(d); out.append(td);
+        const quint32 c=(quint32)crc32(crc32(0,nullptr,0),reinterpret_cast<const Bytef*>(td.constData()),td.size());
+        out.append(char(c>>24));out.append(char(c>>16));out.append(char(c>>8));out.append(char(c)); };
+    auto decodeFrame=[&](const AFrame& fr)->QImage{
+        QByteArray png; png.append(reinterpret_cast<const char*>(SIG),8);
+        QByteArray ih=ihdr; ih[0]=char(fr.w>>24);ih[1]=char(fr.w>>16);ih[2]=char(fr.w>>8);ih[3]=char(fr.w);
+                            ih[4]=char(fr.h>>24);ih[5]=char(fr.h>>16);ih[6]=char(fr.h>>8);ih[7]=char(fr.h);
+        chunk(png,"IHDR",ih);
+        if(!plte.isEmpty()) chunk(png,"PLTE",plte);
+        if(!trns.isEmpty()) chunk(png,"tRNS",trns);
+        chunk(png,"IDAT",fr.dat); chunk(png,"IEND",QByteArray());
+        return QImage::fromData(png,"PNG"); };
+    QImage canvas(int(fullW),int(fullH),QImage::Format_ARGB32_Premultiplied); if(canvas.isNull()) return false;
+    canvas.fill(Qt::transparent);
+    QVector<QImage> outFrames; QVector<int> delays;
+    const qint64 APNG_PIXEL_BUDGET=256LL*1024*1024; qint64 accPix=0;    // each held frame is a full-canvas copy → bound the total
+    for(const AFrame& fr: frames){
+        if(accPix + (qint64)fullW*fullH > APNG_PIXEL_BUDGET) break;     // stop before another full-canvas copy blows the budget
+        accPix += (qint64)fullW*fullH;
+        QImage sub=decodeFrame(fr); if(sub.isNull()) continue;
+        sub=sub.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        const QImage prev = (fr.dispose==2)? canvas.copy() : QImage();
+        { QPainter g(&canvas);
+          g.setCompositionMode(fr.blend==0? QPainter::CompositionMode_Source : QPainter::CompositionMode_SourceOver);
+          g.drawImage(QPointF(fr.x,fr.y), sub); }
+        outFrames.push_back(canvas.convertToFormat(QImage::Format_ARGB32));
+        delays.push_back(fr.delayMs);
+        if(fr.dispose==1){ QPainter g(&canvas); g.setCompositionMode(QPainter::CompositionMode_Clear);
+                           g.fillRect(QRectF(fr.x,fr.y,fr.w,fr.h),Qt::transparent); }
+        else if(fr.dispose==2 && !prev.isNull()) canvas=prev;
+    }
+    if(outFrames.size()<2) return false;
+    pushUndo("Import APNG");
+    const double W=outFrames[0].width(), H=outFrames[0].height();
+    const double maxW=m_doc.pageSize.width()*0.9, maxH=m_doc.pageSize.height()*0.9;
+    const double sc=qMin(1.0, qMin(maxW/W, maxH/H));
+    const QTransform place=QTransform::fromScale(sc,sc)*QTransform::fromTranslate((m_doc.pageSize.width()-W*sc)/2,(m_doc.pageSize.height()-H*sc)/2);
+    m_doc.layers.clear(); m_doc.shapes.clear();
+    const QString base=QFileInfo(path).completeBaseName();
+    for(int i=0;i<outFrames.size();++i){
+        Layer L; L.name=QString("%1 %2").arg(base).arg(i+1); L.visible=(i==0); L.frameDelayMs=delays.value(i,100); m_doc.layers.push_back(L);
+        Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=L.name; s.layer=i;
+        s.fill.type=FillType::Bitmap; s.fill.image=outFrames[i]; s.fill.origImage=outFrames[i]; s.fill.tiled=false;
+        s.fill.p0=QPointF(0,H); s.fill.p1=QPointF(W,H); s.fill.p2=QPointF(0,0);
+        s.stroke.enabled=false; s.transform=place; m_doc.shapes.push_back(s);
+    }
+    m_sel.clear(); emit documentChanged(); emit selectionChanged(); update();
+    emit statusMessage(QString("Imported APNG: %1 frame(s).").arg(outFrames.size()));
+    return true;
+}
+
+// ---- OpenDocument (.odg/.odp/.odt/.ods + flat .fodg/… + OpenOffice.org 1.x .sxd/.sxw): unzip →
+//      content.xml → draw: primitive shapes, with a text fallback for text-centric documents ----
+static double xqOdfLen(const QString& s){                            // "5cm","2.5mm","10pt","3in","100px", bare
+    QString t=s.trimmed(); if(t.isEmpty()) return 0; int i=0;
+    while(i<t.size() && (t[i].isDigit()||t[i]=='.'||t[i]=='-'||t[i]=='+'||t[i]=='e'||t[i]=='E')) ++i;
+    const double num=t.left(i).toDouble(); const QString u=t.mid(i).trimmed().toLower(); const double dpi=96.0;
+    if(u=="cm") return num*dpi/2.54;   if(u=="mm") return num*dpi/25.4;  if(u=="in") return num*dpi;
+    if(u=="pt") return num*dpi/72.0;   if(u=="pc") return num*dpi/6.0;   return num; }
+
+// Parse an ODF draw:transform list (ODF 1.2 §19.228) into a QTransform. Three divergences from SVG,
+// each pinned against LibreOffice: (1) the list applies LEFT-TO-RIGHT (first listed applies first),
+// the opposite of SVG; (2) translate/matrix e,f carry real UNITS ("5cm"), not user units; (3) rotate
+// and the skews are in RADIANS and turn counter-clockwise on a y-down page, so the angle is negated
+// for Qt (whose positive rotation is clockwise on screen).
+static QTransform xqOdfTransform(const QString& str){
+    QTransform t; if(str.trimmed().isEmpty()) return t;
+    static const QRegularExpression re("([A-Za-z]+)\\s*\\(([^)]*)\\)");
+    auto it=re.globalMatch(str);
+    while(it.hasNext()){
+        const auto m=it.next(); const QString fn=m.captured(1);
+        const QStringList a=m.captured(2).split(QRegularExpression("[\\s,]+"),Qt::SkipEmptyParts);
+        auto L=[&](int i){ return i<a.size()? xqOdfLen(a[i]) : 0.0; };            // ODF length (unit-aware)
+        auto N=[&](int i,double d){ return i<a.size()? a[i].toDouble() : d; };    // bare number / radians
+        QTransform u;
+        if      (fn=="translate") u.translate(L(0), L(1));
+        else if (fn=="scale")   { const double sx=N(0,1.0); u.scale(sx, a.size()>1? N(1,sx) : sx); }
+        else if (fn=="rotate")    u.rotateRadians(-N(0,0.0));
+        else if (fn=="skewX")     u.shear(-std::tan(N(0,0.0)), 0);
+        else if (fn=="skewY")     u.shear(0, -std::tan(N(0,0.0)));
+        else if (fn=="matrix" && a.size()>=6) u=QTransform(N(0,1),N(1,0),N(2,0),N(3,1),L(4),L(5));
+        else continue;
+        t = t * u;                                   // left-to-right composition
+    }
+    if(!std::isfinite(t.m11())||!std::isfinite(t.m12())||!std::isfinite(t.m21())||
+       !std::isfinite(t.m22())||!std::isfinite(t.dx())||!std::isfinite(t.dy())) return QTransform();
+    return t;
+}
+
+// --- OpenRaster (.ora) / Krita (.kra): app-native layered raster in a ZIP container ----------------
+// Both wrap layers + a flattened "mergedimage.png" in a ZIP. OpenRaster describes its stack in a standard
+// stack.xml (layer PNGs under data/), which we reverse-engineer into one editable photo object per layer;
+// Krita's per-layer data is tiled binary, so we import its flattened composite. mergedimage is the fallback.
+static QByteArray xqZipFind(const QMap<QString,QByteArray>& zip, const QString& name){
+    for(auto it=zip.begin(); it!=zip.end(); ++it){
+        const QString k=it.key();
+        if(k.compare(name,Qt::CaseInsensitive)==0 || k.endsWith('/'+name, Qt::CaseInsensitive)) return it.value();
+    }
+    return {};
+}
+// Place a flattened bitmap as a single photo object, scaled to fit the page (the composite path).
+void Canvas::placeZipComposite(const QImage& img, const QString& name, const QString& undoLabel){
+    const double W=img.width(), H=img.height();
+    const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/qMax(1.0,W), m_doc.pageSize.height()*0.9/qMax(1.0,H)));
+    Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,W,H); s.name=name;
+    s.fill.type=FillType::Bitmap; s.fill.image=img; s.fill.origImage=img; s.fill.tiled=false;
+    s.fill.p0=QPointF(0,H); s.fill.p1=QPointF(W,H); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
+    s.transform=QTransform::fromScale(sc,sc)*QTransform::fromTranslate((m_doc.pageSize.width()-W*sc)/2,(m_doc.pageSize.height()-H*sc)/2);
+    addShapes({s}, undoLabel);
+    zoomFit();
+}
+bool Canvas::importOra(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    if(zip.isEmpty()){ emit statusMessage("Not a readable OpenRaster (.ora) archive."); return false; }
+    // Parse stack.xml → layers (listed top-first in the file). Nested groups are flattened.
+    struct OraLayer { QString src, name; double x=0, y=0, opacity=1.0; };
+    QVector<OraLayer> layers; double cw=0, ch=0;
+    { const QByteArray sx=xqZipFind(zip,"stack.xml"); QXmlStreamReader r(sx);
+      while(!r.atEnd()){ r.readNext(); if(!r.isStartElement()) continue;
+          const QXmlStreamAttributes a=r.attributes();
+          if(r.name()==QLatin1String("image")){ cw=a.value(QLatin1String("w")).toDouble(); ch=a.value(QLatin1String("h")).toDouble(); }
+          else if(r.name()==QLatin1String("layer")){
+              OraLayer l; l.src=a.value(QLatin1String("src")).toString(); l.name=a.value(QLatin1String("name")).toString();
+              l.x=a.value(QLatin1String("x")).toDouble(); l.y=a.value(QLatin1String("y")).toDouble();
+              if(a.hasAttribute("opacity")) l.opacity=a.value(QLatin1String("opacity")).toDouble();
+              if(!l.src.isEmpty() && layers.size()<4096) layers.push_back(l); } } }   // cap layer COUNT (pixel budget below caps total decode)
+    // Resolve a layer's bytes: exact src first, then basename (so "data/sub/x.png" isn't shadowed by "data/x.png").
+    auto findLayer=[&](const QString& src)->QByteArray{ QByteArray b=xqZipFind(zip,src); if(b.isEmpty()) b=xqZipFind(zip,QFileInfo(src).fileName()); return b; };
+    // PNG dimensions straight from the IHDR (ORA layers are PNG) — header-only, so the size-derivation pass
+    // can't be turned into a decode bomb.
+    auto pngSize=[](const QByteArray& b)->QSize{
+        if(b.size()<24 || quint8(b[0])!=0x89 || b[1]!='P' || b[2]!='N' || b[3]!='G') return {};
+        auto be=[&](int o){ return (quint32(quint8(b[o]))<<24)|(quint32(quint8(b[o+1]))<<16)|(quint32(quint8(b[o+2]))<<8)|quint8(b[o+3]); };
+        const quint32 w=be(16), h=be(20);
+        return (w==0||h==0||w>65535||h>65535) ? QSize() : QSize(int(w),int(h)); };
+    // Sanitise the declared canvas size — a hostile stack.xml can inject inf/NaN/≤0 (Qt's toDouble parses "inf"/"nan").
+    if(!qIsFinite(cw) || cw<=0) cw=0;
+    if(!qIsFinite(ch) || ch<=0) ch=0;
+    QVector<Shape> shapes;
+    if(!layers.isEmpty()){
+        // If the canvas size is missing, derive it from the union of ALL layer extents (header-only reads).
+        if(cw<=0 || ch<=0){ double uw=0, uh=0;
+            for(const OraLayer& l : layers){ const QSize sz=pngSize(findLayer(l.src)); if(!sz.isValid()) continue;
+                const double lx=qIsFinite(l.x)?l.x:0, ly=qIsFinite(l.y)?l.y:0;
+                uw=qMax(uw, lx+sz.width()); uh=qMax(uh, ly+sz.height()); }
+            if(cw<=0) cw=uw; if(ch<=0) ch=uh; }
+        if(!qIsFinite(cw) || cw<=0) cw=1;
+        if(!qIsFinite(ch) || ch<=0) ch=1;
+        const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/cw, m_doc.pageSize.height()*0.9/ch));
+        const double ox=(m_doc.pageSize.width()-cw*sc)/2, oy=(m_doc.pageSize.height()-ch*sc)/2;
+        const qint64 kPixBudget=256LL*1024*1024; qint64 accPix=0;   // cumulative decode budget (many-huge-layers OOM guard)
+        for(int i=layers.size()-1; i>=0; --i){ const OraLayer& l=layers[i];   // add bottom-first for correct z-order
+            QImage im; const QByteArray lb=findLayer(l.src);
+            if(lb.isEmpty() || !im.loadFromData(lb) || im.isNull()) continue;
+            accPix += (qint64)im.width()*im.height(); if(accPix > kPixBudget) break;
+            const double lw=im.width(), lh=im.height();
+            const double lx=qIsFinite(l.x)?l.x:0, ly=qIsFinite(l.y)?l.y:0;   // never let inf/NaN reach the transform
+            Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,lw,lh); s.name=l.name.isEmpty()?QStringLiteral("Layer"):l.name;
+            s.fill.type=FillType::Bitmap; s.fill.image=im; s.fill.origImage=im; s.fill.tiled=false;
+            s.fill.p0=QPointF(0,lh); s.fill.p1=QPointF(lw,lh); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
+            s.opacity=qBound(0.0, qIsFinite(l.opacity)?l.opacity:1.0, 1.0);
+            s.transform=QTransform::fromTranslate(lx,ly)*QTransform::fromScale(sc,sc)*QTransform::fromTranslate(ox,oy);
+            shapes.push_back(s); }
+    }
+    if(!shapes.isEmpty()){ addShapes(shapes,"Import OpenRaster"); zoomFit();
+        emit statusMessage(QStringLiteral("Imported OpenRaster — %1 editable layers.").arg(shapes.size())); return true; }
+    // Fallback: the flattened composite.
+    QImage merged; const QByteArray mb=xqZipFind(zip,"mergedimage.png");
+    if(!mb.isEmpty() && merged.loadFromData(mb)){
+        placeZipComposite(merged, QFileInfo(path).fileName(), QStringLiteral("Import OpenRaster"));
+        emit statusMessage(QStringLiteral("Imported OpenRaster composite %1×%2.").arg(merged.width()).arg(merged.height())); return true; }
+    emit statusMessage("No importable content found in the .ora."); return false;
+}
+bool Canvas::importKra(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    if(zip.isEmpty()){ emit statusMessage("Not a readable Krita (.kra) archive."); return false; }
+    QImage merged; QByteArray mb=xqZipFind(zip,"mergedimage.png"); if(mb.isEmpty()) mb=xqZipFind(zip,"preview.png");
+    if(mb.isEmpty() || !merged.loadFromData(mb)){ emit statusMessage("No importable image found in the .kra."); return false; }
+    placeZipComposite(merged, QFileInfo(path).fileName()+QStringLiteral(" (flattened)"), QStringLiteral("Import Krita"));
+    emit statusMessage(QStringLiteral("Imported Krita composite %1×%2 (layers flattened).").arg(merged.width()).arg(merged.height()));
+    return true;
+}
+// Flatten an ODF content.xml's BODY text (text:p / text:h paragraphs, tabs, line-breaks) into a string.
+// The `inBody` gate keeps out <office:automatic-styles>/<office:meta> text; used as the fallback for a
+// text-centric ODF (ODT / OpenOffice.org 1.x .sxw) that carries no draw: vector shapes.
+static QString xqOdfExtractText(const QByteArray& content){
+    QString text; QXmlStreamReader r(content); r.setNamespaceProcessing(false); bool inBody=false;
+    while(!r.atEnd()){ r.readNext();
+        if(r.isStartElement()){ const QString ln=r.name().toString().section(':',-1);
+            if(ln=="body") inBody=true;
+            else if(inBody){ if(ln=="tab") text+='\t'; else if(ln=="line-break") text+='\n'; } }
+        else if(r.isEndElement()){ const QString ln=r.name().toString().section(':',-1);
+            if(ln=="body") inBody=false;
+            else if(inBody && (ln=="p"||ln=="h")) text+='\n'; }
+        else if(r.isCharacters() && inBody && !r.isWhitespace()) text += r.text();
+    }
+    return text.trimmed();
+}
+bool Canvas::importOdg(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    // Packaged ODF is a ZIP holding content.xml; a "flat" ODF (.fodg/.fodt/.fodp) is a single XML file.
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    QByteArray content = zip.isEmpty()? QByteArray() : zip.value("content.xml");
+    if(content.isEmpty() && data.contains("office:document")) content=data;   // flat ODF (not zipped)
+    if(content.isEmpty()) return false;
+    QVector<Shape> shapes;                       // finished TOP-LEVEL shapes
+    // <draw:g> becomes a real XarQ Group. ODF groups are purely STRUCTURAL: the spec gives draw:g no
+    // draw:transform and children carry absolute page coordinates, so the group takes an identity
+    // transform and children keep their own — the render is unchanged, only the structure becomes
+    // selectable/enterable (mirrors the SVG importer's foldSvgGroups).
+    struct OpenG { Shape g; bool nest=true; };
+    QVector<OpenG> gopen;
+    auto emitShape=[&](const Shape& sh){ if(gopen.isEmpty()) shapes<<sh; else gopen.back().g.children.push_back(sh); };
+    // Closing MOVES the finished subtree into its parent. Copying it (the obvious version) makes a
+    // deeply nested document quadratic, since every close re-copies everything below it.
+    auto closeGroup=[&](){ if(gopen.isEmpty()) return; OpenG o=std::move(gopen.back()); gopen.pop_back();
+        if(o.g.children.isEmpty()) return;                                   // drop empty groups
+        if(o.nest){ if(gopen.isEmpty()) shapes.push_back(std::move(o.g)); else gopen.back().g.children.push_back(std::move(o.g)); }
+        else for(Shape& ch : o.g.children){ if(gopen.isEmpty()) shapes.push_back(std::move(ch)); else gopen.back().g.children.push_back(std::move(ch)); } };
+    // Resolve the graphic style each shape references (draw:style-name → <style:graphic-properties>), so
+    // imported shapes keep their REAL fill/stroke colours + widths instead of a single hardcoded default.
+    struct OdfStyle { QString parent; int fill=-1, stroke=-1; QColor fillColor, strokeColor; double strokeWidth=-1; QString fillGrad; };
+    struct OdfGrad  { QString style="linear"; QColor c1, c2; double angleDeg=0, cx=0.5, cy=0.5; };
+    QHash<QString,OdfStyle> styleMap;
+    QHash<QString,OdfGrad>  gradMap;   // <draw:gradient> colour ramps, referenced by draw:fill-gradient-name
+    auto pct=[](const QString& s, double dflt)->double{ QString t=s.trimmed(); if(t.isEmpty()) return dflt; bool p=t.endsWith('%'); double v=t.remove('%').toDouble(); return p? v/100.0 : v; };
+    auto collectStyles=[&](const QByteArray& bytes){
+        if(bytes.isEmpty()) return;
+        QXmlStreamReader r(bytes); r.setNamespaceProcessing(false); QString cur;
+        while(!r.atEnd()){ if(r.readNext()!=QXmlStreamReader::StartElement) continue;
+            const QString el=r.name().toString().section(':',-1); const QXmlStreamAttributes a=r.attributes();
+            auto A=[&](const char* q){ QString v=a.value(QLatin1String(q)).toString(); if(v.isEmpty()) v=a.value(QString::fromLatin1(q).section(':',-1)).toString(); return v; };
+            if(el=="style"){ cur=A("style:name"); if(!cur.isEmpty()) styleMap[cur].parent=A("style:parent-style-name"); }
+            else if((el=="graphic-properties"||el=="drawing-page-properties") && !cur.isEmpty()){
+                OdfStyle& s=styleMap[cur];
+                const QString fill=A("draw:fill");         if(!fill.isEmpty()) s.fill=(fill=="none")?0:(fill=="gradient")?2:1;
+                const QString fc=A("draw:fill-color");     if(!fc.isEmpty())   s.fillColor=QColor(fc.trimmed());
+                const QString fg=A("draw:fill-gradient-name"); if(!fg.isEmpty()) s.fillGrad=fg;
+                const QString st=A("draw:stroke");         if(!st.isEmpty())   s.stroke=(st=="none")?0:1;
+                const QString sc=A("svg:stroke-color");    if(!sc.isEmpty())   s.strokeColor=QColor(sc.trimmed());
+                const QString sw=A("svg:stroke-width");    if(!sw.isEmpty())   s.strokeWidth=xqOdfLen(sw);
+            }
+            else if(el=="gradient"){                       // <draw:gradient draw:name=… start/end-color, style, angle>
+                const QString nm=A("draw:name"); if(nm.isEmpty()) continue;
+                OdfGrad g; const QString stl=A("draw:style"); if(!stl.isEmpty()) g.style=stl;
+                g.c1=QColor(A("draw:start-color").trimmed()); g.c2=QColor(A("draw:end-color").trimmed());
+                const QString ang=A("draw:angle").trimmed();
+                if(!ang.isEmpty()){ if(ang.endsWith("deg")) g.angleDeg=ang.chopped(3).toDouble(); else g.angleDeg=ang.toDouble()/10.0; }  // legacy draw:angle = 1/10 degree
+                g.cx=pct(A("draw:cx"),0.5); g.cy=pct(A("draw:cy"),0.5);
+                gradMap[nm]=g;
+            }
+        }
+    };
+    collectStyles(zip.value("styles.xml"));   // named/default styles + <draw:gradient> defs (may be parents)
+    collectStyles(content);                   // <office:automatic-styles> (the per-shape graphic styles)
+    // Flatten a style + its parent chain into effective fill/stroke (depth-capped against cyclic parents).
+    auto resolve=[&](const QString& name)->OdfStyle{
+        OdfStyle e; QString n=name; int guard=0;
+        while(!n.isEmpty() && guard++<64){ auto it=styleMap.constFind(n); if(it==styleMap.constEnd()) break; const OdfStyle& s=it.value();
+            if(e.fill<0&&s.fill>=0) e.fill=s.fill;                 if(!e.fillColor.isValid()&&s.fillColor.isValid()) e.fillColor=s.fillColor;
+            if(e.fillGrad.isEmpty()&&!s.fillGrad.isEmpty()) e.fillGrad=s.fillGrad;
+            if(e.stroke<0&&s.stroke>=0) e.stroke=s.stroke;         if(!e.strokeColor.isValid()&&s.strokeColor.isValid()) e.strokeColor=s.strokeColor;
+            if(e.strokeWidth<0&&s.strokeWidth>=0) e.strokeWidth=s.strokeWidth; n=s.parent; }
+        return e;
+    };
+    QXmlStreamReader xml(content); xml.setNamespaceProcessing(false);   // ODF names are svg:x / draw:points — keep the prefixes literal
+    auto styleFor=[&](const QXmlStreamAttributes& at)->OdfStyle{        // resolved style + this shape's inline overrides
+        auto AA=[&](const char* q){ QString v=at.value(QLatin1String(q)).toString(); if(v.isEmpty()) v=at.value(QString::fromLatin1(q).section(':',-1)).toString(); return v; };
+        OdfStyle st=resolve(AA("draw:style-name"));
+        const QString fill=AA("draw:fill");      if(!fill.isEmpty()) st.fill=(fill=="none")?0:(fill=="gradient")?2:1;
+        const QString fg=AA("draw:fill-gradient-name"); if(!fg.isEmpty()) st.fillGrad=fg;
+        const QString fc=AA("draw:fill-color");  if(!fc.isEmpty())   st.fillColor=QColor(fc.trimmed());
+        const QString stk=AA("draw:stroke");     if(!stk.isEmpty())  st.stroke=(stk=="none")?0:1;
+        const QString sc=AA("svg:stroke-color"); if(!sc.isEmpty())   st.strokeColor=QColor(sc.trimmed());
+        const QString sw=AA("svg:stroke-width"); if(!sw.isEmpty())   st.strokeWidth=xqOdfLen(sw);
+        return st;
+    };
+    auto mkPath=[&](const QPainterPath& pth, bool closedArea, const OdfStyle& st, const QTransform& xf=QTransform()){ Shape s; s.type=ShapeType::Path; s.path=pth; s.name="Shape"; s.transform=xf;
+        auto git = (st.fill==2 && !st.fillGrad.isEmpty()) ? gradMap.constFind(st.fillGrad) : gradMap.constEnd();
+        if(git!=gradMap.constEnd() && git.value().c1.isValid() && git.value().c2.isValid()){   // draw:fill="gradient" → real ramp
+            const OdfGrad& g=git.value(); const QRectF bb=pth.boundingRect(); s.fill.stops.clear();
+            const bool radial = g.style.contains("radial")||g.style.contains("ellipsoid")||g.style.contains("square")||g.style.contains("rect");
+            if(radial){ s.fill.type=FillType::Radial;
+                s.fill.stops.push_back({0.0,g.c2}); s.fill.stops.push_back({1.0,g.c1});   // ODF radial: end-colour at centre, start-colour at the rim
+                const QPointF c(bb.left()+g.cx*bb.width(), bb.top()+g.cy*bb.height());
+                s.fill.p0=c; s.fill.p1=c+QPointF(bb.width()*0.5,0); s.fill.p2=c+QPointF(0,bb.height()*0.5);
+            } else { s.fill.type=FillType::Linear;
+                if(g.style.contains("axial")){ s.fill.stops.push_back({0.0,g.c2}); s.fill.stops.push_back({0.5,g.c1}); s.fill.stops.push_back({1.0,g.c2}); }
+                else { s.fill.stops.push_back({0.0,g.c1}); s.fill.stops.push_back({1.0,g.c2}); }
+                const double th=g.angleDeg*M_PI/180.0; const QPointF dir(std::cos(th),std::sin(th)); const QPointF c=bb.center();
+                double half=0.5*(std::abs(bb.width()*dir.x())+std::abs(bb.height()*dir.y())); if(half<1e-3) half=1.0;
+                s.fill.p0=c-dir*half; s.fill.p1=c+dir*half;
+            }
+        } else {
+            const bool filled = (st.fill==1) || (st.fill<0 && closedArea);   // explicit solid, or default: closed shapes fill
+            if(filled){ s.fill.type=FillType::Solid; s.fill.color = st.fillColor.isValid()? st.fillColor : QColor(210,225,245); }
+            else s.fill.type=FillType::None;
+        }
+        if(st.stroke==0) s.stroke.enabled=false;
+        else { s.stroke.enabled=true; s.stroke.color = st.strokeColor.isValid()? st.strokeColor : QColor(40,44,52);
+               s.stroke.width = st.strokeWidth>0? st.strokeWidth : 1.0; }
+        emitShape(s); };
+    while(!xml.atEnd()){
+        const auto tok=xml.readNext();
+        if(tok==QXmlStreamReader::EndElement){
+            const QString eq=xml.name().toString(); const QString e2 = eq.contains(':')? eq.section(':',1) : eq;
+            if(e2=="g") closeGroup();
+            continue;
+        }
+        if(tok!=QXmlStreamReader::StartElement) continue;
+        const QString elq=xml.name().toString(); const QString el = elq.contains(':')? elq.section(':',1) : elq;
+        const QXmlStreamAttributes a=xml.attributes();
+        if(el=="g"){                                    // <draw:g> — open a group (depth-capped like SVG)
+            if(gopen.size()>=4096){ xml.skipCurrentElement(); continue; }   // bound the PARSE stack too
+            OpenG o; o.g.type=ShapeType::Group; o.g.name="Group";
+            { QString gn=a.value(QLatin1String("draw:name")).toString(); if(!gn.isEmpty()) o.g.name=gn; }
+            o.nest = gopen.size()<64;                   // past the cap, children fold into the parent
+            gopen.push_back(o); continue;
+        }
+        auto A=[&](const char* q)->QString{ QString v=a.value(QLatin1String(q)).toString();       // try "svg:x" then bare "x"
+            if(v.isEmpty()){ const QString ln=QString::fromLatin1(q).section(':',-1); v=a.value(ln).toString(); } return v; };
+        const QTransform oxf = xqOdfTransform(A("draw:transform"));   // ODF affine, kept live in Shape::transform
+        if(el=="rect"){ const double x=xqOdfLen(A("svg:x")),y=xqOdfLen(A("svg:y")),w=xqOdfLen(A("svg:width")),h=xqOdfLen(A("svg:height"));
+            if(w>0&&h>0){ QPainterPath pp; pp.addRect(x,y,w,h); mkPath(pp,true,styleFor(a),oxf); } }
+        else if(el=="ellipse"||el=="circle"){ const double cx=xqOdfLen(A("svg:cx")),cy=xqOdfLen(A("svg:cy"));
+            double rx=xqOdfLen(A("svg:rx")),ry=xqOdfLen(A("svg:ry")); if(el=="circle"){ rx=ry=xqOdfLen(A("svg:r")); }
+            if(rx>0&&ry>0){ QPainterPath pp; pp.addEllipse(QPointF(cx,cy),rx,ry); mkPath(pp,true,styleFor(a),oxf); }
+            else { const double x=xqOdfLen(A("svg:x")),y=xqOdfLen(A("svg:y")),w=xqOdfLen(A("svg:width")),h=xqOdfLen(A("svg:height"));
+                   if(w>0&&h>0){ QPainterPath pp; pp.addEllipse(x,y,w,h); mkPath(pp,true,styleFor(a),oxf); } } }
+        else if(el=="line"){ const double x1=xqOdfLen(A("svg:x1")),y1=xqOdfLen(A("svg:y1")),x2=xqOdfLen(A("svg:x2")),y2=xqOdfLen(A("svg:y2"));
+            QPainterPath pp; pp.moveTo(x1,y1); pp.lineTo(x2,y2); mkPath(pp,false,styleFor(a),oxf); }
+        else if(el=="polyline"||el=="polygon"||el=="path"){
+            // draw:points / svg:d live in a viewBox coord space, placed by svg:x/y/width/height + svg:viewBox.
+            const double px=xqOdfLen(A("svg:x")),py=xqOdfLen(A("svg:y")),pw=xqOdfLen(A("svg:width")),ph=xqOdfLen(A("svg:height"));
+            double vx=0,vy=0,vw=0,vh=0; { const QStringList v=A("svg:viewBox").split(QRegularExpression("[ ,]+"),Qt::SkipEmptyParts);
+                if(v.size()==4){ vx=v[0].toDouble(); vy=v[1].toDouble(); vw=v[2].toDouble(); vh=v[3].toDouble(); } }
+            const bool haveBox = vw>0 && vh>0 && pw>0 && ph>0;
+            if(el=="path"){                                          // curved shapes: reuse the SVG path-data parser
+                const QString d=A("svg:d"); if(d.isEmpty()) continue;
+                QPainterPath raw=xara::parseSvgPathData(d); if(raw.elementCount()==0) continue;
+                QPainterPath pp=raw;
+                if(haveBox){ QTransform t; t.translate(px,py); t.scale(pw/vw,ph/vh); t.translate(-vx,-vy); pp=t.map(raw); }
+                mkPath(pp, d.contains('z')||d.contains('Z'), styleFor(a), oxf);
+            } else {
+                const QString pts=A("draw:points"); if(pts.isEmpty()) continue;
+                QPainterPath pp; bool first=true;
+                for(const QString& tp: pts.split(QRegularExpression("\\s+"),Qt::SkipEmptyParts)){
+                    const QStringList xy=tp.split(','); if(xy.size()<2) continue;
+                    double X=xy[0].toDouble(), Y=xy[1].toDouble();
+                    if(haveBox){ X=px+(X-vx)/vw*pw; Y=py+(Y-vy)/vh*ph; }
+                    if(first){ pp.moveTo(X,Y); first=false; } else pp.lineTo(X,Y); }
+                if(!first){ const bool area=(el=="polygon"); if(area) pp.closeSubpath(); mkPath(pp,area,styleFor(a),oxf); } }
+        }
+    }
+    while(!gopen.isEmpty()) closeGroup();          // a truncated document can leave groups open
+    if(!shapes.isEmpty()){
+        addShapes(shapes, "Import OpenDocument"); zoomFit();
+        emit statusMessage(QString("Imported OpenDocument: %1 shape(s).").arg(shapes.size()));
+        return true;
+    }
+    // No vector shapes — a text-centric ODF (ODT / OpenOffice.org 1.x .sxw). Flatten its body text into
+    // an editable wrapping frame, the same way importDocx handles Word documents.
+    const QString text=xqOdfExtractText(content);
+    if(text.isEmpty()){ emit statusMessage("OpenDocument had no importable drawing or text."); return false; }
+    Shape s; s.type=ShapeType::Text; s.text=text; s.textFrame=true; s.name=QFileInfo(path).fileName();
+    s.fill.type=FillType::Solid; s.fill.color=Qt::black; s.stroke.enabled=false;
+    const double w=qMin(m_doc.pageSize.width()*0.8, 520.0);
+    s.rect=QRectF(0,0,w,qMax(80.0,m_doc.pageSize.height()*0.8));
+    s.transform=QTransform::fromTranslate(m_doc.pageSize.width()*0.1, m_doc.pageSize.height()*0.08);
+    addShapes({s},"Import OpenDocument");
+    emit statusMessage("Imported OpenDocument text.");
+    return true;
+}
+
+// Shared tail: fit source-space paths to the page and add them as editable Path shapes.
+static QVector<Shape> xqPathsToShapes(QVector<QPainterPath>& paths, const QVector<bool>& closed,
+                                      QSizeF page, bool flipY, const QColor& areaFill){
+    QVector<Shape> out;
+    QRectF bbox;
+    for(const QPainterPath& p: paths){ if(p.elementCount()==0) continue;
+        bbox = bbox.isNull()? p.boundingRect() : bbox.united(p.boundingRect()); }
+    const QTransform t=xqFitTransform(bbox, page, 40, flipY);
+    for(int i=0;i<paths.size();++i){ QPainterPath p=paths[i]; if(p.elementCount()==0) continue;
+        p=t.map(p);
+        Shape s; s.type=ShapeType::Path; s.path=p; s.name=QStringLiteral("Path");
+        const bool area = (i<closed.size() && closed[i]);
+        if(area && areaFill.isValid()){ s.fill.type=FillType::Solid; s.fill.color=areaFill; }
+        else s.fill.type=FillType::None;
+        s.stroke.enabled=true; s.stroke.color=QColor(40,44,52); s.stroke.width=1.0;
+        out<<s;
+    }
+    return out;
+}
+
+bool Canvas::importGeoJson(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QByteArray data=f.readAll(); f.close();
+    QJsonParseError err; const QJsonDocument jd=QJsonDocument::fromJson(data,&err);
+    if(err.error!=QJsonParseError::NoError || !jd.isObject()) return false;
+    const QJsonObject root=jd.object();
+    QJsonArray feats;
+    const QString rt=root.value("type").toString();
+    if(rt=="FeatureCollection") feats=root.value("features").toArray();
+    else if(rt=="Feature") feats.append(root);
+    else { QJsonObject wrap; wrap.insert("type","Feature"); wrap.insert("geometry",root); feats.append(wrap); }
+
+    QVector<QPainterPath> paths; QVector<bool> closed;
+    auto ring=[&](const QJsonArray& coords, bool close){ QPainterPath p; bool first=true;
+        for(const QJsonValue& cv: coords){ const QJsonArray xy=cv.toArray(); if(xy.size()<2) continue;
+            const QPointF pt(xy[0].toDouble(), xy[1].toDouble());
+            if(first){ p.moveTo(pt); first=false; } else p.lineTo(pt); }
+        if(close && !first) p.closeSubpath();
+        if(!first){ paths<<p; closed<<close; } };
+    std::function<void(const QJsonObject&)> geom=[&](const QJsonObject& g){
+        const QString gt=g.value("type").toString(); const QJsonArray c=g.value("coordinates").toArray();
+        if(gt=="Point"){ if(c.size()>=2){ const QPointF pt(c[0].toDouble(),c[1].toDouble());
+                QPainterPath p; p.addEllipse(pt, 0.0001, 0.0001); paths<<p; closed<<false; } }
+        else if(gt=="LineString") ring(c,false);
+        else if(gt=="MultiPoint"){ for(const QJsonValue& v: c){ const QJsonArray xy=v.toArray(); if(xy.size()>=2){
+                QPainterPath p; p.addEllipse(QPointF(xy[0].toDouble(),xy[1].toDouble()),0.0001,0.0001); paths<<p; closed<<false; } } }
+        else if(gt=="MultiLineString"){ for(const QJsonValue& v: c) ring(v.toArray(),false); }
+        else if(gt=="Polygon"){ for(const QJsonValue& v: c) ring(v.toArray(),true); }
+        else if(gt=="MultiPolygon"){ for(const QJsonValue& poly: c) for(const QJsonValue& v: poly.toArray()) ring(v.toArray(),true); }
+        else if(gt=="GeometryCollection"){ for(const QJsonValue& v: g.value("geometries").toArray()) geom(v.toObject()); } };
+    for(const QJsonValue& fv: feats){ const QJsonObject o=fv.toObject().value("geometry").toObject(); if(!o.isEmpty()) geom(o); }
+    if(paths.isEmpty()) return false;
+    QVector<Shape> shapes=xqPathsToShapes(paths, closed, m_doc.pageSize, /*flipY*/true, QColor(210,225,245));  // lat grows up
+    if(shapes.isEmpty()) return false;
+    addShapes(shapes, "Import GeoJSON"); zoomFit();
+    emit statusMessage(QString("Imported GeoJSON: %1 shape(s).").arg(shapes.size()));
+    return true;
+}
+
+bool Canvas::importKml(const QString& path){
+    QByteArray data;
+    if(path.endsWith(".kmz",Qt::CaseInsensitive)){                    // KMZ = zip; find the doc.kml
+        QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray z=f.readAll(); f.close();
+        const QMap<QString,QByteArray> zip=readZipEntries(z);
+        if(zip.contains("doc.kml")) data=zip.value("doc.kml");
+        else for(auto it=zip.begin(); it!=zip.end(); ++it) if(it.key().endsWith(".kml",Qt::CaseInsensitive)){ data=it.value(); break; }
+    } else { QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; data=f.readAll(); }
+    if(data.isEmpty()) return false;
+    QVector<QPainterPath> paths; QVector<bool> closed;
+    QXmlStreamReader xml(data); int polyDepth=0;
+    while(!xml.atEnd()){ const auto tok=xml.readNext();
+        if(tok==QXmlStreamReader::StartElement){ const QString n=xml.name().toString();
+            if(n=="Polygon"||n=="LinearRing") ++polyDepth;
+            else if(n=="coordinates"){ const QString text=xml.readElementText();
+                QPainterPath p; bool first=true;
+                const QStringList tuples=text.simplified().split(' ',Qt::SkipEmptyParts);
+                for(const QString& tp: tuples){ const QStringList xy=tp.split(','); if(xy.size()<2) continue;
+                    const QPointF pt(xy[0].toDouble(), xy[1].toDouble());
+                    if(first){ p.moveTo(pt); first=false; } else p.lineTo(pt); }
+                if(!first){ const bool close=polyDepth>0; if(close) p.closeSubpath(); paths<<p; closed<<close; } }
+        } else if(tok==QXmlStreamReader::EndElement){ const QString n=xml.name().toString();
+            if((n=="Polygon"||n=="LinearRing") && polyDepth>0) --polyDepth; }
+    }
+    if(paths.isEmpty()) return false;
+    QVector<Shape> shapes=xqPathsToShapes(paths, closed, m_doc.pageSize, /*flipY*/true, QColor(210,225,245));
+    if(shapes.isEmpty()) return false;
+    addShapes(shapes, "Import KML"); zoomFit();
+    emit statusMessage(QString("Imported KML: %1 shape(s).").arg(shapes.size()));
+    return true;
+}
+
+bool Canvas::importHpgl(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+    const QString s=QString::fromLatin1(f.readAll()); f.close();
+    QPainterPath cur; double curx=0,cury=0; bool penDown=false, absolute=true, started=false;
+    int i=0; const int N=s.size();
+    while(i<N){
+        while(i<N && !s[i].isLetter()) ++i;
+        if(i+1>=N) break;
+        const QString cmd=s.mid(i,2).toUpper(); i+=2;
+        QString params;
+        while(i<N){ const QChar c=s[i];
+            if(c.isDigit()||c=='-'||c=='+'||c=='.'||c==','||c==' '||c=='\t'||c=='\r'||c=='\n'){ params+=c; ++i; } else break; }
+        if(cmd=="PU"||cmd=="PD"||cmd=="PA"||cmd=="PR"){
+            if(cmd=="PU") penDown=false; else if(cmd=="PD") penDown=true;
+            else if(cmd=="PA") absolute=true; else if(cmd=="PR") absolute=false;
+            QList<double> nums; const auto parts=params.split(QRegularExpression("[,\\s]+"),Qt::SkipEmptyParts);
+            for(const QString& p: parts) nums<<p.toDouble();
+            for(int k=0;k+1<nums.size();k+=2){
+                const double nx=absolute? nums[k]   : curx+nums[k];
+                const double ny=absolute? nums[k+1] : cury+nums[k+1];
+                if(penDown){ if(!started){ cur.moveTo(curx,cury); started=true; } cur.lineTo(nx,ny); }
+                else { cur.moveTo(nx,ny); started=true; }
+                curx=nx; cury=ny;
+            }
+        }
+    }
+    if(cur.elementCount()==0) return false;
+    QVector<QPainterPath> paths{cur}; QVector<bool> closed{false};
+    QVector<Shape> shapes=xqPathsToShapes(paths, closed, m_doc.pageSize, /*flipY*/true, QColor());   // plotter Y grows up; stroke-only
+    if(shapes.isEmpty()) return false;
+    addShapes(shapes, "Import HP-GL"); zoomFit();
+    emit statusMessage(QString("Imported HP-GL plot: %1 path(s).").arg(shapes.size()));
+    return true;
 }

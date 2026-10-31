@@ -1,5 +1,6 @@
 # Build output / artifacts — source only in git
 build/
+build-asan/
 AppDir/
 *.o
 *.obj

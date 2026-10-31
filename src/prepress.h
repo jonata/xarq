@@ -34,11 +34,20 @@ Document importEmf(const QByteArray& data);
 
 // PSD (Photoshop) flattened composite → QImage (the merged preview: RAW or PackBits RLE).
 QImage importPsd(const QByteArray& data);
+// Raster-only PostScript/EPS written by ImageMagick's "DisplayImage" prologue: the pixels are a
+// plain hex stream rather than drawing operators, so they can be recovered without an interpreter.
+QImage psDisplayImageRaster(const QByteArray& data);
+// Raster-only PDF: the page is a single image XObject rather than drawing operators.
+QImage pdfRasterImage(const QByteArray& data);
 
 // PSD → a Document: each Photoshop layer becomes a positioned bitmap shape (opacity + blend mode)
 // so layered files import editable. Falls back to a single flattened-composite shape if there are
 // no layers (or they can't be parsed).
-Document importPsdDocument(const QByteArray& data);
+struct PsdImportStats {
+    int groups = 0, vectorLayers = 0, textLayers = 0, rasterText = 0, adjustments = 0, skippedAdjustments = 0, effectLayers = 0;
+    QVector<double> guidesH, guidesV;
+};
+Document importPsdDocument(const QByteArray& data, PsdImportStats* stats = nullptr);
 
 // Convert an sRGB colour to naive CMYK (0..1 each). Shared by import (setcmykcolor) + separations.
 void rgbToCmyk(const QColor& c, double& C, double& M, double& Y, double& K);
