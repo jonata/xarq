@@ -6,18 +6,18 @@
 namespace xara {
 
 // ---- DS tokens used here (from tokens/colors.css + effects.css) ----
-static const QColor kSurfacePanel (0x17,0x1A,0x20);   // --surface-panel  (neutral-850)
-static const QColor kSurfaceRaised(0x1D,0x20,0x27);   // --surface-raised (neutral-800)
-static const QColor kSurfaceWell  (0x23,0x27,0x2F);   // --surface-well   (neutral-750)
-static const QColor kSurfaceChrome(0x11,0x13,0x18);   // --surface-chrome (neutral-900)
-static const QColor kTextStrong   (0xEE,0xF1,0xF5);   // --text-strong
-static const QColor kTextSecondary(0x8B,0x94,0xA3);   // --text-secondary
-static const QColor kTextTertiary (0x6E,0x77,0x87);   // --text-tertiary
-static const QColor kAccent400    (0x54,0x88,0xFF);   // --accent-400
+static const QColor kSurfacePanel (0x1A,0x23,0x2B);   // --surface-panel  (neutral-850)
+static const QColor kSurfaceRaised(0x21,0x2D,0x37);   // --surface-raised (neutral-800)
+static const QColor kSurfaceWell  (0x30,0x42,0x51);   // --surface-well   (neutral-750)
+static const QColor kSurfaceChrome(0x0D,0x12,0x16);   // --surface-chrome (neutral-900)
+static const QColor kTextStrong   (0xF0,0xF6,0xFB);   // --text-strong
+static const QColor kTextSecondary(0x8E,0xA6,0xB9);   // --text-secondary
+static const QColor kTextTertiary (0x7A,0x93,0xA7);   // --text-tertiary
+static const QColor kAccent400    (0xC8,0xDB,0xE9);   // --accent-400
 static const QColor kAccent500    (0x2D,0x6F,0xF7);   // --accent-500
-static const QColor kAccentTop    (0x46,0x80,0xFF);   // grad-accent top
+static const QColor kAccentTop    (0xC8,0xDB,0xE9);   // grad-accent top
 static const QColor kViolet       (0x7C,0x5C,0xFF);   // mark violet blade
-static const QColor kSuccess      (0x2F,0xBF,0x71);   // --success-500
+static const QColor kSuccess      (0x5D,0xE8,0x45);   // --success-500
 
 static const char* kSteps[] = {
     "Starting Qt runtime…",
@@ -134,8 +134,8 @@ void LaunchSplash::paintEvent(QPaintEvent*) {
     // brand glow (radial approximation of grad-brand, blurred)
     {
         QRadialGradient g(QPointF(cx, hero.top() + 24), hero.width()*0.55);
-        g.setColorAt(0.0, QColor(0x54,0x88,0xFF, 120));
-        g.setColorAt(0.45, QColor(0x2D,0x6F,0xF7, 70));
+        g.setColorAt(0.0, QColor(0xB8,0xCE,0xE0, 60));
+        g.setColorAt(0.45, QColor(0xB8,0xCE,0xE0, 30));
         g.setColorAt(0.75, QColor(0x7C,0x5C,0xFF, 30));
         g.setColorAt(1.0, QColor(0x7C,0x5C,0xFF, 0));
         p.fillRect(heroClip, g);
@@ -233,7 +233,7 @@ void LaunchSplash::paintEvent(QPaintEvent*) {
     const double fillW = qMax(4.0, track.width() * m_pct/100.0);
     QRectF fill(track.left(), track.top(), fillW, track.height());
     QLinearGradient fg(fill.topLeft(), fill.bottomLeft());
-    fg.setColorAt(0.0, kAccentTop); fg.setColorAt(1.0, kAccent500);
+    fg.setColorAt(0.0, kAccentTop); fg.setColorAt(1.0, QColor(0xB8,0xCE,0xE0));
     QPainterPath fp; fp.addRoundedRect(fill, 2, 2); p.fillPath(fp, fg);
 
     // meta line

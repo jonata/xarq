@@ -165,14 +165,14 @@ QIcon actionIcon(const QString& name, int size, const QColor& col) {
             g.drawLine(QPointF(s*0.40,s*0.84),QPointF(c,s*0.74)); g.drawLine(QPointF(s*0.60,s*0.84),QPointF(c,s*0.74));
             g.drawLine(QPointF(s*0.36,s*0.50),QPointF(s*0.36,s*0.40)); g.drawLine(QPointF(s*0.50,s*0.50),QPointF(s*0.50,s*0.32)); g.drawLine(QPointF(s*0.64,s*0.50),QPointF(s*0.64,s*0.36)); }
         else if (name=="win-min"){         // window minimize — a single centered bar
-            g.drawLine(QPointF(s*0.28,c),QPointF(s*0.72,c)); }
-        else if (name=="win-max"){         // window maximize — a rounded square
-            rrect(s*0.28,s*0.28,s*0.72,s*0.72,r*2.2); }
+            g.setPen(QPen(col,1.0)); g.drawLine(QPointF(s*0.28,c),QPointF(s*0.72,c)); }
+        else if (name=="win-max"){         // window maximize — a square
+            g.setPen(QPen(col,1.0)); g.drawRect(QRectF(s*0.28,s*0.28,s*0.44,s*0.44)); }
         else if (name=="win-restore"){     // window restore — two overlapping squares
-            rrect(s*0.34,s*0.24,s*0.74,s*0.64,r*1.6);   // back square
-            g.setBrush(Qt::NoBrush); rrect(s*0.26,s*0.36,s*0.66,s*0.76,r*1.6); }   // front square
+            g.setPen(QPen(col,1.0)); g.drawRect(QRectF(s*0.34,s*0.24,s*0.40,s*0.40));   // back square
+            g.drawRect(QRectF(s*0.26,s*0.36,s*0.40,s*0.40)); }                          // front square
         else if (name=="win-close"){       // window close — an X
-            g.drawLine(QPointF(s*0.30,s*0.30),QPointF(s*0.70,s*0.70));
+            g.setPen(QPen(col,1.0)); g.drawLine(QPointF(s*0.30,s*0.30),QPointF(s*0.70,s*0.70));
             g.drawLine(QPointF(s*0.70,s*0.30),QPointF(s*0.30,s*0.70)); }
         else { g.drawEllipse(QPointF(c,c),s*0.25,s*0.25); }
     }, col);

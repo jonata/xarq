@@ -303,7 +303,8 @@ ColorPanel::ColorPanel(Canvas* c, QWidget* parent):QWidget(parent),m_c(c) {
 // ===== InfoBar: per-tool options bar ========================================
 InfoBar::InfoBar(Canvas* c, QWidget* parent):QWidget(parent),m_c(c){
     setObjectName("infobar");
-    m_lay=new QHBoxLayout(this); m_lay->setContentsMargins(8,3,8,3); m_lay->setSpacing(6);
+    m_lay=new QHBoxLayout(this); m_lay->setContentsMargins(0,0,8,0); m_lay->setSpacing(6);   // no left/top/bottom margin: the tool tag sits flush
+    setMinimumHeight(34);
     connect(c,&Canvas::toolChanged,this,[this](Tool){ rebuild(); });
     // The per-tool controls (Shadow/Contour/Bevel/… on-checkboxes, blur/width spins) mirror the selected
     // object's state, so they must re-sync when the canvas changes the model (e.g. casting a shadow by drag

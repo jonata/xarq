@@ -15,65 +15,65 @@
 
 namespace xara {
 
-// ---- design tokens (from the XarQ token set, mirrored in the handoff) ---------------------------
+// ---- design tokens (Subtitld's slate + sky) ---------------------------
 namespace tok {
-    static const QColor app(0x08,0x09,0x0B), chrome(0x11,0x13,0x18), panel(0x17,0x1A,0x20), well(0x23,0x27,0x2F);
-    static const QColor strong(0xEE,0xF1,0xF5), body(0xD2,0xD8,0xE0), sec(0x8B,0x94,0xA3), tert(0x6E,0x77,0x87);
-    static const QColor accent(0x2D,0x6F,0xF7), accent3(0x7F,0xA5,0xFF), warning(0xF5,0xB2,0x3D);
+    static const QColor app(0x07,0x09,0x0B), chrome(0x0D,0x12,0x16), panel(0x1A,0x23,0x2B), well(0x30,0x42,0x51);
+    static const QColor strong(0xF0,0xF6,0xFB), body(0xB8,0xCE,0xE0), sec(0x8E,0xA6,0xB9), tert(0x7A,0x93,0xA7);
+    static const QColor accent(0xB8,0xCE,0xE0), accent3(0xC8,0xDB,0xE9), warning(0xF5,0xB2,0x3D);
 }
 
 // Shared QSS for the panel (#startPanel) and the modal (#startDialog). ID selectors so they beat the
 // global theme; everything between the grid background and the leaf widgets is made transparent so the
 // grid shows through (labels are already transparent via the global theme).
 static const char* kStartQss = R"QSS(
-    #startPanel, #startDialog { background:#08090B; }
-    #startSidebar { background:#111318; border-right:1px solid rgba(255,255,255,0.06); }
+    #startPanel, #startDialog { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #07090B, stop:1 #1A232B); }
+    #startSidebar { background:#0D1216; border-right:1px solid rgba(255,255,255,0.06); }
     #startMain, #startContent { background:transparent; }
     QScrollArea#startScroll { background:transparent; border:none; }
     QScrollArea#startScroll > QWidget > QWidget { background:transparent; }
 
-    QLabel#h1 { font-size:29px; font-weight:800; color:#EEF1F5; letter-spacing:-0.5px; }
-    QLabel#sub { font-size:14px; color:#8B94A3; }
-    QLabel#eyebrow { font-size:11px; font-weight:700; color:#6E7787; letter-spacing:1.6px; }
-    QLabel#link { font-size:12px; color:#5488FF; }
-    QLabel#ver { font-size:11px; color:#6E7787; }
+    QLabel#h1 { font-size:29px; font-weight:800; color:#F0F6FB; letter-spacing:-0.5px; }
+    QLabel#sub { font-size:14px; color:#8EA6B9; }
+    QLabel#eyebrow { font-size:11px; font-weight:700; color:#7A93A7; letter-spacing:1.6px; }
+    QLabel#link { font-size:12px; color:#C8DBE9; }
+    QLabel#ver { font-size:11px; color:#7A93A7; }
 
     /* Controls use the design-system --radius-md (3px). Primary = --grad-accent gradient (wt 600, dark
        border + top highlight); Outline = accent-300 text on an accent-600 border. */
-    QPushButton#btnPrimary { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4680FF, stop:1 #2D6FF7); border:1px solid rgba(0,0,0,0.20); border-top-color:rgba(255,255,255,0.18); border-radius:3px; color:#FFFFFF; font-size:14px; font-weight:600; padding:0 18px; min-height:36px; max-height:36px; text-align:center; }
-    QPushButton#btnPrimary:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #5A90FF, stop:1 #3D7DFF); }
-    QPushButton#btnPrimary:pressed { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2D6FF7, stop:1 #235FE0); }
-    QPushButton#btnOutline { background:transparent; border:1px solid #235FE0; border-radius:3px; color:#7FA5FF; font-size:13px; font-weight:600; padding:0 14px; min-height:28px; max-height:28px; text-align:center; }
-    QPushButton#btnOutline:hover { background:rgba(45,111,247,0.12); border-color:#2D6FF7; color:#9DB8FF; }
-    QPushButton#btnSecondary { background:#2A2F39; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#EEF1F5; font-size:12px; font-weight:600; padding:0 12px; }
-    QPushButton#btnSecondary:hover { background:#323844; }
-    QPushButton#btnGhost { background:transparent; border:none; border-radius:3px; color:#D2D8E0; font-size:12px; font-weight:600; padding:0 10px; }
-    QPushButton#btnGhost:hover { background:rgba(255,255,255,0.06); color:#EEF1F5; }
-    QPushButton#sideLink { background:transparent; border:none; border-top:1px solid rgba(255,255,255,0.06); text-align:left; }
+    QPushButton#btnPrimary { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #C8DBE9, stop:1 #B8CEE0); border:none; border-radius:2px; color:#304251; font-size:12px; font-weight:700; text-transform:uppercase; padding:0 18px; min-height:36px; max-height:36px; text-align:center; }
+    QPushButton#btnPrimary:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #D7E4EF, stop:1 #C8DBE9); }
+    QPushButton#btnPrimary:pressed { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #8DB0C9, stop:1 #5F7B8D); }
+    QPushButton#btnOutline { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4A5F70, stop:1 #3E5363); border:none; border-radius:2px; color:#B8CEE0; font-size:11px; font-weight:700; text-transform:uppercase; padding:0 14px; min-height:28px; max-height:28px; text-align:center; }
+    QPushButton#btnOutline:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #566F84, stop:1 #4A5F70); }
+    QPushButton#btnSecondary { background:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4A5F70, stop:1 #3E5363); border:none; border-radius:2px; color:#B8CEE0; font-size:11px; font-weight:700; text-transform:uppercase; padding:0 12px; }
+    QPushButton#btnSecondary:hover { background:#4A5F70; }
+    QPushButton#btnGhost { background:transparent; border:none; border-radius:2px; color:#B8CEE0; font-size:12px; font-weight:600; padding:0 10px; }
+    QPushButton#btnGhost:hover { background:rgba(255,255,255,0.06); color:#F0F6FB; }
+    QPushButton#sideLink { background:transparent; border:none; border-top:1px solid rgba(255,255,255,0.06); text-align:left; min-height:40px; }
 
-    QLineEdit#search { background:#23272F; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#D2D8E0; padding:6px 10px; font-size:13px; selection-background-color:#2D6FF7; }
-    QLineEdit#search:focus { border:1px solid #2D6FF7; }
+    QLineEdit#search { background:#304251; border:1px solid rgba(255,255,255,0.10); border-radius:2px; color:#B8CEE0; padding:6px 10px; font-size:13px; selection-background-color:#B8CEE0; }
+    QLineEdit#search:focus { border:1px solid #B8CEE0; }
 
-    QFrame#tplCard { background:#171A20; border:1px solid rgba(255,255,255,0.06); border-radius:5px; }
-    QFrame#tplCard:hover { border:1px solid rgba(255,255,255,0.18); background:#1B1F27; }
-    QFrame#tplCardDashed { background:transparent; border:1px dashed rgba(255,255,255,0.16); border-radius:5px; }
+    QFrame#tplCard { background:#1A232B; border:1px solid rgba(255,255,255,0.06); border-radius:2px; }
+    QFrame#tplCard:hover { border:1px solid rgba(255,255,255,0.18); background:#253340; }
+    QFrame#tplCardDashed { background:transparent; border:1px dashed rgba(255,255,255,0.16); border-radius:2px; }
     QFrame#tplCardDashed:hover { border:1px dashed rgba(255,255,255,0.32); background:rgba(255,255,255,0.02); }
-    QLabel#cardTitle { font-size:13px; font-weight:600; color:#EEF1F5; background:transparent; }
-    QLabel#cardMeta { font-size:11px; color:#6E7787; background:transparent; }
+    QLabel#cardTitle { font-size:13px; font-weight:600; color:#F0F6FB; background:transparent; }
+    QLabel#cardMeta { font-size:11px; color:#7A93A7; background:transparent; }
     QLabel#cardTile { background:transparent; }
 
-    QFrame#recBanner { background:rgba(245,178,61,0.15); border:1px solid rgba(245,178,61,0.32); border-radius:5px; }
-    QLabel#recTitle { font-size:13px; font-weight:600; color:#EEF1F5; background:transparent; }
-    QLabel#recChip { background:#23272F; border-radius:5px; padding:2px 8px; color:#8B94A3; font-size:11px; }
+    QFrame#recBanner { background:rgba(245,178,61,0.15); border:1px solid rgba(245,178,61,0.32); border-radius:2px; }
+    QLabel#recTitle { font-size:13px; font-weight:600; color:#F0F6FB; background:transparent; }
+    QLabel#recChip { background:#304251; border-radius:2px; padding:2px 8px; color:#8EA6B9; font-size:11px; }
     QLabel#recIcon { background:rgba(245,178,61,0.18); border-radius:8px; }
 
-    QFrame#emptyPanel { background:#171A20; border:1px dashed rgba(255,255,255,0.10); border-radius:5px; }
-    QLabel#emptyTitle { font-size:14px; font-weight:600; color:#EEF1F5; background:transparent; }
-    QLabel#emptyBody { font-size:12px; color:#8B94A3; background:transparent; }
-    QLabel#emptyIcon { background:#23272F; border-radius:26px; }
+    QFrame#emptyPanel { background:#1A232B; border:1px dashed rgba(255,255,255,0.10); border-radius:2px; }
+    QLabel#emptyTitle { font-size:14px; font-weight:600; color:#F0F6FB; background:transparent; }
+    QLabel#emptyBody { font-size:12px; color:#8EA6B9; background:transparent; }
+    QLabel#emptyIcon { background:#304251; border-radius:26px; }
 
-    QFrame#footer { background:#111318; border-top:1px solid rgba(255,255,255,0.06); }
-    QCheckBox#showChk { color:#6E7787; font-size:11px; }
+    QFrame#footer { background:#0D1216; border-top:1px solid rgba(255,255,255,0.06); }
+    QCheckBox#showChk { color:#7A93A7; font-size:11px; }
 )QSS";
 
 // The main-area background: the coming-soon 54px grid, faded by a top-right radial mask, plus a soft blue
@@ -85,7 +85,7 @@ protected:
     void paintEvent(QPaintEvent*) override {
         QPainter p(this); p.setRenderHint(QPainter::Antialiasing);
         const int W=width(), H=height();
-        p.fillRect(rect(), tok::app);
+        { QLinearGradient bg(0,0,0,H); bg.setColorAt(0.0,tok::app); bg.setColorAt(1.0,tok::panel); p.fillRect(rect(), bg); }
         if (W<=0 || H<=0) return;
         // grid lines drawn into a scratch layer, then masked so they read only top-right and fade out
         QImage layer(size(), QImage::Format_ARGB32_Premultiplied); layer.fill(Qt::transparent);
@@ -100,7 +100,7 @@ protected:
           g.fillRect(layer.rect(), mask); }
         p.drawImage(0,0,layer);
         QRadialGradient glow(QPointF(W*0.82, H*0.04), 780);        // ~radial(900×620 at 82% 4%)
-        glow.setColorAt(0.0, QColor(45,111,247,38)); glow.setColorAt(0.6, QColor(45,111,247,0));
+        glow.setColorAt(0.0, QColor(184,206,224,20)); glow.setColorAt(0.6, QColor(184,206,224,0));
         p.fillRect(rect(), glow);
     }
 };
@@ -146,8 +146,7 @@ static QFrame* mkCard(const QString& title, const QString& meta, const QString& 
     auto* m=new QLabel(meta);  m->setObjectName("cardMeta");  m->setAttribute(Qt::WA_TransparentForMouseEvents);
     { QFont mf("JetBrains Mono"); if(!QFontDatabase::families().contains("JetBrains Mono")) mf=QFont("Ubuntu Mono"); mf.setPixelSize(11); m->setFont(mf); }
     tv->addWidget(t); tv->addWidget(m); h->addLayout(tv,1);
-    if(!dashed){ auto* sh=new QGraphicsDropShadowEffect(b); sh->setBlurRadius(16); sh->setOffset(0,3); sh->setColor(QColor(0,0,0,90)); b->setGraphicsEffect(sh); }
-    auto* cf=new ClickFilter(b); cf->cb=std::move(onClick); b->installEventFilter(cf);
+        auto* cf=new ClickFilter(b); cf->cb=std::move(onClick); b->installEventFilter(cf);
     return b;
 }
 
@@ -157,7 +156,7 @@ static QPushButton* mkLinkRow(const QString& text){
     b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto* h=new QHBoxLayout(b); h->setContentsMargins(6,16,6,8); h->setSpacing(8);
     auto* g=new QLabel; g->setPixmap(actionIcon("globe",15,tok::tert).pixmap(15,15)); g->setAttribute(Qt::WA_TransparentForMouseEvents);
-    auto* t=new QLabel(text); t->setStyleSheet("color:#6E7787;font-size:12px;font-weight:600;background:transparent;"); t->setAttribute(Qt::WA_TransparentForMouseEvents);
+    auto* t=new QLabel(text); t->setStyleSheet("color:#7A93A7;font-size:12px;font-weight:600;background:transparent;"); t->setAttribute(Qt::WA_TransparentForMouseEvents);
     auto* a=new QLabel; a->setPixmap(actionIcon("arrow-up-right",13,tok::tert).pixmap(13,13)); a->setAttribute(Qt::WA_TransparentForMouseEvents);
     h->addWidget(g); h->addWidget(t); h->addStretch(); h->addWidget(a);
     return b;
@@ -225,7 +224,7 @@ QWidget* StartScreen::buildPanel(MainWindow* mw, std::function<void()> onChosen)
         for(const auto& e : recov){ const QString orig=e.second;
             const QString name = orig.isEmpty()? QStringLiteral("Untitled document") : QFileInfo(orig).fileName();
             const QString meta = orig.isEmpty()? QStringLiteral("never saved") : QFileInfo(orig).absolutePath();
-            auto* chip=new QLabel(name+"  <span style='color:#6E7787'>· "+meta.toHtmlEscaped()+"</span>");
+            auto* chip=new QLabel(name+"  <span style='color:#7A93A7'>· "+meta.toHtmlEscaped()+"</span>");
             chip->setObjectName("recChip"); chip->setTextFormat(Qt::RichText);
             QFont mf("JetBrains Mono"); if(!QFontDatabase::families().contains("JetBrains Mono")) mf=QFont("Ubuntu Mono"); mf.setPixelSize(11); chip->setFont(mf);
             chips->addWidget(chip); }
@@ -244,7 +243,7 @@ QWidget* StartScreen::buildPanel(MainWindow* mw, std::function<void()> onChosen)
     { auto* hr=new QHBoxLayout;
       auto* eye=new QLabel("START A NEW DOCUMENT"); eye->setObjectName("eyebrow");
       auto* browse=new QPushButton("Browse all templates →"); browse->setObjectName("btnGhost");
-      browse->setStyleSheet("color:#5488FF;background:transparent;border:none;font-size:12px;"); browse->setCursor(Qt::PointingHandCursor);
+      browse->setStyleSheet("color:#C8DBE9;background:transparent;border:none;font-size:12px;"); browse->setCursor(Qt::PointingHandCursor);
       hr->addWidget(eye); hr->addStretch(); hr->addWidget(browse); mv->addLayout(hr);
       QObject::connect(browse,&QPushButton::clicked,w,[mw,w,onChosen]{
           bool ok; const QStringList names=Canvas::templateNames();
@@ -314,10 +313,10 @@ QWidget* StartScreen::buildPanel(MainWindow* mw, std::function<void()> onChosen)
             if(!p.isEmpty()){ mw->openPath(p); if(onChosen) onChosen(); } });
     } else {
         auto* list=new QListWidget; list->setObjectName("startRecent");
-        list->setStyleSheet("QListWidget#startRecent{background:#171A20;border:1px solid rgba(255,255,255,0.08);border-radius:5px;padding:6px;}"
-                            "QListWidget#startRecent::item{padding:8px 10px;border-radius:3px;color:#D2D8E0;}"
-                            "QListWidget#startRecent::item:hover{background:#1D2027;}"
-                            "QListWidget#startRecent::item:selected{background:rgba(45,111,247,0.24);color:#EEF1F5;}");
+        list->setStyleSheet("QListWidget#startRecent{background:#1A232B;border:1px solid rgba(255,255,255,0.08);border-radius:2px;padding:6px;}"
+                            "QListWidget#startRecent::item{padding:8px 10px;border-radius:2px;color:#B8CEE0;}"
+                            "QListWidget#startRecent::item:hover{background:#212D37;}"
+                            "QListWidget#startRecent::item:selected{background:rgba(184,206,224,0.24);color:#F0F6FB;}");
         for(const QString& p : recents){ QFileInfo fi(p);
             auto* it=new QListWidgetItem(fi.fileName()+"   —   "+fi.absolutePath()); it->setData(Qt::UserRole,p); list->addItem(it); }
         QObject::connect(list,&QListWidget::itemClicked,w,[mw,onChosen](QListWidgetItem* it){ mw->openPath(it->data(Qt::UserRole).toString()); if(onChosen) onChosen(); });

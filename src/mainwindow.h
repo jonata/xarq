@@ -130,7 +130,7 @@ private:
     QDockWidget* m_panelDock{};
     QWidget* m_rightPanel{};      // the Design|Prototype panel, floated as a translucent glass overlay over the canvas
     QWidget* m_panelGrip{};       // draggable handle on the panel's left edge to resize it
-    int  m_rightPanelW{302};      // current panel width (user-resizable)
+    int  m_rightPanelW{352};      // current panel width (user-resizable)
     std::function<void()> m_pokeRightPanel;   // reveal the auto-hide (show-on-hover) right panel programmatically
     bool m_gripDrag{false};
     void positionRightPanel();    // pin it to the right edge of the canvas, full height
@@ -143,7 +143,7 @@ private:
     void refreshDocStatus();      // update the centred identity + Save button + status "Saved" from filePath + m_dirty
     // --- frameless title bar ("App title bar design"): centre swaps document identity ⇄ menu bar on hover ---
     QToolButton* m_saveBtn{}; QToolButton* m_exportBtn{};
-    QWidget* m_titleBarW{};                          // the DragBar background (OS window move handle)
+    std::function<void()> m_playSaveWave;            // the green ripple from Save, when a save lands
     QWidget* m_docLayer{}; QWidget* m_menuLayer{};   // the two cross-faded centre layers
     QLabel*  m_pathLabel{}; QLabel* m_titleLabel{}; QString m_titleFull;
     QGraphicsOpacityEffect *m_docFx{}, *m_menuFx{};

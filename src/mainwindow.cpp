@@ -12,6 +12,8 @@
 #include <QBuffer>
 #include <QImageWriter>
 #include <QPainter>
+#include <QVariantAnimation>
+#include <cmath>
 #include <QStackedWidget>
 #include <QDesktopServices>
 #include <QUrl>
@@ -38,6 +40,8 @@
 namespace xara {
 
 namespace {
+const QColor kWinGlyph(0xB8,0xCE,0xE0,0x77);   // window-control glyphs: Subtitld's dim sky
+
 // Make a floating canvas overlay fully transparent until the pointer is over its area, then fade it in.
 // The filter is installed on the widget AND every descendant, so gliding between child buttons never
 // flickers; on leaving, a short delay re-checks the cursor against the whole widget rect before fading out.
@@ -118,17 +122,61 @@ private:
     QWidget* m_zone; std::function<void(bool)> m_setHover; QTimer m_leave;
 };
 
-// Swaps a button's icon on hover (QSS can recolor a background but not a QIcon) — used so the close X turns
-// white over its red hover fill.
-class HoverIconSwap : public QObject {
+// A toolbar with no inset, so the InfoBar's tool tag sits flush with the window edge. QToolBar recomputes its
+// layout margins from the style on every style change, so they have to be zeroed again each time.
+class FlushToolBar : public QToolBar {
 public:
-    HoverIconSwap(QToolButton* b, QIcon normal, QIcon hover): QObject(b), m_b(b), m_n(std::move(normal)), m_h(std::move(hover)) { b->installEventFilter(this); }
+    using QToolBar::QToolBar;
 protected:
-    bool eventFilter(QObject*, QEvent* e) override {
-        if(e->type()==QEvent::Enter) m_b->setIcon(m_h);
-        else if(e->type()==QEvent::Leave) m_b->setIcon(m_n);
-        return false; }
-    QToolButton* m_b; QIcon m_n, m_h;
+    void changeEvent(QEvent* e) override { QToolBar::changeEvent(e); if(e->type()==QEvent::StyleChange && layout()) layout()->setContentsMargins(0,0,0,0); }
+};
+
+// Document tabs have curved sides, and Qt's own close button lands in the curve. This one carries its own
+// right margin, so the tab reserves room for it and it sits on the tab's flat body.
+class DocTabBar : public QTabBar {
+protected:
+    void tabInserted(int index) override {
+        QTabBar::tabInserted(index);
+        auto* box=new QWidget; box->setObjectName("docTabCloseBox"); box->setFixedSize(26,16);
+        auto* x=new QToolButton(box); x->setObjectName("docTabClose"); x->setGeometry(0,0,16,16);
+        x->setIcon(QIcon(":/xarq/assets/logo/tabclose.svg")); x->setIconSize(QSize(12,12)); x->setToolTip("Close");
+        connect(x,&QToolButton::clicked,this,[this,box]{
+            for(int i=0;i<count();++i) if(tabButton(i,QTabBar::RightSide)==box){ emit tabCloseRequested(i); return; } });
+        setTabButton(index,QTabBar::RightSide,box); }
+    // Qt's stylesheet sizing doesn't reserve the close box's width, which would elide the name.
+    QSize tabSizeHint(int index) const override { QSize s=QTabBar::tabSizeHint(index); s.rwidth()+=26; return s; }
+    QSize minimumTabSizeHint(int index) const override { QSize s=QTabBar::minimumTabSizeHint(index); s.rwidth()+=26; return s; }
+};
+
+// The ripple Subtitld sends out from the Save button when a save lands: a soft green ring sweeping across the
+// window. A click-through overlay; hidden and costing nothing except for the second it plays.
+class SaveWave : public QWidget {
+public:
+    explicit SaveWave(QWidget* host): QWidget(host), m_host(host) {
+        setAttribute(Qt::WA_TransparentForMouseEvents); setAttribute(Qt::WA_NoSystemBackground); setAttribute(Qt::WA_TranslucentBackground);
+        m_anim=new QVariantAnimation(this); m_anim->setDuration(1100); m_anim->setEasingCurve(QEasingCurve::OutCubic);
+        m_anim->setStartValue(0.0); m_anim->setEndValue(1.0);
+        connect(m_anim,&QVariantAnimation::valueChanged,this,[this](const QVariant& v){ m_t=v.toDouble(); update(); });
+        connect(m_anim,&QVariantAnimation::finished,this,&QWidget::hide);
+        hide(); }
+    void play(const QPoint& origin){
+        m_origin=origin; m_reach=0;
+        for(const QPoint& c : {m_host->rect().topLeft(),m_host->rect().topRight(),m_host->rect().bottomLeft(),m_host->rect().bottomRight()})
+            m_reach=qMax(m_reach, QLineF(QPointF(origin),QPointF(c)).length());
+        setGeometry(m_host->rect()); show(); raise();
+        m_anim->stop(); m_anim->start(); }
+protected:
+    void paintEvent(QPaintEvent*) override {
+        if(m_t<=0.0 || m_t>=1.0 || m_reach<=0.0) return;
+        QPainter g(this); g.setRenderHint(QPainter::Antialiasing);
+        const double radius=m_reach*m_t, half=180.0, outer=radius+half;   // ring 360px thick, for a soft sweep
+        QColor peak(0x5D,0xE8,0x45); peak.setAlphaF(0.20*std::pow(1.0-m_t,1.5));
+        QColor edge=peak; edge.setAlphaF(0.0);
+        QRadialGradient rg(QPointF(m_origin),outer);
+        rg.setColorAt(0.0,edge); rg.setColorAt(qMax(0.0,(radius-half)/outer),edge); rg.setColorAt(radius/outer,peak); rg.setColorAt(1.0,edge);
+        g.fillRect(rect(),rg); }
+private:
+    QWidget* m_host; QVariantAnimation* m_anim; QPoint m_origin; double m_t=0.0, m_reach=0.0;
 };
 
 // Edge/corner resize for a frameless window: a left-press within 6px of the RIGHT or BOTTOM window border
@@ -166,8 +214,8 @@ MainWindow::MainWindow() {
 
     // InfoBar — Xara's signature per-tool options bar, on its own row below the action bar.
     m_infobar=new InfoBar(m_canvas);
-    auto* ibTb=new QToolBar("Tool Options"); ibTb->setObjectName("infobarTb"); ibTb->setMovable(false);
-    ibTb->addWidget(m_infobar); addToolBarBreak(Qt::TopToolBarArea); addToolBar(Qt::TopToolBarArea,ibTb);
+    auto* ibTb=new FlushToolBar("Tool Options"); ibTb->setObjectName("infobarTb"); ibTb->setMovable(false);
+    ibTb->addWidget(m_infobar); ibTb->layout()->setContentsMargins(0,0,0,0); addToolBarBreak(Qt::TopToolBarArea); addToolBar(Qt::TopToolBarArea,ibTb);
 
     buildToolRail();
     buildDocks();
@@ -400,7 +448,7 @@ void MainWindow::buildZoomPill(){
     auto pillIcon=[](const QString& kind)->QIcon{
         QPixmap pm(18,18); pm.fill(Qt::transparent);
         QPainter g(&pm); g.setRenderHint(QPainter::Antialiasing);
-        QPen pen(QColor(0xC7,0xCE,0xD8),1.6); pen.setCapStyle(Qt::RoundCap); pen.setJoinStyle(Qt::RoundJoin); g.setPen(pen);
+        QPen pen(QColor(0xB8,0xCE,0xE0),1.6); pen.setCapStyle(Qt::RoundCap); pen.setJoinStyle(Qt::RoundJoin); g.setPen(pen);
         if(kind=="pan"){ g.drawLine(9,3,9,15); g.drawLine(3,9,15,9);
             g.drawLine(9,3,7,5); g.drawLine(9,3,11,5); g.drawLine(9,15,7,13); g.drawLine(9,15,11,13);
             g.drawLine(3,9,5,7); g.drawLine(3,9,5,11); g.drawLine(15,9,13,7); g.drawLine(15,9,13,11); }
@@ -413,7 +461,7 @@ void MainWindow::buildZoomPill(){
     };
     m_zoomPill=new QWidget(m_canvas); m_zoomPill->setObjectName("zoomPill");
     m_zoomPill->setAttribute(Qt::WA_StyledBackground,true); m_zoomPill->setFixedHeight(36);
-    auto* h=new QHBoxLayout(m_zoomPill); h->setContentsMargins(8,0,8,0); h->setSpacing(4);
+    auto* h=new QHBoxLayout(m_zoomPill); h->setContentsMargins(22,0,22,0); h->setSpacing(4);
     auto mkBtn=[&](const QString& kind,const QString& tip,bool checkable){
         auto* b=new QToolButton; b->setObjectName("pillBtn"); b->setIcon(pillIcon(kind)); b->setIconSize(QSize(18,18));
         b->setToolTip(tip); b->setCheckable(checkable); b->setCursor(Qt::PointingHandCursor); b->setAutoRaise(true); return b; };
@@ -447,7 +495,7 @@ class PanelStack;   // manages a column of sections: drag-to-reorder + detach/do
 static QIcon detachIcon(){
     QPixmap pm(14,14); pm.fill(Qt::transparent);
     QPainter g(&pm); g.setRenderHint(QPainter::Antialiasing);
-    QPen pen(QColor(0x8B,0x94,0xA3),1.3); g.setPen(pen); g.setBrush(Qt::NoBrush);
+    QPen pen(QColor(0x8E,0xA6,0xB9),1.3); g.setPen(pen); g.setBrush(Qt::NoBrush);
     g.drawRect(2,4,7,7); g.drawLine(9,3,12,3); g.drawLine(12,3,12,6); g.drawLine(12,3,8,7);
     return QIcon(pm);
 }
@@ -1487,8 +1535,8 @@ void MainWindow::buildMenus() {
 void MainWindow::newFile(){ newDocumentTab(); snapshotRecovery(); }   // File▸New opens a fresh document tab
 void MainWindow::openFile(){ QString p=QFileDialog::getOpenFileName(this,"Open",QString(),supportedOpenFilter(),nullptr,QFileDialog::DontUseNativeDialog|QFileDialog::HideNameFilterDetails); if(p.isEmpty()) return; openPath(p); }
 bool MainWindow::saveFile(){ if(m_tabs.isEmpty()) ensureLandingTab();   // Save from the empty state → materialise + reveal the (blank) document, don't act on the hidden canvas
-    QString p=m_canvas->filePath(); if(p.isEmpty()) return saveFileAs(); m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); return true; }
-bool MainWindow::saveFileAs(){ if(m_tabs.isEmpty()) ensureLandingTab(); QString p=QFileDialog::getSaveFileName(this,"Save As","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return false; if(!p.endsWith(".xar",Qt::CaseInsensitive)) p+=".xar"; m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); return true; }
+    QString p=m_canvas->filePath(); if(p.isEmpty()) return saveFileAs(); m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); m_playSaveWave(); return true; }
+bool MainWindow::saveFileAs(){ if(m_tabs.isEmpty()) ensureLandingTab(); QString p=QFileDialog::getSaveFileName(this,"Save As","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return false; if(!p.endsWith(".xar",Qt::CaseInsensitive)) p+=".xar"; m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); m_playSaveWave(); return true; }
 
 // ---- recent files + Start screen (DS4) ----
 QStringList MainWindow::recentFiles() const {
@@ -1619,8 +1667,8 @@ void MainWindow::acceptWelcomeDrop(const QString& path){
 
 // ---- multi-document tabs (R6) ----------------------------------------------
 void MainWindow::setupTabBar(QWidget*& centralOut){
-    m_tabBar=new QTabBar; m_tabBar->setObjectName("docTabBar");
-    m_tabBar->setDocumentMode(true); m_tabBar->setTabsClosable(true); m_tabBar->setExpanding(false);
+    m_tabBar=new DocTabBar; m_tabBar->setObjectName("docTabBar");
+    m_tabBar->setDocumentMode(true); m_tabBar->setExpanding(false);
     m_tabBar->setUsesScrollButtons(true); m_tabBar->setElideMode(Qt::ElideRight);
     connect(m_tabBar,&QTabBar::currentChanged,this,[this](int i){ switchToTab(i); });   // programmatic changes are QSignalBlocker-wrapped
     connect(m_tabBar,&QTabBar::tabCloseRequested,this,[this](int i){ confirmAndCloseTab(i); });
@@ -1980,29 +2028,29 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
     dlg.setWindowFlags(Qt::Dialog|Qt::FramelessWindowHint);
     dlg.resize(1080, 700);
     dlg.setStyleSheet(R"QSS(
-        #exportDlg { background:#171A20; border:1px solid rgba(255,255,255,0.16); }
-        #expHeader,#expFooter { background:#111318; }
-        #expTitle { font-family:"Montserrat"; font-weight:700; font-size:15px; color:#EEF1F5; }
-        #expDoc,#expOutPath { font-family:"Ubuntu Mono"; font-size:11px; color:#6E7787; }
-        #expOut { font-family:"Ubuntu Mono"; font-size:12px; color:#D2D8E0; }
-        #expReadout { font-family:"Ubuntu Mono"; font-size:11px; color:#8B94A3; }
-        #expClose { color:#8B94A3; border:none; font-size:16px; font-weight:700; background:transparent; }
-        #expClose:hover { color:#EEF1F5; }
-        QLabel[secHdr="true"] { color:#6E7787; font-weight:700; font-size:11px; }
-        QLabel[rowLbl="true"] { color:#8B94A3; font-size:12px; }
-        #expRail { background:#171A20; border-left:1px solid rgba(255,255,255,0.10); }
-        QToolButton[seg="true"] { background:#23272F; border:1px solid rgba(255,255,255,0.10); color:#8B94A3; padding:3px 9px; font-size:11px; }
-        QToolButton[seg="true"]:checked { background:rgba(45,111,247,0.24); border:1px solid #2D6FF7; color:#7FA5FF; }
-        QToolButton[card="true"] { background:#23272F; border:1px solid rgba(255,255,255,0.10); border-radius:3px; text-align:left; padding:8px 10px; color:#D2D8E0; font-weight:700; font-size:12px; }
-        QToolButton[card="true"]:checked { background:rgba(45,111,247,0.16); border:1px solid #2D6FF7; color:#7FA5FF; }
-        #expPrimary { background:#2D6FF7; color:white; border:none; border-radius:4px; padding:9px 20px; font-weight:700; }
+        #exportDlg { background:#1A232B; border:1px solid rgba(255,255,255,0.16); }
+        #expHeader,#expFooter { background:#0D1216; }
+        #expTitle { font-family:"Montserrat"; font-weight:700; font-size:15px; color:#F0F6FB; }
+        #expDoc,#expOutPath { font-family:"Ubuntu Mono"; font-size:11px; color:#7A93A7; }
+        #expOut { font-family:"Ubuntu Mono"; font-size:12px; color:#B8CEE0; }
+        #expReadout { font-family:"Ubuntu Mono"; font-size:11px; color:#8EA6B9; }
+        #expClose { color:#8EA6B9; border:none; font-size:16px; font-weight:700; background:transparent; }
+        #expClose:hover { color:#F0F6FB; }
+        QLabel[secHdr="true"] { color:#7A93A7; font-weight:700; font-size:11px; }
+        QLabel[rowLbl="true"] { color:#8EA6B9; font-size:12px; }
+        #expRail { background:#1A232B; border-left:1px solid rgba(255,255,255,0.10); }
+        QToolButton[seg="true"] { background:#304251; border:1px solid rgba(255,255,255,0.10); color:#8EA6B9; padding:3px 9px; font-size:11px; }
+        QToolButton[seg="true"]:checked { background:rgba(184,206,224,0.24); border:1px solid #B8CEE0; color:#C8DBE9; }
+        QToolButton[card="true"] { background:#304251; border:1px solid rgba(255,255,255,0.10); border-radius:3px; text-align:left; padding:8px 10px; color:#B8CEE0; font-weight:700; font-size:12px; }
+        QToolButton[card="true"]:checked { background:rgba(184,206,224,0.16); border:1px solid #B8CEE0; color:#C8DBE9; }
+        #expPrimary { background:#B8CEE0; color:#304251; border:none; border-radius:2px; padding:9px 20px; font-weight:700; }
         #expPrimary:hover { background:#3B79FF; }
-        #expGhost { background:transparent; color:#8B94A3; border:1px solid rgba(255,255,255,0.10); border-radius:4px; padding:9px 16px; }
-        #expGhost:hover { color:#EEF1F5; background:#1D2027; }
-        QLineEdit { background:#23272F; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#D2D8E0; padding:4px 7px; }
+        #expGhost { background:transparent; color:#8EA6B9; border:1px solid rgba(255,255,255,0.10); border-radius:2px; padding:9px 16px; }
+        #expGhost:hover { color:#F0F6FB; background:#212D37; }
+        QLineEdit { background:#304251; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#B8CEE0; padding:4px 7px; }
         QScrollArea { border:none; }
-        QSlider::groove:horizontal { height:4px; background:#23272F; border-radius:2px; }
-        QSlider::handle:horizontal { width:12px; margin:-5px 0; background:#2D6FF7; border-radius:6px; }
+        QSlider::groove:horizontal { height:4px; background:#304251; border-radius:2px; }
+        QSlider::handle:horizontal { width:12px; margin:-5px 0; background:#B8CEE0; border-radius:6px; }
         QSlider::sub-page:horizontal { background:#3B79FF; border-radius:2px; }
     )QSS");
 
@@ -2011,7 +2059,7 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
     // ---- header ----
     auto* header=new QWidget; header->setObjectName("expHeader"); header->setFixedHeight(48);
     { auto* h=new QHBoxLayout(header); h->setContentsMargins(16,0,10,0); h->setSpacing(10);
-      auto* dot=new QLabel; dot->setFixedSize(9,9); dot->setStyleSheet("background:#2D6FF7;border-radius:2px;");
+      auto* dot=new QLabel; dot->setFixedSize(9,9); dot->setStyleSheet("background:#B8CEE0;border-radius:2px;");
       auto* title=new QLabel("Export bitmap"); title->setObjectName("expTitle");
       auto* doc=new QLabel(QFileInfo(initialPath).fileName()); doc->setObjectName("expDoc");
       auto* close=new QToolButton; close->setObjectName("expClose"); close->setText("✕"); close->setCursor(Qt::PointingHandCursor);
@@ -2025,12 +2073,12 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
 
     // preview column
     auto* prevCol=new QWidget; auto* prevV=new QVBoxLayout(prevCol); prevV->setContentsMargins(0,0,0,0); prevV->setSpacing(0);
-    prevCol->setStyleSheet("background:#0C0D10;");
-    auto* prevBar=new QWidget; prevBar->setFixedHeight(40); prevBar->setStyleSheet("background:#111318;border-bottom:1px solid rgba(255,255,255,0.06);");
+    prevCol->setStyleSheet("background:#07090B;");
+    auto* prevBar=new QWidget; prevBar->setFixedHeight(40); prevBar->setStyleSheet("background:#0D1216;border-bottom:1px solid rgba(255,255,255,0.06);");
     auto* pbH=new QHBoxLayout(prevBar); pbH->setContentsMargins(12,0,12,0); pbH->setSpacing(8);
     auto* preview=new ExportPreview;
     auto* readout=new QLabel; readout->setObjectName("expReadout");
-    auto* readBar=new QWidget; readBar->setFixedHeight(30); readBar->setStyleSheet("background:#111318;border-top:1px solid rgba(255,255,255,0.06);");
+    auto* readBar=new QWidget; readBar->setFixedHeight(30); readBar->setStyleSheet("background:#0D1216;border-top:1px solid rgba(255,255,255,0.06);");
     { auto* rh=new QHBoxLayout(readBar); rh->setContentsMargins(12,0,12,0); rh->addWidget(readout); rh->addStretch(); }
     prevV->addWidget(prevBar); prevV->addWidget(preview,1); prevV->addWidget(readBar);
     bodyH->addWidget(prevCol,1);
@@ -2407,8 +2455,8 @@ void MainWindow::pageSetup(){
 void MainWindow::about(){
     QMessageBox box(this); box.setWindowTitle("About XarQ"); box.setTextFormat(Qt::RichText);
     box.setIconPixmap(QIcon(":/xarq/assets/logo/xarq-mark.svg").pixmap(72,72));
-    box.setText("<b style='font-size:17px'><span style='color:#5488FF'>X</span>arQ</b><br>"
-        "<span style='color:#8B94A3'>Vector · photo · layout studio</span><br><br>"
+    box.setText("<b style='font-size:17px'><span style='color:#C8DBE9'>X</span>arQ</b><br>"
+        "<span style='color:#8EA6B9'>Vector · photo · layout studio</span><br><br>"
         "A modern Qt6 rebuild of Xara Xtreme — the <b>X</b> of Xara, the <b>Q</b> of Qt.<br>"
         "Renders through the open libGDraw / AGG rasteriser pipeline.<br>"
         "All classic Xara tools, reimagined.");
@@ -2425,23 +2473,23 @@ void MainWindow::updateTitle(){
 // status badge can sit truly CENTERED between the menus (left) and the Share/cloud controls (right),
 // exactly like ui_kits/editor. The real QMenuBar is embedded live, so all menus/shortcuts keep working.
 void MainWindow::buildTitleBar(){
-    // Frameless single-row chrome (38px): [ Save Export ] | (title ⇄ menu on hover) | XarQ v.. [ – ▢ ✕ ]
+    // Frameless single-row chrome, after Subtitld's (37px): [Save][Export⟋] (title ⇄ menu on hover) [⟍ XarQ v..][ – ▢ ✕ ]
     auto* bar=new DragBar([this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
-    bar->setObjectName("titleBar"); bar->setFixedHeight(38); m_titleBarW=bar;
+    bar->setObjectName("titleBar"); bar->setFixedHeight(37);
     auto* h=new QHBoxLayout(bar); h->setContentsMargins(0,0,0,0); h->setSpacing(0);
-    auto hair=[&]{ auto* d=new QFrame; d->setObjectName("titleHair"); d->setFixedSize(1,20); return d; };
 
-    // LEFT — quick actions (Save, Export)
-    auto* left=new QWidget; auto* lh=new QHBoxLayout(left); lh->setContentsMargins(10,0,10,0); lh->setSpacing(7);
-    m_saveBtn=new QToolButton; m_saveBtn->setObjectName("titleSave"); m_saveBtn->setFixedSize(30,30);
+    // LEFT — Save + Export, flush in the window's corner. Export's curved right side is the bar's signature.
+    m_saveBtn=new QToolButton; m_saveBtn->setObjectName("titleSave"); m_saveBtn->setFixedSize(50,36);
     m_saveBtn->setIconSize(QSize(16,16)); m_saveBtn->setCursor(Qt::PointingHandCursor);
     connect(m_saveBtn,&QToolButton::clicked,this,[this]{ saveFile(); });
-    m_exportBtn=new QToolButton; m_exportBtn->setObjectName("titleQuick"); m_exportBtn->setFixedSize(30,30);
-    m_exportBtn->setIcon(actionIcon("export",15,QColor(174,179,186))); m_exportBtn->setIconSize(QSize(16,16));
+    m_exportBtn=new QToolButton; m_exportBtn->setObjectName("titleExport"); m_exportBtn->setFixedSize(66,36);
+    m_exportBtn->setIcon(actionIcon("export",16,QColor(0x30,0x42,0x51))); m_exportBtn->setIconSize(QSize(16,16));
     m_exportBtn->setCursor(Qt::PointingHandCursor); m_exportBtn->setToolTip("Export…  Ctrl+E");
     connect(m_exportBtn,&QToolButton::clicked,this,[this]{ exportImage(); });
-    lh->addWidget(m_saveBtn); lh->addWidget(m_exportBtn);
-    h->addWidget(left,0,Qt::AlignVCenter); h->addWidget(hair(),0,Qt::AlignVCenter);
+    h->addWidget(m_saveBtn,0,Qt::AlignTop); h->addWidget(m_exportBtn,0,Qt::AlignTop);
+
+    auto* wave=new SaveWave(this);
+    m_playSaveWave=[this,wave]{ if(isVisible() && m_saveBtn) wave->play(m_saveBtn->mapTo(this,m_saveBtn->rect().center())); };
 
     // CENTER — document identity ⇄ menu bar (cross-fade on hover)
     auto* center=new QWidget; center->setObjectName("titleCenter");
@@ -2459,22 +2507,20 @@ void MainWindow::buildTitleBar(){
     m_docAnim=new QPropertyAnimation(m_docFx,"opacity",this); m_docAnim->setDuration(150); m_docAnim->setEasingCurve(QEasingCurve::OutCubic);
     m_menuAnim=new QPropertyAnimation(m_menuFx,"opacity",this); m_menuAnim->setDuration(150); m_menuAnim->setEasingCurve(QEasingCurve::OutCubic);
     new TitleCenterHover(center,[this](bool on){ setCenterHover(on); });
-    h->addWidget(center,1); h->addWidget(hair(),0,Qt::AlignVCenter);
+    h->addWidget(center,1);
 
-    // RIGHT — wordmark + version + window controls
-    auto* wm=new QWidget; auto* wmh=new QHBoxLayout(wm); wmh->setContentsMargins(14,0,8,0); wmh->setSpacing(6);
-    auto* word=new QLabel("<span style='color:#5488FF'>X</span>arQ"); word->setObjectName("brandWord"); word->setTextFormat(Qt::RichText);
-    auto* ver=new QLabel("v0.9"); ver->setObjectName("brandVer");
-    wmh->addWidget(word,0,Qt::AlignVCenter); wmh->addWidget(ver,0,Qt::AlignVCenter);
-    h->addWidget(wm,0,Qt::AlignVCenter);
-    auto mkWin=[&](const QString& glyph,const QString& obj,const QString& tip){
-        auto* b=new QToolButton; b->setObjectName(obj); b->setIcon(actionIcon(glyph,14,QColor(174,179,186))); b->setIconSize(QSize(15,15));
-        b->setFixedSize(46,38); b->setCursor(Qt::PointingHandCursor); b->setToolTip(tip); return b; };
-    m_minBtn  =mkWin("win-min","winBtn","Minimize");    connect(m_minBtn,&QToolButton::clicked,this,[this]{ showMinimized(); });
-    m_maxBtn  =mkWin("win-max","winBtn","Maximize");    connect(m_maxBtn,&QToolButton::clicked,this,[this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
-    m_closeBtn=mkWin("win-close","winClose","Close");   connect(m_closeBtn,&QToolButton::clicked,this,[this]{ close(); });
-    new HoverIconSwap(m_closeBtn, actionIcon("win-close",14,QColor(174,179,186)), actionIcon("win-close",14,QColor(255,255,255)));
-    h->addWidget(m_minBtn); h->addWidget(m_maxBtn); h->addWidget(m_closeBtn);
+    // RIGHT — mark + wordmark + version on a faint curved tab, then the window controls
+    auto* brand=new QLabel("<img src=':/xarq/assets/logo/xarq-mark.svg' width='14' height='14' style='vertical-align:middle'>"
+                           "&nbsp;&nbsp;<b>XarQ</b>&nbsp; v0.9");
+    brand->setObjectName("brandTab"); brand->setTextFormat(Qt::RichText); brand->setFixedHeight(36);
+    h->addWidget(brand,0,Qt::AlignRight|Qt::AlignTop);
+    auto mkWin=[&](const QString& glyph,const QString& tip){
+        auto* b=new QToolButton; b->setObjectName("winBtn"); b->setIcon(actionIcon(glyph,14,kWinGlyph)); b->setIconSize(QSize(15,15));
+        b->setFixedSize(46,32); b->setCursor(Qt::PointingHandCursor); b->setToolTip(tip); return b; };
+    m_minBtn  =mkWin("win-min","Minimize");    connect(m_minBtn,&QToolButton::clicked,this,[this]{ showMinimized(); });
+    m_maxBtn  =mkWin("win-max","Maximize");    connect(m_maxBtn,&QToolButton::clicked,this,[this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
+    m_closeBtn=mkWin("win-close","Close");     connect(m_closeBtn,&QToolButton::clicked,this,[this]{ close(); });
+    h->addWidget(m_minBtn,0,Qt::AlignTop); h->addWidget(m_maxBtn,0,Qt::AlignTop); h->addWidget(m_closeBtn,0,Qt::AlignTop);
 
     setMenuWidget(bar);
     updateMaxButtonIcon();
@@ -2489,7 +2535,7 @@ void MainWindow::setCenterHover(bool on){
 }
 void MainWindow::updateSaveButton(){
     if(!m_saveBtn) return;
-    m_saveBtn->setIcon(actionIcon("save",15, m_dirty?QColor(0x51,0xcf,0x66):QColor(174,179,186)));
+    m_saveBtn->setIcon(actionIcon("save",16, m_dirty?QColor(0x30,0x42,0x51):QColor(0xBF,0xD4,0xE4)));
     m_saveBtn->setToolTip(m_dirty? "Save — unsaved changes  Ctrl+S" : "Saved  Ctrl+S");
     m_saveBtn->setProperty("dirty", m_dirty);
     m_saveBtn->style()->unpolish(m_saveBtn); m_saveBtn->style()->polish(m_saveBtn);
@@ -2511,10 +2557,8 @@ void MainWindow::reelideTitle(){
 }
 void MainWindow::updateMaxButtonIcon(){
     if(m_maxBtn){ const bool mx=isMaximized();
-        m_maxBtn->setIcon(actionIcon(mx?"win-restore":"win-max",14,QColor(174,179,186)));
+        m_maxBtn->setIcon(actionIcon(mx?"win-restore":"win-max",14,kWinGlyph));
         m_maxBtn->setToolTip(mx?"Restore":"Maximize"); }
-    if(m_titleBarW){ m_titleBarW->setProperty("maxed", isMaximized());
-        m_titleBarW->style()->unpolish(m_titleBarW); m_titleBarW->style()->polish(m_titleBarW); }
 }
 void MainWindow::changeEvent(QEvent* e){
     QMainWindow::changeEvent(e);

@@ -13,5 +13,29 @@
     <file>assets/logo/xarq-mark-mono.svg</file>
     <file>assets/logo/favicon.svg</file>
     <file>assets/logo/tabclose.svg</file>
+    <file>assets/chrome/brand-tab.svg</file>
+    <file>assets/chrome/check-disabled.svg</file>
+    <file>assets/chrome/check-off-hover.svg</file>
+    <file>assets/chrome/check-off.svg</file>
+    <file>assets/chrome/check-on-hover.svg</file>
+    <file>assets/chrome/check-on.svg</file>
+    <file>assets/chrome/combo-arrow.svg</file>
+    <file>assets/chrome/export-hover.svg</file>
+    <file>assets/chrome/export-normal.svg</file>
+    <file>assets/chrome/export-pressed.svg</file>
+    <file>assets/chrome/groupbox.svg</file>
+    <file>assets/chrome/pill.svg</file>
+    <file>assets/chrome/save-hover.svg</file>
+    <file>assets/chrome/save-normal.svg</file>
+    <file>assets/chrome/save-pressed.svg</file>
+    <file>assets/chrome/save-unsaved-hover.svg</file>
+    <file>assets/chrome/save-unsaved-normal.svg</file>
+    <file>assets/chrome/save-unsaved-pressed.svg</file>
+    <file>assets/chrome/spin-down.svg</file>
+    <file>assets/chrome/spin-up.svg</file>
+    <file>assets/chrome/tab-hover.svg</file>
+    <file>assets/chrome/tab-normal.svg</file>
+    <file>assets/chrome/tab-selected.svg</file>
+    <file>assets/chrome/tooltag.svg</file>
   </qresource>
 </RCC>

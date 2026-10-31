@@ -4441,7 +4441,7 @@ void Canvas::paintEvent(QPaintEvent*) {
     if (m_previewZoom && !m_screenCache.isNull() && m_screenCache.size()==dev
         && m_cacheKey.xf != viewXf() && m_cacheKey.xf.isInvertible()) {   // only if there's an actual zoom delta to preview
         QPainter g(this);
-        g.fillRect(rect(), QColor(0x2A,0x2D,0x34));                       // pasteboard fill for areas the scaled bitmap doesn't cover
+        g.fillRect(rect(), QColor(0x10,0x16,0x1B));                       // pasteboard fill for areas the scaled bitmap doesn't cover
         g.setRenderHint(QPainter::SmoothPixmapTransform, true);
         g.setTransform(m_cacheKey.xf.inverted() * viewXf());             // cached (rendered-view) pixels → current view
         g.drawImage(0, 0, m_screenCache);
@@ -4472,9 +4472,9 @@ void Canvas::paintEvent(QPaintEvent*) {
 
 // Background + page(s) + grid + the document content layer: the expensive part, rendered into the cache.
 void Canvas::paintBackdrop(QPainter& g) {
-    // XarQ grad-canvas: a soft radial from the top-centre so the pasteboard reads as machined graphite.
-    { const QRectF r=rect(); QRadialGradient cbg(QPointF(r.center().x(), r.top()), r.height()*1.25);
-      cbg.setColorAt(0.0, QColor(0x32,0x36,0x3E)); cbg.setColorAt(1.0, QColor(0x22,0x25,0x2B));
+    // The pasteboard is Subtitld's window gradient, so the artwork sits where its video does.
+    { const QRectF r=rect(); QLinearGradient cbg(r.topLeft(), r.bottomLeft());
+      cbg.setColorAt(0.0, QColor(0x07,0x09,0x0B)); cbg.setColorAt(1.0, QColor(0x1A,0x23,0x2B));
       g.fillRect(r, cbg); }
 
     // page(s) — stacked vertically on the pasteboard. The artboard rect spans all pages.
@@ -4675,7 +4675,7 @@ bool Canvas::indentMarkerX(int which, double& viewX) const {
 void Canvas::drawRulers(QPainter& g) {
     if (!m_showRulers) return;
     const int W=width(), H=height();
-    const QColor bg(34,36,42), tick(120,125,135), txt(150,155,165), curCol(74,144,226);
+    const QColor bg(0x14,0x1C,0x23), tick(0x56,0x6F,0x84), txt(0x8E,0xA6,0xB9), curCol(0xB8,0xCE,0xE0);
     g.setRenderHint(QPainter::Antialiasing,false);
     g.setPen(Qt::NoPen); g.setBrush(bg);
     g.drawRect(QRectF(0,0,W,kRuler)); g.drawRect(QRectF(0,0,kRuler,H));
