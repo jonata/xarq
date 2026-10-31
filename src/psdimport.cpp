@@ -359,6 +359,7 @@ struct Lay {
     QByteArray blend, sectBlend;
     int opacity = 255, fillOpacity = 255, section = 0;
     bool clipping = false, visible = true;
+    int blendIf[8] = { 0, 0, 255, 255, 0, 0, 255, 255 };   // composite grey: this layer's range, then the backdrop's
     QString name;
     QHash<QByteArray, Span> blocks;
     QRect maskRect; int maskDefault = 0; bool maskOff = false; double maskDensity = 1.0, vecDensity = 1.0, maskFeather = 0.0, vecFeather = 0.0;
@@ -438,7 +439,9 @@ bool readLayerInfo(const Rd& r, qint64 o, qint64 end, bool psb, int depth, const
             }
         }
         q += qMax<qint64>(0, ml);
-        const qint64 br = r.u32(q); q += 4 + qMax<qint64>(0, br);
+        const qint64 br = r.u32(q);
+        if(br >= 8) for(int k = 0; k < 8; ++k) L.blendIf[k] = r.u8(q + 4 + k);
+        q += 4 + qMax<qint64>(0, br);
         const int nl = r.u8(q);
         L.name = QString::fromLatin1(r.d.mid(q + 1, nl));
         q += ((nl + 1 + 3) / 4) * 4;
@@ -609,29 +612,27 @@ QString pathD(const QPainterPath& p){
 }
 
 // ---------------------------------------------------------------- vector masks
-// 26-byte records: positions are 8.24 fixed fractions of the document, y first.
-QPainterPath readVectorPath(const Rd& r, const Span& s, int W, int H, bool* disabled, bool* inverted){
+// 26-byte records: positions are 8.24 fixed fractions of the document, y first. Each subpath's length record
+// holds its operation (0 exclude, 1 combine, 2 subtract, 3 intersect, -1 continues the one before) and its
+// fill rule (2 non-zero, else even-odd). A path that opens by subtracting starts from the whole canvas.
+QPainterPath readVectorPath(const Rd& r, const Span& s, int W, int H, bool* disabled, bool* inverted, int* firstOp = nullptr){
     if(s.len < 8) return {};
     const quint32 flags = quint32(r.u32(s.o + 4));
     if(disabled) *disabled = flags & 4;
     if(inverted) *inverted = flags & 1;
-    QPainterPath result; result.setFillRule(Qt::WindingFill);
-    QVector<QPointF> ctrl; bool closed = false; int pending = 0, op = 1;
-    bool first = true;
+    struct Comp { int op; QPainterPath path; };
+    QVector<Comp> comps;
+    QVector<QPointF> ctrl; bool closed = false; int pending = 0, op = 1; Qt::FillRule rule = Qt::OddEvenFill;
     auto pt = [&](qint64 o){ return QPointF(r.i32(o + 4) / 16777216.0 * W, r.i32(o) / 16777216.0 * H); };
-    QPainterPath sub;
     auto flushSub = [&]{
         if(ctrl.size() < 3){ ctrl.clear(); return; }
         const int n = ctrl.size() / 3;
-        sub = QPainterPath(); sub.setFillRule(Qt::WindingFill);
+        QPainterPath sub;
         sub.moveTo(ctrl[1]);
         for(int i = 1; i < n; ++i) sub.cubicTo(ctrl[(i-1)*3+2], ctrl[i*3], ctrl[i*3+1]);
         if(closed){ sub.cubicTo(ctrl[(n-1)*3+2], ctrl[0], ctrl[1]); sub.closeSubpath(); }
-        if(first){ result = sub; first = false; }
-        else if(op == 2) result = result.subtracted(sub);
-        else if(op == 3) result = result.intersected(sub);
-        else if(op == 0){ const QPainterPath both = result.intersected(sub); result = result.united(sub).subtracted(both); }
-        else { result.addPath(sub); }
+        if(op < 0 && !comps.isEmpty()) comps.last().path.addPath(sub);
+        else { sub.setFillRule(rule); comps.push_back({ op < 0 ? 1 : op, sub }); }
         ctrl.clear();
     };
     const qint64 end = s.o + s.len;
@@ -641,13 +642,26 @@ QPainterPath readVectorPath(const Rd& r, const Span& s, int W, int H, bool* disa
             flushSub();
             closed = sel == 0;
             pending = r.u16(o + 2);
-            const int nextOp = r.i16(o + 4);
-            op = nextOp < 0 ? 1 : nextOp;
+            op = r.i16(o + 4);
+            rule = r.u16(o + 6) == 2 ? Qt::WindingFill : Qt::OddEvenFill;
         } else if(sel == 1 || sel == 2 || sel == 4 || sel == 5){
             if(pending > 0 && ctrl.size() < 3000000){ ctrl << pt(o + 2) << pt(o + 10) << pt(o + 18); --pending; }
         }
     }
     flushSub();
+    if(comps.isEmpty()) return {};
+    if(firstOp) *firstOp = comps.first().op;
+    if(comps.size() == 1 && comps.first().op != 2) return comps.first().path;
+    QPainterPath result;
+    if(comps.first().op == 2){ result.addRect(0, 0, W, H); result = result.subtracted(comps.first().path); }
+    else result = comps.first().path;
+    for(int i = 1; i < comps.size() && i < 4096; ++i){
+        const QPainterPath& c = comps[i].path;
+        if(comps[i].op == 2) result = result.subtracted(c);
+        else if(comps[i].op == 3) result = result.intersected(c);
+        else if(comps[i].op == 0){ const QPainterPath both = result.intersected(c); result = result.united(c).subtracted(both); }
+        else result = result.united(c);
+    }
     return result;
 }
 
@@ -1250,6 +1264,37 @@ void adjustShapes(QVector<Shape>& list, const Adjustment& adj, const QImage* mas
         if(s.stroke.enabled && !mask){ const QColor c = s.stroke.color; s.stroke.color = QColor::fromRgba((lerpTo(c.rgba(), fn(c.rgba()), 255) & 0xffffffu) | (uint(c.alpha()) << 24)); }
     }
 }
+// Removes coverage from objects: what a knockout does to everything beneath it.
+void cutUnder(QVector<Shape>& list, const QImage& cov, const QRect& area, bool keepFirst){
+    for(int i = 0; i < list.size(); ++i){
+        Shape& s = list[i];
+        if(keepFirst && i == 0) continue;
+        if(s.type == ShapeType::Group){ cutUnder(s.children, cov, area, false); continue; }
+        if(!isPixelShape(s)){
+            const QRect a = s.docBounds().toAlignedRect();
+            if(a.isEmpty() || qint64(a.width()) * a.height() > 40000000) continue;
+            Shape flat = s; flat.opacity = 1.0; flat.blend = QPainter::CompositionMode_SourceOver; flat.transp = Transparency(); flat.visible = true;
+            Shape b = bitmapShape(coverageOf(flat, a).convertToFormat(QImage::Format_ARGB32), a.left(), a.top(), s.name);
+            b.opacity = s.opacity; b.blend = s.blend; b.transp = s.transp; b.visible = s.visible;
+            s = b;
+        }
+        QImage img = s.fill.image.convertToFormat(QImage::Format_ARGB32);
+        const int ox = int(s.transform.dx()), oy = int(s.transform.dy());
+        for(int y = 0; y < img.height(); ++y){
+            QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            const int cy = y + oy - area.top();
+            const QRgb* c = (cy >= 0 && cy < area.height()) ? reinterpret_cast<const QRgb*>(cov.constScanLine(cy)) : nullptr;
+            if(!c) continue;
+            for(int x = 0; x < img.width(); ++x){
+                const int cx = x + ox - area.left();
+                if(cx >= 0 && cx < area.width()) row[x] = (row[x] & 0xffffffu) | (uint(qAlpha(row[x]) * (255 - qAlpha(c[cx])) / 255) << 24);
+            }
+        }
+        s.fill.image = img;
+        if(s.fill.origImage.size() != img.size() || s.fill.origImage.cacheKey() == img.cacheKey()) s.fill.origImage = img;
+    }
+}
+
 // Photoshop's stored CMYK was only needed while adjustments ran; afterwards the original is the picture.
 void dropNative(QVector<Shape>& list){
     for(Shape& s : list){
@@ -1529,7 +1574,8 @@ void buildEffects(const Val& fx, double globalAngle, const QImage& coverage, con
         const double reachOut = st == "InsF" ? 0.0 : st == "CtrF" ? sz / 2.0 : sz, reachIn = st == "OutF" ? 0.0 : st == "CtrF" ? sz / 2.0 : sz;
         for(qint64 i = 0; i < o.size(); ++i){
             const double sd = outD[i] > 0 ? outD[i] : -inD[i];
-            float v = sd >= 0 ? float(qBound(0.0, reachOut - sd + 0.5, 1.0)) : float(qBound(0.0, reachIn + sd + 0.5, 1.0));
+            // Distances run between pixel centres, so a pixel exactly at the reach is fully inside the stroke.
+            float v = sd >= 0 ? float(qBound(0.0, reachOut - sd + 1.0, 1.0)) : float(qBound(0.0, reachIn + sd + 1.0, 1.0));
             if(reachOut <= 0.0 && sd >= 0) v = 0.f;
             if(reachIn <= 0.0 && sd < 0) v = 0.f;
             o[i] = v;
@@ -1637,6 +1683,7 @@ QString textSvg(const Rd& r, const Span& s){
     if(const Val* rend = eng->get("Rendered")) if(const Val* sh = rend->get("Shapes")) if(const Val* ch = sh->get("Children")) if(!ch->list.isEmpty()){
         if(const Val* cook = ch->list[0].get("Cookie")) if(const Val* ph = cook->get("Photoshop")){
             box = ph->n("ShapeType") == 1;
+            if(ph->n("ShapeType") > 1) return {};          // on a path: no flat layout can stand in for it
             if(const Val* bb = ph->get("BoxBounds")) if(bb->list.size() >= 4){ boxLeft = bb->list[0].num; boxTop = bb->list[1].num; boxW = bb->list[2].num - bb->list[0].num; }
         }
     }
@@ -1771,13 +1818,14 @@ struct Builder {
     }
 
     // Shape and fill layers: real geometry with the layer's own fill and stroke.
-    QVector<Shape> vectorLayer(const Lay& L, bool& handled, bool& needVecMask) const {
+    // With solidProbe, the opaque silhouette a layer effect sees: its outline however its fill is painted.
+    QVector<Shape> vectorLayer(const Lay& L, bool& handled, bool& needVecMask, bool solidProbe = false) const {
         handled = false; needVecMask = false;
         const FillSrc fs = fillSource(L);
         if(!fs.ok && !L.blocks.contains("vstk")) return {};
         Span vm = L.blocks.value("vmsk"); if(!vm.len) vm = L.blocks.value("vsms");
-        bool disabled = false, inverted = false;
-        QPainterPath path = vm.len ? readVectorPath(r, vm, W, H, &disabled, &inverted) : QPainterPath();
+        bool disabled = false, inverted = false; int firstOp = 1;
+        QPainterPath path = vm.len ? readVectorPath(r, vm, W, H, &disabled, &inverted, &firstOp) : QPainterPath();
         const bool soft = !path.isEmpty() && !disabled && (L.vecDensity < 0.999 || L.vecFeather > 0.0);
         if(path.isEmpty() || disabled || inverted || soft){
             QPainterPath full; full.addRect(0, 0, W, H);
@@ -1792,11 +1840,14 @@ struct Builder {
             stroke = descAt(L.blocks["vstk"], 4);
             hasStroke = stroke.n("strokeEnabled", 1) != 0;
             fillOn = stroke.n("fillEnabled", 1) != 0;
+            // Measured: a path that opens by subtracting or intersecting shows no stroke of its own.
+            if(firstOp == 2 || firstOp == 3) hasStroke = false;
         }
-        if(!fillOn || !fs.ok) a = QStringLiteral(" fill=\"none\"");
+        if(solidProbe) a = QStringLiteral(" fill=\"#000000\"");
+        else if(!fillOn || !fs.ok) a = QStringLiteral(" fill=\"none\"");
         else { a = fillAttrs(fs, path, defs); if(a.isEmpty()) return {}; }
         const double fop = L.fillOpacity / 255.0;
-        if(fop < 0.999) a += QStringLiteral(" fill-opacity=\"%1\"").arg(fn(fop));
+        if(fop < 0.999 && !solidProbe) a += QStringLiteral(" fill-opacity=\"%1\"").arg(fn(fop));
         QString body = QStringLiteral("<path d=\"%1\" fill-rule=\"%2\"%3/>").arg(pathD(path), path.fillRule() == Qt::OddEvenFill ? QStringLiteral("evenodd") : QStringLiteral("nonzero"), a);
         if(hasStroke){
             const double w = qMax(0.0, stroke.n("strokeStyleLineWidth", 1.0));
@@ -1962,7 +2013,9 @@ struct Builder {
 };
 
 const Val* effectsOf(const Rd& r, const Lay& L, Val& storage){
+    // Three keys, by age; lmfx is the one that can hold several of an effect.
     Span s = L.blocks.value("lmfx");
+    if(!s.len) s = L.blocks.value("lfxs");
     if(!s.len) s = L.blocks.value("lfx2");
     if(s.len < 8) return nullptr;
     DescReader d(r.d, s.o + 8, s.o + s.len);
@@ -2130,6 +2183,62 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
         return s;
     };
 
+    // A deep knockout stops at a true background layer: the bottom one, with no transparency of its own.
+    const bool bottomIsBackground = !lays.isEmpty() && std::none_of(lays[0].chans.begin(), lays[0].chans.end(), [](const LChan& c){ return c.id == -1; });
+    // Takes a pixel layer's layer effects, and returns the group holding it and them.
+    auto withEffects = [&](Shape layer, const Lay& L)->Shape {
+        Val fxStore;
+        const Val* fx = effectsOf(r, L, fxStore);
+        if(!fx) return layer;
+        const QRectF bb = layer.docBounds();
+        const int margin = 64;
+        const QRect area = bb.toAlignedRect().adjusted(-margin, -margin, margin, margin).intersected(QRect(-margin, -margin, W + margin * 2, H + margin * 2));
+        if(area.isEmpty() || qint64(area.width()) * area.height() > 40000000) return layer;
+        // Effects see the layer's outline: not its fill opacity or how its fill is painted, nor a mask on a shape.
+        Shape probe = layer;
+        bool h = false, pend = false;
+        const QVector<Shape> solid = B.vectorLayer(L, h, pend, true);
+        if(h && !solid.isEmpty()){
+            if(solid.size() == 1) probe = solid[0];
+            else { probe = Shape(); probe.type = ShapeType::Group; probe.children = solid; }
+        } else if(L.fillOpacity < 255 && !L.pix.isNull()){
+            Lay full = L; full.fillOpacity = 255;
+            Builder quiet = B; quiet.stats = nullptr;
+            const QVector<Shape> again = quiet.leaf(full);
+            if(again.size() == 1) probe = again[0];
+            else if(!again.isEmpty()){ probe = Shape(); probe.type = ShapeType::Group; probe.children = again; }
+        }
+        probe.opacity = 1.0; probe.blend = QPainter::CompositionMode_SourceOver; probe.transp = Transparency(); probe.visible = true;
+        FxOut fo;
+        buildEffects(*fx, globalAngle, coverageOf(probe, area), area.topLeft(), bb.toAlignedRect(), L.name, B.patterns, fo);
+        // "Blend interior effects as group": then fill opacity does reach the interior ones.
+        if(L.fillOpacity < 255 && L.blocks.contains("infx") && r.u8(L.blocks["infx"].o) != 0)
+            for(Shape& os : fo.over) if(!os.name.endsWith(QLatin1String("(stroke)"))) os.opacity *= L.fillOpacity / 255.0;
+        if(fo.under.isEmpty() && fo.over.isEmpty()) return layer;
+        Shape g; g.type = ShapeType::Group; g.name = L.name; g.visible = L.visible;
+        g.opacity = layer.opacity; layer.opacity = 1.0;
+        g.isolate = g.opacity < 0.999;
+        g.children = fo.under; layer.visible = true; g.children.push_back(layer); g.children += fo.over;
+        if(stats) ++stats->effectLayers;
+        return g;
+    };
+
+    // Knockout: the layer punches through what lies beneath it, to the bottom of its group (shallow) or down to
+    // the background (deep), and its fill opacity then says how much of itself remains.
+    auto applyKnockout = [&](const Shape& layer, const Lay& L){
+        const int knock = L.blocks.contains("knko") ? r.u8(L.blocks["knko"].o) : 0;
+        if(knock != 1 && knock != 2) return;
+        Shape flat = layer; flat.opacity = 1.0; flat.visible = true; flat.blend = QPainter::CompositionMode_SourceOver; flat.transp = Transparency(); flat.isolate = false;
+        bool h = false, pend = false;
+        const QVector<Shape> solid = B.vectorLayer(L, h, pend, true);
+        if(h && !solid.isEmpty()){ flat = solid[0]; if(solid.size() > 1){ flat = Shape(); flat.type = ShapeType::Group; flat.children = solid; } }
+        const QRect area(0, 0, W, H);
+        const QImage cov = coverageOf(flat, area);
+        if(cov.isNull()) return;
+        if(knock == 1) cutUnder(stack.last().shapes, cov, area, false);
+        else for(int i = 0; i < stack.size(); ++i) cutUnder(stack[i].shapes, cov, area, i == 0 && bottomIsBackground);
+    };
+
     // Records run bottom layer first: a divider opens a group, the folder record closes it.
     for(int li = 0; li < lays.size(); ++li){
         Lay& L = lays[li];
@@ -2154,7 +2263,8 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
             const QByteArray bm = L.sectBlend.isEmpty() ? L.blend : L.sectBlend;
             // Fill below 100 % stops a group passing through: Photoshop composites it as a unit.
             const bool pass = bm == "pass" && L.fillOpacity == 255;
-            if(sc.shapes.isEmpty()) continue;
+            const bool board = L.blocks.contains("artb") || L.blocks.contains("artd") || L.blocks.contains("abdd");
+            if(sc.shapes.isEmpty() && !board) continue;
             Shape g; g.type = ShapeType::Group; g.name = L.name; g.children = sc.shapes; g.visible = L.visible;
             g.opacity = L.opacity / 255.0 * L.fillOpacity / 255.0;
             // A pass-through group's opacity simply reaches each child; only a real group is composited whole.
@@ -2167,7 +2277,7 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
                 if(rc && bt != 3){
                     const QRectF rr(QPointF(rc->n("Left"), rc->n("Top")), QPointF(rc->n("Rght"), rc->n("Btom")));
                     QPainterPath clipTo; clipTo.addRect(rr);
-                    g.regionPath = clipTo; g.isolate = true;
+                    g.regionPath = clipTo; g.isolate = !g.children.isEmpty();
                     const QColor bc = bt == 2 ? QColor(Qt::black) : bt == 1 ? QColor(Qt::white) : colorOf(v.get("Clr"));
                     QPainterPath pp; pp.addRect(rr);
                     QVector<Shape> bg = B.fromSvg(QStringLiteral("<path d=\"%1\" fill=\"%2\"/>").arg(pathD(pp), hx(bc)));
@@ -2179,6 +2289,9 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
             Span vm = L.blocks.value("vmsk"); if(!vm.len) vm = L.blocks.value("vsms");
             if(vm.len){ bool off = false, inv = false; QPainterPath p = readVectorPath(r, vm, W, H, &off, &inv); if(!off && !inv && !p.isEmpty() && L.vecDensity >= 0.999 && L.vecFeather <= 0.0){ g.regionPath = p; g.isolate = true; } }
             Scope& parent = stack.last();
+            if(g.children.isEmpty()) continue;
+            g = withEffects(g, L);
+            applyKnockout(g, L);
             if(L.clipping && parent.baseIndex >= 0) parent.shapes.push_back(addClipped(parent.shapes, g, parent.baseIndex));
             else { parent.shapes.push_back(g); parent.baseIndex = parent.shapes.size() - 1; parent.baseIsAdjustment = false; }
             if(stats) ++stats->groups;
@@ -2233,37 +2346,52 @@ Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
         applyBlend(layer, L.blend);
         if(layer.type == ShapeType::Group && (layer.opacity < 0.999 || L.blend != "norm")) layer.isolate = true;
 
-        Val fxStore;
-        if(const Val* fx = effectsOf(r, L, fxStore)){
-            QRectF bb = layer.docBounds();
-            const int margin = 64;
-            QRect area = bb.toAlignedRect().adjusted(-margin, -margin, margin, margin).intersected(QRect(-margin, -margin, W + margin * 2, H + margin * 2));
+        layer = withEffects(layer, L);
+
+        // Blend If and Dissolve decide pixel by pixel, so such a layer becomes pixels.
+        const bool blendIf = L.blendIf[0] != 0 || L.blendIf[1] != 0 || L.blendIf[2] != 255 || L.blendIf[3] != 255 || L.blendIf[4] != 0 || L.blendIf[5] != 0 || L.blendIf[6] != 255 || L.blendIf[7] != 255;
+        if(blendIf || L.blend == "diss"){
+            const QRect area = layer.docBounds().toAlignedRect().intersected(QRect(-W, -H, W * 3, H * 3));
             if(!area.isEmpty() && qint64(area.width()) * area.height() <= 40000000){
-                // Fill opacity thins the layer's own content but not its effects, so they need the full shape.
-                Shape probe = layer;
-                if(L.fillOpacity < 255){
-                    Lay full = L; full.fillOpacity = 255;
-                    Builder quiet = B; quiet.stats = nullptr;
-                    const QVector<Shape> again = quiet.leaf(full);
-                    if(again.size() == 1) probe = again[0];
-                    else if(!again.isEmpty()){ probe.children = again; probe.type = ShapeType::Group; }
+                const bool diss = L.blend == "diss";
+                Shape flat = layer; flat.visible = true; flat.blend = QPainter::CompositionMode_SourceOver; flat.transp = Transparency();
+                if(!diss) flat.opacity = 1.0;
+                QImage img = coverageOf(flat, area).convertToFormat(QImage::Format_ARGB32);
+                QImage under;
+                if(blendIf){
+                    under = QImage(area.size(), QImage::Format_ARGB32_Premultiplied); under.fill(Qt::white);
+                    QPainter g(&under); g.setRenderHint(QPainter::Antialiasing); g.translate(-area.topLeft());
+                    for(const Scope& sc : stack) for(const Shape& below : sc.shapes) paintShape(g, below);
                 }
-                probe.opacity = 1.0; probe.blend = QPainter::CompositionMode_SourceOver; probe.transp = Transparency(); probe.visible = true;
-                FxOut fo;
-                buildEffects(*fx, globalAngle, coverageOf(probe, area), area.topLeft(), bb.toAlignedRect(), L.name, B.patterns, fo);
-                // "Blend interior effects as group": then fill opacity does reach the interior ones.
-                if(L.fillOpacity < 255 && L.blocks.contains("infx") && r.u8(L.blocks["infx"].o) != 0)
-                    for(Shape& os : fo.over) if(!os.name.endsWith(QLatin1String("(stroke)"))) os.opacity *= L.fillOpacity / 255.0;
-                if(!fo.under.isEmpty() || !fo.over.isEmpty()){
-                    Shape g; g.type = ShapeType::Group; g.name = L.name; g.visible = L.visible;
-                    g.opacity = layer.opacity; layer.opacity = 1.0;
-                    g.isolate = g.opacity < 0.999;
-                    g.children = fo.under; layer.visible = true; g.children.push_back(layer); g.children += fo.over;
-                    layer = g;
-                    if(stats) ++stats->effectLayers;
+                auto ramp = [](int v, const int* q){
+                    if(v < q[0]) return 0.0;
+                    if(v < q[1]) return double(v - q[0]) / qMax(1, q[1] - q[0]);
+                    if(v <= q[2]) return 1.0;
+                    if(v < q[3]) return double(q[3] - v) / qMax(1, q[3] - q[2]);
+                    return 0.0;
+                };
+                for(int y = 0; y < img.height(); ++y){
+                    QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+                    const QRgb* u = under.isNull() ? nullptr : reinterpret_cast<const QRgb*>(under.constScanLine(y));
+                    for(int x = 0; x < img.width(); ++x){
+                        double a = qAlpha(row[x]) / 255.0;
+                        if(blendIf){
+                            a *= ramp(qGray(row[x]), L.blendIf);
+                            if(u) a *= ramp(qGray(u[x]), L.blendIf + 4);
+                        }
+                        // Photoshop's noise belongs to the pixel's position, so the holes of stacked layers coincide.
+                        if(diss){ quint32 h = quint32(x + area.left()) * 73856093u ^ quint32(y + area.top()) * 19349663u; h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15; a = (h & 0xffff) / 65535.0 < a ? 1.0 : 0.0; }
+                        row[x] = (row[x] & 0xffffffu) | (uint(a * 255.0 + 0.5) << 24);
+                    }
                 }
+                Shape b = bitmapShape(img, area.left(), area.top(), layer.name);
+                b.visible = layer.visible; b.opacity = diss ? 1.0 : layer.opacity;
+                if(!diss){ b.blend = layer.blend; b.transp = layer.transp; }
+                layer = b;
             }
         }
+
+        applyKnockout(layer, L);
         Scope& top = stack.last();
         if(L.clipping && top.baseIndex >= 0) top.shapes.push_back(addClipped(top.shapes, layer, top.baseIndex));
         else { top.shapes.push_back(layer); top.baseIndex = top.shapes.size() - 1; top.baseIsAdjustment = false; }

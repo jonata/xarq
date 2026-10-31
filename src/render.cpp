@@ -1264,6 +1264,15 @@ static void hslBlend(int type, double& br,double& bg,double& bb, double sr,doubl
     else if(type==16){ double L=hslLum(br,bg,bb),S=hslSat(sr,sg,sb); hslSetSat(br,bg,bb,S); hslSetLum(br,bg,bb,L); } // Saturation
     else { double L=hslLum(br,bg,bb),S=hslSat(br,bg,bb); br=sr;bg=sg;bb=sb; hslSetSat(br,bg,bb,S); hslSetLum(br,bg,bb,L); } // Hue
 }
+// A per-pixel blend over a backdrop that isn't opaque. A blend only applies where there is something to blend
+// with: over nothing the source shows as itself, and the result gains the source's coverage.
+static QRgb hslOverPartial(QRgb back, QRgb src, double rr, double rg, double rb, double a){
+    const double ab=qAlpha(back)/255.0, ao=a+ab*(1.0-a);
+    if(ao<=0.0) return back;
+    auto mix=[&](double cb,double cs,double blended){ const double c=((1.0-a)*ab*cb + a*((1.0-ab)*cs + ab*blended))/ao; return qBound(0,int(c*255.0+0.5),255); };
+    return qRgba(mix(qRed(back)/255.0,qRed(src)/255.0,rr), mix(qGreen(back)/255.0,qGreen(src)/255.0,rg), mix(qBlue(back)/255.0,qBlue(src)/255.0,rb), qBound(0,int(ao*255.0+0.5),255));
+}
+
 // An already rendered buffer through a per-pixel blend mode. Needs the backdrop, so only when painting to an image.
 static void compositeHsl(QPainter& g, const QImage& srcIn, const QRect& devB0, int type, double strength){
     QPaintDevice* dev = g.device();
@@ -1278,6 +1287,8 @@ static void compositeHsl(QPainter& g, const QImage& srcIn, const QRect& devB0, i
             const double br=qRed(bR[x])/255.0, bg=qGreen(bR[x])/255.0, bb=qBlue(bR[x])/255.0;
             double rr=br,rg=bg,rb=bb; hslBlend(type, rr,rg,rb, qRed(sR[x])/255.0,qGreen(sR[x])/255.0,qBlue(sR[x])/255.0);
             const double a=(sa/255.0)*strength;
+            const int ba=qAlpha(bR[x]);
+            if(ba<255){ bR[x]=hslOverPartial(bR[x],sR[x],rr,rg,rb,a); continue; }
             bR[x]=qRgba(qBound(0,int((br+(rr-br)*a)*255+0.5),255),qBound(0,int((bg+(rg-bg)*a)*255+0.5),255),qBound(0,int((bb+(rb-bb)*a)*255+0.5),255),qAlpha(bR[x])); } }
     g.save(); g.resetTransform(); g.setClipping(false); g.setOpacity(1.0);
     g.setCompositionMode(QPainter::CompositionMode_Source);
@@ -1289,6 +1300,7 @@ static void compositeHsl(QPainter& g, const QImage& srcIn, const QRect& devB0, i
 static void paintHslBlend(QPainter& g, const Shape& s){
     Shape s2=s; s2.transp=Transparency(); s2.shadow.on=s2.extrude.on=s2.contour.on=false;   // under-effects at full extent (paintShape)
     const QRectF docB=s.docBounds(); if(docB.isEmpty()){ paintShape(g,s2); return; }
+    s2.opacity=1.0;      // the opacity is applied once, in the blend's strength below
     const QTransform xf=g.transform();
     QRect devB = xf.mapRect(docB).toRect().adjusted(-1,-1,1,1);
     QPaintDevice* dev=g.device();
@@ -1306,6 +1318,7 @@ static void paintHslBlend(QPainter& g, const Shape& s){
             double br=qRed(bR[x])/255.0, bg=qGreen(bR[x])/255.0, bb=qBlue(bR[x])/255.0;
             double rr=br,rg=bg,rb=bb; hslBlend(s.transp.type, rr,rg,rb, qRed(sR[x])/255.0,qGreen(sR[x])/255.0,qBlue(sR[x])/255.0);
             double a=(sa/255.0)*strength;
+            if(qAlpha(bR[x])<255){ bR[x]=hslOverPartial(bR[x],sR[x],rr,rg,rb,a); continue; }
             int R=(int)((br+(rr-br)*a)*255+0.5), G=(int)((bg+(rg-bg)*a)*255+0.5), B=(int)((bb+(rb-bb)*a)*255+0.5);
             bR[x]=qRgba(qBound(0,R,255),qBound(0,G,255),qBound(0,B,255),qAlpha(bR[x])); } }
     g.save(); g.resetTransform(); g.setClipping(false); g.setOpacity(1.0);

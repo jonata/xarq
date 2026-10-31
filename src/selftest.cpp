@@ -10539,6 +10539,27 @@ check(RasterExtra::decodeData(QByteArray("P7 332\n4 4 255\n")+QByteArray(3,'\0')
       be16(b,2); be16(b,0); be16(b,0); be16(b,128); be16(b,255);
       check(near(adjusted(255,0,0,"curv",b),QColor(127,255,255),2), "PSD adjustments: channel curves apply before the composite"); }
 
+    { // Knockout: deep punches through what's beneath, and a true background (no alpha channel) stays.
+      L top=pix(0,0,2,2,0,0,255); { QByteArray v; v.append(char(2)); v.append(QByteArray(3,0)); top.extra=block("knko",v); }
+      const Document cut=importPsdDocument(psd(2,2,{pix(0,0,2,2,255,0,0),top}));
+      check(cut.shapes.size()==2 && qAlpha(cut.shapes[0].fill.image.pixel(0,0))==0, "PSD layers: a deep knockout removes what lies beneath");
+      L bg{0,0,2,2,{{0,plane(4,255)},{1,plane(4,0)},{2,plane(4,0)}},"norm","bg",{},{},255,false};
+      const Document kept=importPsdDocument(psd(2,2,{bg,top}));
+      check(kept.shapes.size()==2 && qAlpha(kept.shapes[0].fill.image.pixel(0,0))==255, "PSD layers: a deep knockout stops at the background"); }
+
+    { // Dissolve's noise belongs to the pixel's position: two layers share their holes.
+      const Document pd=importPsdDocument(psd(32,32,{pix(0,0,32,32,255,0,0,"diss",128),pix(0,0,32,32,0,255,0,"diss",128)}));
+      bool same=pd.shapes.size()==2, mixed=false, solid=false;
+      if(same) for(int y=0;y<32;++y) for(int x=0;x<32;++x){ const int a=qAlpha(pd.shapes[0].fill.image.pixel(x,y)), b=qAlpha(pd.shapes[1].fill.image.pixel(x,y)); if(a!=b) same=false; if(a==0) mixed=true; if(a==255) solid=true; }
+      check(same && mixed && solid, "PSD layers: dissolve punches the same hard-edged holes in stacked layers"); }
+
+    { // A per-pixel blend over nothing shows as itself, at its opacity once.
+      QImage bd(4,4,QImage::Format_ARGB32_Premultiplied); bd.fill(Qt::transparent);
+      Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,4,4); s.fill.type=FillType::Solid; s.fill.color=QColor(0,0,255); s.stroke.enabled=false; s.transp.type=45; s.opacity=0.5;
+      { QPainter g(&bd); paintShape(g,s); }
+      const QColor c=bd.pixelColor(1,1);
+      check(qAbs(c.alpha()-128)<=2 && c.blue()>=250 && c.red()<=2, "Blend modes: over transparency the source shows, with its opacity applied once"); }
+
     check(importPsdDocument(QByteArray("8BPSjunk")).shapes.isEmpty(), "PSD layers: a truncated header yields nothing");
 }
 
