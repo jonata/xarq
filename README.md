@@ -13,6 +13,11 @@ building.
 Built with **Qt6 Widgets + C++17** and rendered natively with **QPainter** —
 there is **no wxWidgets dependency**.
 
+## Download
+
+Alpha builds for Linux (AppImage) and Windows (installer or portable zip) are on the
+[Releases](https://github.com/jonata/xarq/releases) page.
+
 ## Build & run
 
 ```sh
