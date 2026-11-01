@@ -1,0 +1,43 @@
+name: Release
+
+# A release published on GitHub (Releases, Draft a new release, its tag created
+# with it): everything is built at that tag, its version taken from the tag
+# without the "v", and attached to the release. Its title and notes are kept. To
+# build without publishing, run build.yml instead.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: gh release upload "$TAG" artifacts/* --clobber --repo "$GITHUB_REPOSITORY"

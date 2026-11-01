@@ -1,0 +1,34 @@
+# Linked format libraries. GDAL is left out on purpose, as in apt-packages.txt.
+librevenge
+libcdr
+libwpg
+libvisio
+libfreehand
+libmspub
+libpagemaker
+libzmf
+libqxp
+libstaroffice
+libetonyek
+libmwaw
+jxrlib
+zstd
+gdcm
+openslide
+graphviz
+# Poppler's build (build-poppler.sh)
+freetype
+fontconfig
+libjpeg-turbo
+libpng
+libtiff
+# Loaded at runtime when present; bundle-windows.sh copies them in
+lcms2
+libraw
+openjpeg2
+libjxl
+djvulibre
+jbig2dec
+qrencode
+libarchive
+libmobi

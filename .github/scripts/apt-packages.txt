@@ -1,0 +1,68 @@
+# What the AppImage builds with, on Ubuntu 24.04. GDAL is left out on purpose: it pulls in a large tree of
+# libraries, Ubuntu's own older Poppler among them.
+# Build tools and required libraries
+cmake
+g++
+pkg-config
+file
+wget
+qt6-base-dev
+qt6-svg-dev
+qt6-base-dev-tools
+qt6-wayland
+qmake6
+zlib1g-dev
+libharfbuzz-dev
+libgl1-mesa-dev
+libopengl0
+# For the self-test's text layout and hyphenation
+fonts-dejavu-core
+fonts-liberation
+hyphen-en-us
+# Linked format libraries
+libcdr-dev
+librevenge-dev
+libwpg-dev
+libvisio-dev
+libfreehand-dev
+libmspub-dev
+libpagemaker-dev
+libzmf-dev
+libqxp-dev
+libstaroffice-dev
+libetonyek-dev
+libmwaw-dev
+libjxr-dev
+libzstd-dev
+libgdcm-dev
+libwmf-dev
+libopenslide-dev
+libgraphviz-dev
+# Poppler's build
+libfreetype-dev
+libfontconfig-dev
+libjpeg-dev
+libpng-dev
+libtiff-dev
+libopenjp2-7-dev
+liblcms2-dev
+# Loaded at runtime when present; the AppImage bundles them
+liblcms2-2
+libraw23t64
+libopenjp2-7
+libjxl0.7
+libdjvulibre21
+libjbig2dec0
+libqrencode4
+libarchive13t64
+libmobi0
+# Qt's xcb platform plugin needs these on the build machine to bundle them
+libxcb-cursor0
+libxcb-icccm4
+libxcb-image0
+libxcb-keysyms1
+libxcb-render-util0
+libxcb-shape0
+libxcb-xinerama0
+libxcb-xkb1
+libxkbcommon-x11-0
