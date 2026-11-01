@@ -192,6 +192,61 @@ bool Canvas::importEpub(const QString& path){
     return true;
 }
 
+// A layered document read by one of the paint-app importers: an empty document takes its page; otherwise
+// it comes in as one group, scaled to fit the page. `note` is added to the status line.
+bool Canvas::adoptLayers(const Document& pd, const QString& path, const char* undo, const QString& note){
+    if(pd.shapes.isEmpty()) return false;
+    const QString fileName=QFileInfo(path).fileName();
+    const QString noteText=note.isEmpty()?QString():QStringLiteral(" %1.").arg(note);
+    if(m_doc.shapes.isEmpty()){
+        m_doc.pageSize=pd.pageSize; m_doc.pageCount=1;
+        warnMissingFonts(pd.shapes);
+        if(pd.shapes.size()>1){ Shape g; g.type=ShapeType::Group; g.name=fileName; g.children=pd.shapes; addShapes({g}, undo); }
+        else addShapes(pd.shapes, undo);
+        zoomFit();
+        emit statusMessage(QStringLiteral("Imported %1.%2").arg(fileName,noteText));
+        return true;
+    }
+    QRectF b; for(const Shape& s: pd.shapes) b = b.isNull()? s.docBounds() : b.united(s.docBounds());
+    if(b.isNull()||b.width()<1||b.height()<1) return false;
+    const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/b.width(), m_doc.pageSize.height()*0.9/b.height()));
+    const QPointF pc(m_doc.pageSize.width()/2, m_doc.pageSize.height()/2), bc=b.center();
+    QTransform place; place.translate(pc.x(),pc.y()); place.scale(sc,sc); place.translate(-bc.x(),-bc.y());
+    Shape g; g.type=ShapeType::Group; g.name=fileName; g.children=pd.shapes; g.transform=place;
+    addShapes({g}, undo);
+    emit statusMessage(QStringLiteral("Imported %1.%2").arg(fileName,noteText));
+    return true;
+}
+bool Canvas::importPsp(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    PspImportStats st;
+    const Document pd=importPspDocument(data,&st);
+    QStringList notes;
+    if(st.skippedText) notes<<QStringLiteral("%1 text object(s) not read").arg(st.skippedText);
+    if(st.skippedShapes) notes<<QStringLiteral("%1 ellipse or polygon shape(s) not read").arg(st.skippedShapes);
+    if(st.unsupportedPaints) notes<<QStringLiteral("%1 gradient or pattern paint(s) not read").arg(st.unsupportedPaints);
+    if(st.adjustments) notes<<QStringLiteral("%1 adjustment layer(s) not applied").arg(st.adjustments);
+    if(st.maskLayers) notes<<QStringLiteral("%1 mask layer(s) not applied").arg(st.maskLayers);
+    if(st.artMedia) notes<<QStringLiteral("%1 art media layer(s) not read").arg(st.artMedia);
+    if(st.groups) notes<<QStringLiteral("%1 layer group(s) flattened into the layer list").arg(st.groups);
+    if(adoptLayers(pd,path,"Import PaintShop Pro",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the PaintShop Pro file."); return false;
+}
+bool Canvas::importClip(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    ClipImportStats st;
+    const Document pd=importClipDocument(data,&st);
+    QStringList notes;
+    if(st.skippedCorrections) notes<<QStringLiteral("%1 correction layer(s) not applied").arg(st.skippedCorrections);
+    if(st.tones) notes<<QStringLiteral("%1 screen tone(s) drawn as even shade").arg(st.tones);
+    if(adoptLayers(pd,path,"Import Clip Studio",notes.join(QStringLiteral(", ")))) return true;
+    const QImage pv=clipPreview(data);
+    if(!pv.isNull()){
+        Document one; one.pageSize=pv.size(); one.shapes.push_back(psdBitmapShape(pv,0,0,QFileInfo(path).fileName()));
+        return adoptLayers(one,path,"Import Clip Studio",QStringLiteral("Only the file's saved preview could be read"));
+    }
+    emit statusMessage("No readable layers found in the Clip Studio file."); return false;
+}
 bool Canvas::importImage(const QString& path) {
     if(path.endsWith(".apng",Qt::CaseInsensitive) || path.endsWith(".png",Qt::CaseInsensitive)){
         QFile af(path); if(af.open(QIODevice::ReadOnly)){ const QByteArray head=af.read(1<<16); af.close();
@@ -511,6 +566,8 @@ bool Canvas::importCdr(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
     const QByteArray data=f.readAll(); f.close();
     const QString name=QFileInfo(path).fileName();
+    // A compressed exchange file (.ccx, .cpx, and any .cdx that turns out to be one) is CMX underneath.
+    if(data.size()>=12 && data.mid(8,4)=="CDRX" && importCmx(path)) return true;
 
     // A .cdr can take a second or two to parse. Unlike our other importers, libcdr is single-threaded and is
     // NOT safe to run on a worker thread (it hangs off the GUI thread), so the parse blocks the UI. To keep
@@ -869,6 +926,76 @@ bool Canvas::importCmx(const QString& path){
     if(importVectorSvgPages(xara::cmxToSvgPages(data), QStringLiteral("Import CMX"),
                             QStringLiteral("Imported Corel Presentation Exchange"), QStringLiteral("libcdr"))) return true;
     emit statusMessage("No importable vector content found in the CMX file."); return false;
+}
+bool Canvas::importXd(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    xara::XdStats st;
+    const QStringList pages=xara::xdToSvgPages(zip,&st);
+    if(!pages.isEmpty() && importVectorSvgPages(pages, QStringLiteral("Import Adobe XD"),
+                            QStringLiteral("Imported Adobe XD"), QStringLiteral("native"))){
+        if(st.pasteboardObjects>0)
+            emit statusMessage(QStringLiteral("Imported Adobe XD — %1 artboards; %2 objects left on the pasteboard were not imported.").arg(st.artboards).arg(st.pasteboardObjects));
+        return true;
+    }
+    emit statusMessage("No readable artwork found in the Adobe XD file."); return false;
+}
+bool Canvas::importProcreate(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QMap<QString,QByteArray> zip=readZipEntries(data);
+    ProcreateImportStats st;
+    const Document pd=importProcreateDocument(zip,&st);
+    QStringList notes;
+    if(st.badTiles) notes<<QStringLiteral("%1 damaged tile(s) left blank").arg(st.badTiles);
+    if(adoptLayers(pd,path,"Import Procreate",notes.join(QStringLiteral(", ")))) return true;
+    QImage pv; pv.loadFromData(zip.value(QStringLiteral("QuickLook/Thumbnail.png")));
+    if(!pv.isNull()){
+        Document one; one.pageSize=pv.size(); one.shapes.push_back(psdBitmapShape(pv,0,0,QFileInfo(path).fileName()));
+        return adoptLayers(one,path,"Import Procreate",QStringLiteral("Only the file's saved preview could be read"));
+    }
+    emit statusMessage("No readable layers found in the Procreate file."); return false;
+}
+bool Canvas::importCptFile(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    CptImportStats st;
+    const QImage img=importCpt(data,&st);
+    if(!img.isNull()){
+        Document one; one.pageSize=img.size(); one.shapes.push_back(psdBitmapShape(img,0,0,QFileInfo(path).fileName()));
+        if(adoptLayers(one,path,"Import PHOTO-PAINT",QString())) return true;
+    }
+    emit statusMessage(st.unknownTiles
+        ? QStringLiteral("This PHOTO-PAINT file uses a compression XarQ can't read yet (%1 tiles). Save it as TIFF or PSD from PHOTO-PAINT.").arg(st.unknownTiles)
+        : QStringLiteral("No readable image found in the PHOTO-PAINT file."));
+    return false;
+}
+bool Canvas::importPxd(const QString& path){
+    QMap<QString,QByteArray> files;
+    const QFileInfo info(path);
+    if(info.isDir()){                  // a .pxd straight off a Mac is a folder
+        const QDir root(path);
+        QDirIterator it(path, QDir::Files, QDirIterator::Subdirectories);
+        qint64 total=0; const qint64 cap=qint64(1)<<31;
+        while(it.hasNext() && total<cap){ const QString p=it.next(); QFile f(p); if(f.size()>(qint64(1)<<30)||!f.open(QIODevice::ReadOnly)) continue; const QByteArray b=f.readAll(); total+=b.size(); files.insert(root.relativeFilePath(p),b); }
+    } else {
+        QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false;
+        files=readZipEntries(f.readAll());
+    }
+    PxdImportStats st;
+    const Document pd=importPxdDocument(files,&st);
+    QStringList notes;
+    if(st.adjustedLayers||st.adjustmentLayers) notes<<QStringLiteral("%1 colour adjustment(s) not applied").arg(st.adjustedLayers+st.adjustmentLayers);
+    if(st.otherEffects) notes<<QStringLiteral("%1 effect(s) not applied").arg(st.otherEffects);
+    if(st.innerShadows) notes<<QStringLiteral("%1 inner shadow(s) not applied").arg(st.innerShadows);
+    if(st.unknownLayers) notes<<QStringLiteral("%1 layer(s) of an unknown kind left out").arg(st.unknownLayers);
+    if(adoptLayers(pd,path,"Import Pixelmator",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the Pixelmator file."); return false;
+}
+bool Canvas::importFxg(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    const QString svg=xara::fxgToSvg(data, QFileInfo(path).absolutePath());
+    if(!svg.isEmpty() && importVectorSvgPages(QStringList{svg}, QStringLiteral("Import FXG"),
+                            QStringLiteral("Imported Adobe FXG"), QStringLiteral("native"))) return true;
+    emit statusMessage("No importable artwork found in the FXG file."); return false;
 }
 bool Canvas::importGerber(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();

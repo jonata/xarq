@@ -81,6 +81,14 @@ add_executable(xarq
     gisvector.cpp
     dwgvector.cpp
     affvector.cpp
+    fxgvector.cpp
+    pxdimport.cpp
+    cptimport.cpp
+    procreateimport.cpp
+    sqlitemini.cpp
+    clipimport.cpp
+    pspimport.cpp
+    xdvector.cpp
     pdfvector.cpp
     psdimport.cpp
     extcodecs.cpp

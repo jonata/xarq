@@ -1,6 +1,7 @@
 // prepress.h — print/interop importers & exporters (Module 3): EPS/AI + PDF vector
 // import, PSD flattened import, CMYK colour separations, crop/registration marks.
 #pragma once
+#include <QMap>
 #include "model.h"
 #include <QByteArray>
 #include <QImage>
@@ -48,6 +49,36 @@ struct PsdImportStats {
     QVector<double> guidesH, guidesV;
 };
 Document importPsdDocument(const QByteArray& data, PsdImportStats* stats = nullptr);
+// The PSD route's bitmap layer and blend keys ("mul ", "scrn", "hue "…), for the other layered formats.
+Shape psdBitmapShape(const QImage& img, int x, int y, const QString& name);
+void psdApplyBlend(Shape& s, const QByteArray& key);
+
+// PaintShop Pro → a Document: raster layers keep their blend, opacity and mask; vector layers' polylines
+// stay editable. What the format has but this doesn't read is counted, so the importer can say so.
+struct PspImportStats {
+    int vectorShapes = 0, skippedText = 0, skippedShapes = 0, unsupportedPaints = 0;
+    int adjustments = 0, groups = 0, maskLayers = 0, artMedia = 0, dissolve = 0;
+};
+Document importPspDocument(const QByteArray& data, PspImportStats* stats = nullptr);
+
+// Clip Studio Paint → a Document: a bitmap per layer, in folders, with blend, opacity, masks and clipping.
+struct ClipImportStats { int pixelLayers = 0, paper = 0, folders = 0, masks = 0, clipped = 0, corrections = 0, fills = 0, placedImages = 0, textObjects = 0, vectorStrokes = 0, tones = 0, skippedCorrections = 0; };
+Document importClipDocument(const QByteArray& data, ClipImportStats* stats = nullptr);
+QImage clipPreview(const QByteArray& data);
+
+// Procreate → a Document: its layers and groups, with blend, opacity, masks and clipping. `zip` is the unpacked file.
+struct ProcreateImportStats { int layers = 0, groups = 0, masks = 0, clipped = 0, badTiles = 0; };
+Document importProcreateDocument(const QMap<QString,QByteArray>& zip, ProcreateImportStats* stats = nullptr);
+
+// Corel PHOTO-PAINT: the picture, for the compression the format's files have been seen to use in a form that
+// can be read. `unknownTiles` counts tiles in its other, undeciphered compression.
+struct CptImportStats { int unknownTiles = 0; };
+QImage importCpt(const QByteArray& data, CptImportStats* stats = nullptr);
+
+// Pixelmator Pro → a Document: raster, shape and text layers, groups, blends, masks, shadows and blur. `files`
+// is the unpacked file or folder, by relative path.
+struct PxdImportStats { int rasterLayers = 0, vectorLayers = 0, textLayers = 0, groups = 0, masks = 0, clipped = 0, adjustmentLayers = 0, adjustedLayers = 0, otherEffects = 0, innerShadows = 0, unappliedMasks = 0, unknownLayers = 0; };
+Document importPxdDocument(const QMap<QString,QByteArray>& files, PxdImportStats* stats = nullptr);
 
 // Convert an sRGB colour to naive CMYK (0..1 each). Shared by import (setcmykcolor) + separations.
 void rgbToCmyk(const QColor& c, double& C, double& M, double& Y, double& K);

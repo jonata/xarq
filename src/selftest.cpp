@@ -66,6 +66,9 @@
 #include "slide.h"
 #include "otshape.h"
 #include "xar.h"
+#include "fxgvector.h"
+#include "sqlitemini.h"
+#include "xdvector.h"
 
 using namespace xara;
 
@@ -12487,6 +12490,303 @@ if(xara::pdfVectorAvailable()){
       int cnt=0; QObject ctx; QObject::connect(c,&Canvas::documentChangedDebounced,&ctx,[&]{ ++cnt; });
       c->renameShape(i,"R2");
       check(cnt>=1, "a one-off edit forwards documentChangedDebounced synchronously (panels stay in lock-step)"); }
+
+    // --- FXG, XD and the compressed Corel exchange files ---
+    std::printf("[interop] FXG, Adobe XD, CCX\n");
+    {
+      std::function<void(const QVector<Shape>&,QVector<Shape>&)> flat=[&](const QVector<Shape>& in, QVector<Shape>& out){
+          for(const Shape& s : in){ if(s.children.isEmpty()) out.push_back(s); else flat(s.children,out); } };
+      auto shapesOf=[&](const QString& svg){ QVector<Shape> o; flat(parseSvg(svg.toUtf8()),o); return o; };
+      const QByteArray fxg=
+        "<Graphic xmlns=\"http://ns.adobe.com/fxg/2008\" version=\"2.0\" viewWidth=\"200\" viewHeight=\"100\">"
+        "<Library><Definition name=\"Dot\"><Group><Ellipse width=\"10\" height=\"10\"><fill><SolidColor color=\"#00FF00\"/></fill></Ellipse></Group></Definition></Library>"
+        "<Rect x=\"10\" y=\"20\" width=\"100\" height=\"50\"><fill><LinearGradient rotation=\"90\"><GradientEntry color=\"#FF0000\"/><GradientEntry color=\"#0000FF\"/></LinearGradient></fill>"
+        "<stroke><SolidColorStroke color=\"#010203\" weight=\"3\" caps=\"none\" joints=\"miter\"/></stroke></Rect>"
+        "<Rect width=\"40\" height=\"10\"><fill><LinearGradient x=\"5\" y=\"2\" scaleX=\"20\"><GradientEntry color=\"#000000\"/><GradientEntry color=\"#FFFFFF\"/></LinearGradient></fill></Rect>"
+        "<Dot x=\"150\" y=\"10\"/>"
+        "<Group x=\"20\" y=\"60\"><mask><Group><Rect width=\"10\" height=\"10\"><fill><SolidColor color=\"#FFFFFF\"/></fill></Rect></Group></mask>"
+        "<Rect width=\"30\" height=\"30\"><fill><SolidColor color=\"#102030\" alpha=\"0.5\"/></fill></Rect></Group>"
+        "<RichText x=\"5\" y=\"70\" fontFamily=\"Arial\" fontSize=\"12\" color=\"#112233\"><content><p>one<br/>two</p></content></RichText>"
+        "</Graphic>";
+      const QString fs=xara::fxgToSvg(fxg,QString());
+      const QVector<Shape> fx=shapesOf(fs);
+      check(fx.size()==6, "FXG: shapes, a placed symbol, a masked group and two text lines all arrive");
+      check(svgViewportSize(fs.toUtf8())==QSizeF(200,100), "FXG: the view size becomes the page");
+      if(fx.size()==6){
+        const Shape& g=fx[0];
+        check(g.fill.type==FillType::Linear && qAbs(g.fill.p0.y()-0)<.01 && qAbs(g.fill.p1.y()-50)<.01 && qAbs(g.fill.p0.x()-50)<.01,
+              "FXG: a gradient with no position is centred on its shape, and rotates about the centre");
+        check(g.stroke.enabled && qAbs(g.stroke.width-3)<.01 && g.stroke.cap==Qt::FlatCap && g.stroke.join==Qt::MiterJoin, "FXG: stroke weight, caps and joints");
+        check(qAbs(g.docBounds().left()-10)<.01 && qAbs(g.docBounds().top()-20)<.01, "FXG: x and y place the shape");
+        check(fx[1].fill.type==FillType::Linear && qAbs(fx[1].fill.p0.x()-5)<.01 && qAbs(fx[1].fill.p1.x()-25)<.01, "FXG: a gradient with x,y and scaleX starts there and runs that far");
+        check(fx[2].fill.color==QColor(0,255,0) && qAbs(fx[2].docBounds().left()-150)<.01, "FXG: a Library definition is placed by name");
+        check(!fx[3].regionPath.isEmpty(), "FXG: a mask becomes the group's clip");
+        check(fx[4].type==ShapeType::Text && fx[5].type==ShapeType::Text && fx[4].text==QStringLiteral("one") && fx[5].text==QStringLiteral("two"), "FXG: a <br/> breaks the line");
+        check(fx[5].docBounds().top()>fx[4].docBounds().top()+5, "FXG: the second line sits below the first");
+      }
+      check(xara::fxgToSvg("<svg xmlns=\"http://www.w3.org/2000/svg\"/>",QString()).isEmpty() && xara::fxgToSvg("FXG01 binary",QString()).isEmpty(), "FXG: anything else is refused");
+
+      QMap<QString,QByteArray> xd;
+      xd.insert("mimetype","application/vnd.adobe.sparkler.project+dcx");
+      xd.insert("manifest","{\"children\":[{\"path\":\"artwork\",\"children\":[{\"path\":\"pasteboard\",\"name\":\"pasteboard\"},"
+        "{\"path\":\"artboard-b\",\"name\":\"Second\",\"uxdesign#bounds\":{\"x\":300,\"y\":0,\"width\":100,\"height\":200}},"
+        "{\"path\":\"artboard-a\",\"name\":\"First\",\"uxdesign#bounds\":{\"x\":-200,\"y\":50,\"width\":150,\"height\":80}}]}]}");
+      xd.insert("resources/graphics/graphicContent.agc",
+        "{\"artboards\":{\"A\":{\"x\":-200,\"y\":50,\"width\":150,\"height\":80,\"name\":\"First\"},\"B\":{\"x\":300,\"y\":0,\"width\":100,\"height\":200,\"name\":\"Second\"}},"
+        "\"resources\":{\"gradients\":{\"g1\":{\"type\":\"linear\",\"stops\":[{\"offset\":0,\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":255,\"g\":0,\"b\":0}}},{\"offset\":1,\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":0,\"g\":0,\"b\":255}}}]}},\"clipPaths\":{}}}");
+      xd.insert("artwork/artboard-a/graphics/graphicContent.agc",
+        "{\"children\":[{\"type\":\"artboard\",\"style\":{\"fill\":{\"type\":\"solid\",\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":1,\"g\":2,\"b\":3}}}},\"artboard\":{\"ref\":\"A\",\"children\":["
+        "{\"type\":\"shape\",\"transform\":{\"a\":1,\"b\":0,\"c\":0,\"d\":1,\"tx\":-190,\"ty\":60},\"style\":{\"fill\":{\"type\":\"gradient\",\"gradient\":{\"units\":\"objectBoundingBox\",\"ref\":\"g1\",\"x1\":0,\"y1\":0,\"x2\":1,\"y2\":0}},"
+        "\"stroke\":{\"type\":\"solid\",\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":9,\"g\":9,\"b\":9}},\"width\":2,\"align\":\"inside\"}},\"shape\":{\"type\":\"rect\",\"x\":0,\"y\":0,\"width\":20,\"height\":10}},"
+        "{\"type\":\"text\",\"transform\":{\"a\":1,\"b\":0,\"c\":0,\"d\":1,\"tx\":-180,\"ty\":100},\"meta\":{\"ux\":{\"rangedStyles\":[{\"length\":2,\"fontFamily\":\"Arial\",\"fontStyle\":\"Bold\",\"fontSize\":10,\"fill\":{\"value\":4294901760}},{\"length\":2,\"fontFamily\":\"Arial\",\"fontStyle\":\"Regular\",\"fontSize\":10,\"fill\":{\"value\":4278190335}}]}},"
+        "\"style\":{\"font\":{\"family\":\"Arial\",\"style\":\"Regular\",\"size\":10},\"fill\":{\"type\":\"solid\",\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":0,\"g\":0,\"b\":0}}}},"
+        "\"text\":{\"rawText\":\"abcd\",\"frame\":{\"type\":\"positioned\"},\"paragraphs\":[{\"lines\":[[{\"x\":0,\"y\":0,\"from\":0,\"to\":4,\"style\":{\"font\":{\"family\":\"Stand In\"}}}]]}]}}]}}]}");
+      xd.insert("artwork/artboard-b/graphics/graphicContent.agc",
+        "{\"children\":[{\"type\":\"artboard\",\"artboard\":{\"ref\":\"B\",\"children\":[{\"type\":\"shape\",\"visible\":false,\"style\":{},\"shape\":{\"type\":\"circle\",\"cx\":1,\"cy\":1,\"r\":1}},"
+        "{\"type\":\"shape\",\"transform\":{\"a\":1,\"b\":0,\"c\":0,\"d\":1,\"tx\":310,\"ty\":10},\"style\":{\"fill\":{\"type\":\"solid\",\"color\":{\"mode\":\"RGB\",\"value\":{\"r\":0,\"g\":200,\"b\":0}}}},\"shape\":{\"type\":\"circle\",\"cx\":5,\"cy\":5,\"r\":5}}]}}]}");
+      xara::XdStats xs;
+      const QStringList xp=xara::xdToSvgPages(xd,&xs);
+      check(xp.size()==2 && xs.names==QStringList({"Second","First"}), "XD: a page per artboard, in the manifest's order");
+      if(xp.size()==2){
+        check(svgViewportSize(xp[0].toUtf8())==QSizeF(150,200) && svgViewportSize(xp[1].toUtf8())==QSizeF(150,200), "XD: every page takes the largest artboard's size");
+        const QVector<Shape> a=shapesOf(xp[1]), b=shapesOf(xp[0]);
+        check(b.size()==1 && qAbs(b[0].docBounds().left()-10)<.01 && qAbs(b[0].docBounds().top()-10)<.01, "XD: contents shift by the artboard's origin, and hidden objects stay out");
+        // background, fill, the inside stroke, one text object with two runs
+        check(a.size()==4, "XD: artboard fill, shape, inside stroke and the text all arrive");
+        if(a.size()==4){
+          check(a[0].fill.color==QColor(1,2,3) && qAbs(a[0].docBounds().width()-150)<.01, "XD: the artboard's fill sits behind its contents");
+          check(a[1].fill.type==FillType::Linear && !a[1].stroke.enabled, "XD: a shared gradient resolves by reference");
+          check(a[2].stroke.enabled && qAbs(a[2].stroke.width-4)<.01 && !a[2].regionPath.isEmpty(), "XD: an inside stroke is doubled and cut by its own shape");
+          check(a[3].type==ShapeType::Text && a[3].text==QStringLiteral("abcd") && a[3].textRuns.size()==2, "XD: ranged styles become runs of one text object");
+          if(a[3].textRuns.size()==2)
+            check(a[3].textRuns[0].font.family()==QStringLiteral("Arial") && a[3].textRuns[0].font.weight()==QFont::Bold
+                  && a[3].textRuns[0].color==QColor(255,0,0) && a[3].textRuns[1].color==QColor(0,0,255), "XD: a range's font and colour win over the line's stand-in");
+        }
+      }
+      check(xara::xdToSvgPages(QMap<QString,QByteArray>()).isEmpty(), "XD: an empty archive gives nothing");
+
+      QByteArray inner("pagex\0\0\0",8); inner[4]=1; inner.append('Q'); inner.append('\0');
+      QByteArray packed(int(compressBound(inner.size())),'\0'); uLongf pl=packed.size();
+      compress((Bytef*)packed.data(),&pl,(const Bytef*)inner.constData(),inner.size()); packed.resize(int(pl));
+      auto le=[](quint32 v){ return QByteArray(reinterpret_cast<const char*>(&v),4); };
+      QByteArray pack=le(quint32(inner.size()))+QByteArray("CPng\x01\x00\x04\x00",8)+packed;
+      if(pack.size()&1) pack.append('\0');
+      QByteArray riffBody=QByteArray("CDRX")+"cont"+le(2)+QByteArray("ab",2)+"pack"+le(quint32(pack.size()))+pack;
+      const QByteArray ccx=QByteArray("RIFF")+le(quint32(riffBody.size()))+riffBody;
+      const QByteArray cmx=xara::unpackCorelExchange(ccx);
+      check(cmx.mid(8,4)=="CMX1" && cmx.mid(12,4)=="cont" && cmx.mid(22,4)=="page", "CCX: the deflated body comes back as plain CMX chunks");
+      check(xara::unpackCorelExchange("RIFFxxxxCDR9rest")=="RIFFxxxxCDR9rest", "CCX: an ordinary file passes through untouched");
+    }
+
+    // --- PaintShop Pro ---
+    std::printf("[interop] PaintShop Pro\n");
+    {
+      auto le16=[](int v){ QByteArray b(2,'\0'); b[0]=char(v); b[1]=char(v>>8); return b; };
+      auto le32=[](qint64 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(8*i)); return b; };
+      auto f64=[](double v){ return QByteArray(reinterpret_cast<const char*>(&v),8); };
+      auto block=[&](int id, const QByteArray& body){ return QByteArray("~BK\0",4)+le16(id)+le32(body.size())+body; };
+      auto file=[&](int version,int w,int h,int comp,int depth,bool gray,const QByteArray& rest){
+        QByteArray sig("Paint Shop Pro Image File\n\x1a"); sig.append(QByteArray(32-sig.size(),'\0'));
+        const QByteArray img=le32(46)+le32(w)+le32(h)+f64(72)+QByteArray(1,'\1')+le16(comp)+le16(depth)+le16(1)+le32(0)+QByteArray(1,gray?'\1':'\0')+le32(0)+le32(0)+le16(1)+le32(1);
+        return sig+le16(version)+le16(0)+block(0,img)+rest; };
+      auto rect=[&](int a,int b,int c,int d){ return le32(a)+le32(b)+le32(c)+le32(d); };
+      auto channel=[&](int bmp,int ch,const QByteArray& data){ return block(5,le32(16)+le32(data.size())+le32(data.size())+le16(bmp)+le16(ch)+data); };
+      auto layer=[&](const QByteArray& name,int type,int x,int y,int w,int h,int opacity,int blendMode,int vis,int bitmaps,int channels,const QByteArray& subs){
+        QByteArray head=le16(name.size())+name+QByteArray(1,char(type))+rect(x,y,x+w,y+h)+rect(0,0,w,h)+QByteArray(1,char(opacity))+QByteArray(1,char(blendMode))+QByteArray(1,char(vis))+QByteArray(2,'\0')+rect(0,0,0,0)+rect(0,0,0,0)+QByteArray(2,'\0')+QByteArray(8,'\0');
+        const QByteArray chunk=le32(head.size()+4)+head;
+        return block(4,chunk+le32(8)+le16(bitmaps)+le16(channels)+subs); };
+      // Two pixels as RLE: red plane "run of 2", green plane literal, blue literal, and an alpha plane.
+      const QByteArray red=QByteArray::fromHex("82C8"), grn=QByteArray::fromHex("021020"), blu=QByteArray::fromHex("023040"), alp=QByteArray::fromHex("02FF80");
+      const QByteArray lay1=layer("Paint",1,3,1,2,1,128,7,1,2,4,channel(0,1,red)+channel(0,2,grn)+channel(0,3,blu)+channel(1,0,alp));
+      const QByteArray lay2=layer("Hidden",1,0,0,1,1,255,0,0,1,3,channel(0,1,QByteArray::fromHex("0105"))+channel(0,2,QByteArray::fromHex("0106"))+channel(0,3,QByteArray::fromHex("0107")));
+      const Document pd=importPspDocument(file(5,8,4,1,24,false,block(3,lay1+lay2)));
+      check(pd.pageSize==QSizeF(8,4) && pd.shapes.size()==2, "PSP: the page size and both raster layers arrive");
+      if(pd.shapes.size()==2){
+        const Shape& a=pd.shapes[0];
+        check(a.name==QStringLiteral("Paint") && qAbs(a.opacity-128/255.0)<1e-6 && a.blend==QPainter::CompositionMode_Multiply, "PSP: name, opacity and blend mode");
+        check(qAbs(a.docBounds().left()-3)<.01 && qAbs(a.docBounds().top()-1)<.01 && qAbs(a.docBounds().width()-2)<.01, "PSP: the layer sits at its rectangle");
+        const QImage im=a.fill.image;
+        check(im.size()==QSize(2,1) && im.pixel(0,0)==qRgba(0xC8,0x10,0x30,0xFF) && im.pixel(1,0)==qRgba(0xC8,0x20,0x40,0x80), "PSP: RLE planes and the transparency mask assemble");
+        check(!pd.shapes[1].visible, "PSP: a hidden layer stays hidden");
+      }
+      // Version 5 with zlib, palette at four bits per pixel: rows pad to four bytes.
+      QByteArray idx=QByteArray::fromHex("12000000");
+      const QByteArray pal=block(2,le32(8)+le32(3)+QByteArray::fromHex("0A0B0C00 1A1B1C00 2A2B2C00"));
+      const QByteArray zipped=qCompress(idx).mid(4);
+      const QByteArray lay3=layer("Index",1,0,0,2,1,255,0,1,1,1,channel(0,0,zipped));
+      const Document pi=importPspDocument(file(5,2,1,2,4,false,pal+block(3,lay3)));
+      check(pi.shapes.size()==1 && pi.shapes[0].fill.image.pixel(0,0)==qRgb(0x1C,0x1B,0x1A) && pi.shapes[0].fill.image.pixel(1,0)==qRgb(0x2C,0x2B,0x2A), "PSP: zlib, a palette and packed 4-bit pixels");
+      // A vector layer: one polyline with a filled square.
+      auto node=[&](double x,double y,int mv,int flags){ return le32(55)+f64(x)+f64(y)+f64(x)+f64(y)+f64(x)+f64(y)+QByteArray(1,char(mv))+le16(flags); };
+      auto paint=[&](int r,int g,int b){ const QByteArray col=QByteArray(1,char(r))+QByteArray(1,char(g))+QByteArray(1,char(b))+QByteArray(1,'\0')+QByteArray::fromHex("FFFFFFFF");
+        return block(15,le32(6)+le16(1)+le32(12)+col); };
+      const QByteArray attrs=QByteArray::fromHex("010101")+f64(2)+QByteArray(2,'\0')+f64(1)+f64(1)+QByteArray(2,'\0')+f64(1)+f64(1)+QByteArray(1,'\1')+f64(15);
+      const QByteArray nm("Sq");
+      const QByteArray shapeHead=le16(nm.size())+nm+le16(2)+le32(5)+le32(1)+le32(0);
+      const QByteArray poly=le32(8)+le32(4)+node(10,10,1,0x40)+node(30,10,0,0x40)+node(30,20,0,0x40)+node(10,20,0,0x40|0x80);
+      const QByteArray shape=block(14,le32(shapeHead.size()+4)+shapeHead+le32(attrs.size()+4)+attrs+paint(1,2,3)+paint(200,100,50)+poly);
+      const QByteArray vec=block(13,le32(8)+le32(1)+shape);
+      QByteArray nh=le16(1)+QByteArray("V")+QByteArray(1,'\3')+rect(0,0,0,0)+rect(0,0,0,0)+QByteArray(1,char(255))+QByteArray(1,'\0')+QByteArray(1,'\1')+QByteArray(2,'\0')+rect(0,0,0,0)+rect(0,0,0,0)+QByteArray(2,'\0')+QByteArray(8,'\0');
+      const QByteArray lv=block(4,le32(nh.size()+4)+nh+vec);
+      PspImportStats vs;
+      const Document pv=importPspDocument(file(6,64,64,2,24,false,block(3,lv)),&vs);
+      check(pv.shapes.size()==1 && pv.shapes[0].type==ShapeType::Group && vs.vectorShapes==1, "PSP: a vector layer's polyline stays a vector");
+      if(pv.shapes.size()==1 && pv.shapes[0].children.size()==1){
+        const Shape& q=pv.shapes[0].children[0];
+        check(q.fill.color==QColor(200,100,50) && q.stroke.enabled && q.stroke.color==QColor(1,2,3) && qAbs(q.stroke.width-2)<.01, "PSP: the stroke paint comes first, then the fill");
+        check(qAbs(q.docBounds().left()-10)<1.1 && qAbs(q.docBounds().width()-20)<2.1 && qAbs(q.docBounds().height()-10)<2.1, "PSP: nodes are in canvas coordinates");
+      }
+      check(importPspDocument("not a psp file at all, just some text to fill the buffer").shapes.isEmpty(), "PSP: anything else is refused");
+    }
+
+    // --- Clip Studio Paint, and the small SQLite reader under it ---
+    std::printf("[interop] Clip Studio Paint\n");
+    {
+      const QByteArray clip=qUncompress(QByteArray::fromHex("00100000")+QByteArray::fromBase64(
+        "eNrtGU1vG1VwZtfeDyeGVEnqBoS6EU2bthEgQJVAPWA7TrJK4gTH/QgCVdv4Jdlmveus16nTA9QgThX8AySExBEEl3LiACcQh3LhEnFAIEBCQkUqrUAIlff2rb+2jlLViI8mI8/b92bmzZt5876dXphIT53KToMPD7/Lv3AgPZWdniJGISiP8g9CCPrCBFYvU/UMXhIG6vVJ1XNtyywkd4Cgna85Qj+kwAIHlmANxsEAj2IKCKyACTakYRUq9LsGdwI1FUsWTatbP3/54SDsG4APrnsXbn51of+ha6dPfhw/9GjhjepWDLqDN19Y/vXWlcvy94/rsJvh/RM3nha/o5l9HSKWoTEqNKPVPkYQw2MktQME8p8H2NUYgZcWwR8jn2AcQBHfnvzo97eeiTy7+R521yHfjI18K7xy9x2y8PyMGcw9YHmPaMuOWzQ87SkQWCc9p2mUKVPsbWlGohgJubQTyPDYpfUom554i5Vj+AfP7MG/DDILpSTE/WlxA+hvD3YH9KAMKlJQpCkhjp9CFK8C3sSf8Cpu4Rd7HfTfh5goDuGsWSoaJYEWVZ8Yj4oHcW55ubzkEmILD0TE4UBGt5cdQRXEBM4Ym8SVVRSH1LRhbxjluL9IXwMa+XdwA+dwBP6kxf8rjMmPAA4JiiIoqsKAEZUAYEDW7Q3ien2Cv3dJhyUqnVDD0hjkFd22iYsQG40yrVSmVQ4x0ArShGMVmKCsjESoZL+vUWlKNjRGaXgQpNgxkTesCqgqqKoKiyEVQy4W0e01UoDLghCNDZwQmGzIJSaoRiN0DRfnjRJxpSeQ7c2fURY7Rz9J8RDSenFBxTbnGkbTLtAQREZkYyJtmSVNz+Yzk5ncmOYPEzaUiHe2I3UxRM0Ru8B5S9vUu1MirGPWKK91rtvkbFdnu1bD/HD9LD0I6tSwaog+YbplL71qWoVOXO4Ln1shVqPVMHfcNS6mHctxM7Zx3iIdGLOGaedIYRvOJJvU2/BSVqVF4aRrFAzPdOwJ07LY1NdSM3OpMY0WvcDABvUom/8CXAdM0uTH+37hnBekxPHjuOixGJTXLXr2PVcm6xViL4WLYjqXSeYzWj6ZmsloIeaobRTJGC0drZ1EOTE0hK8u+Dr5qspToU0Dp42emz9zTh+vR0ubz+mzydyiNp1Z1JKn8nN6llaazWTzYxqLrN4yHLiCM2bBW9Wo4pk6ZYqYK6teGylHyo5VYWOgnew4Hl+r6lqD+NPLw22aXPzH4/FyxO+82hm/8/ic4anS1nmc1kXnpYwyaW6GDfdf3xDlRCKBV6Z9A5pTONLWvE/qonW+1tAho+UzZ/NBOb9ZIuFlpy04LWuYaa+E1+GSsWR6myFq2imWnDK70bXTT5tl87xptVeg/R/144+/AP5Gkz2470ESIvTkMjAoIfvGevbivxvjP7ifx7+nl8VfhLOAVfiBfv42qPXIcuLIEaydatkW512yYZKLbYXeDptkwOpiwdWLxgoZNzyDn3JqD0py4uBBrBV9axqXpEamp82KBrkLC5Ke55rnK3Ql5qevlOUsrbVYFI3KieHhev80t6ZmTu2wAzJ6F0Y1HAvt/330QsEf2GsVQQJ87cCL+4Mn92WKxyge9u+Z82CAS7EIBDyKrl+dI4aQvxHiHU/lAbchpgRYBxV0sMGk+tPg+O+ZrBX2vI+3KQRSEV+y+d65QGtcohbxN0usv1Xe7UNvrYLc79579nu4pd1o4HckMKM7v+He/d7pT5A4BF7swa4E9n/ABL0W1Mt/AX8H7aA="));
+      ClipImportStats st;
+      const Document cd=importClipDocument(clip,&st);
+      check(!clip.isEmpty() && cd.pageSize==QSizeF(8,6), "Clip: the canvas becomes the page");
+      check(cd.shapes.size()==4 && st.folders==1 && st.paper==1 && st.pixelLayers==3 && st.masks==1 && st.corrections==1, "Clip: the layer tree arrives with its folder, paper, mask and correction");
+      if(cd.shapes.size()==4){
+        const Shape& paper=cd.shapes[0]; const Shape& ink=cd.shapes[1]; const Shape& off=cd.shapes[2]; const Shape& fold=cd.shapes[3];
+        check(paper.name==QStringLiteral("Paper") && paper.fill.image.pixel(0,0)==qRgb(255-200,255-100,255-50), "Clip: a paper layer's colour, then the invert above it");
+        check(ink.name==QStringLiteral("Inked") && ink.blend==QPainter::CompositionMode_Multiply && qAbs(ink.opacity-0.5)<.01, "Clip: blend mode and opacity (256 means full)");
+        check(qAbs(ink.docBounds().left()-3)<.01 && qAbs(ink.docBounds().top()-1)<.01, "Clip: a layer sits at its offset plus its bitmap's");
+        const QImage im=ink.fill.image;
+        check(im.size()==QSize(2,2) && qRed(im.pixel(0,0))==255-200 && qAlpha(im.pixel(0,0))==255 && qGreen(im.pixel(0,1))==255-2, "Clip: tile colours come back in red, green, blue order");
+        check(qAlpha(im.pixel(1,0))==128*128/255, "Clip: the tile's alpha plane and the layer mask multiply");
+        check(!off.visible && off.type!=ShapeType::Group, "Clip: a hidden layer stays hidden");
+        check(fold.type==ShapeType::Group && fold.name==QStringLiteral("Folder") && fold.children.size()==1 && fold.children[0].name==QStringLiteral("Inner"), "Clip: folders nest");
+      }
+      check(importClipDocument("CSFCHUNK and then nothing useful at all").shapes.isEmpty(), "Clip: a damaged file gives nothing");
+      // The reader itself, on the fixture's database.
+      SqliteMini db;
+      const int q=clip.indexOf("CHNKSQLi");
+      check(q>0 && db.open(clip.mid(q+16)), "SQLite: a database file opens");
+      const QVector<SqliteMini::Row> lays=db.rows("Layer");
+      check(db.hasTable("Canvas") && lays.size()==7 && lays[1].value("LayerName").toString()==QStringLiteral("Paper"), "SQLite: a table reads by name, text intact");
+      check(lays[1].value("_PW_ID").toInt()==2 && !lays[1].contains("GradationFillInfo"), "SQLite: an INTEGER PRIMARY KEY reads as the rowid, and NULL is absent");
+      check(lays[6].value("FilterLayerInfo").toByteArray()==QByteArray::fromHex("00000006"), "SQLite: a blob comes back whole");
+      check(db.rows("Canvas").first().value("CanvasWidth").toDouble()==8.0, "SQLite: reals");
+      check(db.rows("NoSuchTable").isEmpty() && !SqliteMini().open("not a database"), "SQLite: missing tables and other files are handled");
+    }
+
+    // --- Procreate ---
+    std::printf("[interop] Procreate\n");
+    {
+      QMap<QString,QByteArray> pz;
+      pz.insert("Document.archive",QByteArray::fromBase64("YnBsaXN0MDDUAQIDBAUGZGdZJGFyY2hpdmVyWCRvYmplY3RzVCR0b3BYJHZlcnNpb25fEA9OU0tleWVkQXJjaGl2ZXKvEBkHCA4RFBUWKSorLzAxNjc4PUJDSU5PUlNUVSRudWxs0gkKCwxYJGNsYXNzZXNaJGNsYXNzbmFtZaIMDVtTaWxpY2FMYXllclhOU09iamVjdNIJCg8QohANW1NpbGljYUdyb3Vw0gkKEhOiEw1XTlNBcnJheVRNTU1NWkxheWVyIE1hc2vaFxgZGhscHR4fICEiIyQjJCUmJyhWJGNsYXNzVFVVSURVYmxlbmRXY2xpcHBlZF1leHRlbmRlZEJsZW5kVmhpZGRlblRtYXNrVG5hbWVXb3BhY2l0eVd2ZXJzaW9ugAGABBAACIAAgAUjP/AAAAAAAAAQAVRBQUFBVkJvdHRvbdoXGBkaGxwdHh8gISwjJCMkLS4nKIAHgACACFRCQkJCU1RvcNoXGBkaGxwdHh8gITIoJCgkMzQ1KIAKgAaACyM/4AAAAAAAAFRDQ0NDVUlubmVy2hcYGRobHB0eHyAhOSMkIzo7PCcogA0JgACADtIXPj9AWk5TLm9iamVjdHOAA6FBgA9TR3Jw1BdERR5GRyRIWGNoaWxkcmVuWGlzSGlkZGVugAKAEIAR0hc+P0qjS0xNgAyAEoAJTxAQAACAPwAAAD8AAAAAAACAP9IJClBRolENXlNpbGljYURvY3VtZW50Vns0LCAyfVF02xdVVldYHllaW1xdXl8kJCRgKGEjYmNfEA9iYWNrZ3JvdW5kQ29sb3JfEBBiYWNrZ3JvdW5kSGlkZGVuXxATZmxpcHBlZEhvcml6b250YWxseV8QEWZsaXBwZWRWZXJ0aWNhbGx5W29yaWVudGF0aW9uVHNpemVbc3Ryb2tlQ291bnRYdGlsZVNpemVfEA91bndyYXBwZWRMYXllcnOAFYAUgBeAFhACgBPRZWZUcm9vdIAYEgABhqAACAARABsAJAApADIARABgAGYAawB0AH8AggCOAJcAnACfAKsAsACzALsAwADLAOAA5wDsAPIA+gEIAQ8BFAEZASEBKQErAS0BLwEwATIBNAE9AT8BRAFLAWABYgFkAWYBawFvAYQBhgGIAYoBkwGYAZ4BswG1AbYBuAG6Ab8BygHMAc4B0AHUAd0B5gHvAfEB8wH1AfoB/gIAAgICBAIXAhwCHwIuAjUCNwJOAmACcwKJAp0CqQKuAroCwwLVAtcC2QLbAt0C3wLhAuQC6QLrAAAAAAAAAgEAAAAAAAAAaAAAAAAAAAAAAAAAAAAAAvA="));
+      // Tile 0~0 of "AAAA", all red, as LZO: a literal pixel then a long match over it. Rows are stored bottom-up.
+      const QByteArray px=QByteArray::fromHex("C81432FF");
+      QByteArray lzo; lzo.append(char(17+4)); lzo.append(px);
+      lzo.append(char(0x20|(12-2))); lzo.append(char((4-1)<<2)); lzo.append('\0');   // copy 12 from 4 back
+      lzo.append(QByteArray::fromHex("110000"));
+      pz.insert("AAAA/0~0.chunk",lzo);
+      // Tile 1~0 of "AAAA": stored LZ4, then the end mark.
+      QByteArray stored; for(int i=0;i<4;++i) stored.append(QByteArray::fromHex("0A1420FF"));
+      QByteArray l4="bv4-"; l4.append(QByteArray::fromHex("10000000")); l4.append(stored); l4.append("bv4$");
+      pz.insert("AAAA/1~0.lz4",l4);
+      // "BBBB" tile 0~0 with a real LZ4 block: one literal pixel, then a match of 12 at distance 4.
+      QByteArray blk=QByteArray::fromHex("48")+QByteArray::fromHex("01020304")+QByteArray::fromHex("0400");
+      QByteArray f="bv41"; f.append(QByteArray::fromHex("10000000")); f.append(char(blk.size())); f.append(QByteArray::fromHex("000000")); f.append(blk); f.append("bv4$");
+      pz.insert("BBBB/0~0.lz4",f);
+      // Its mask: one byte a pixel.
+      QByteArray mk="bv4-"; mk.append(QByteArray::fromHex("04000000")); mk.append(QByteArray::fromHex("FF00FF00")); mk.append("bv4$");
+      pz.insert("MMMM/0~0.lz4",mk);
+      QByteArray cc="bv4-"; cc.append(QByteArray::fromHex("10000000")); cc.append(stored); cc.append("bv4$");
+      pz.insert("CCCC/1~0.lz4",cc);
+      ProcreateImportStats ps;
+      const Document pd=importProcreateDocument(pz,&ps);
+      check(pd.pageSize==QSizeF(4,2) && ps.layers==3 && ps.groups==1 && ps.masks==1 && ps.badTiles==0, "Procreate: the page and every layer arrive, and all the tiles decode");
+      check(pd.shapes.size()==4, "Procreate: background, then the layers from the bottom up");
+      if(pd.shapes.size()==4){
+        check(pd.shapes[0].name==QStringLiteral("Background") && pd.shapes[0].fill.image.pixel(0,0)==qRgb(255,128,0), "Procreate: the background colour is a layer of its own");
+        check(pd.shapes[1].name==QStringLiteral("Bottom") && pd.shapes[1].fill.image.size()==QSize(4,2), "Procreate: tiles assemble into one bitmap");
+        check(pd.shapes[1].fill.image.pixel(0,0)==qRgba(0xC8,0x14,0x32,0xFF) && pd.shapes[1].fill.image.pixel(0,1)==qRgba(0xC8,0x14,0x32,0xFF), "Procreate: an LZO tile, literals and a match");
+        check(pd.shapes[1].fill.image.pixel(3,1)==qRgba(0x0A,0x14,0x20,0xFF), "Procreate: a stored LZ4 tile");
+        const Shape& g=pd.shapes[2];
+        check(g.type==ShapeType::Group && g.name==QStringLiteral("Grp") && g.children.size()==1 && !g.children[0].visible, "Procreate: groups nest, and a hidden layer stays hidden");
+        const Shape& t=pd.shapes[3];
+        check(t.name==QStringLiteral("Top") && qAbs(t.opacity-0.5)<.01 && t.blend==QPainter::CompositionMode_Multiply, "Procreate: blend mode and opacity");
+        // Stored rows run upward, so stored row 0's mask FF 00 lands on the picture's bottom row.
+        const QImage ti=t.fill.image;
+        check(qAlpha(ti.pixel(0,1))==4 && qAlpha(ti.pixel(1,1))==0, "Procreate: an LZ4 block with a match, and its layer mask, the right way up");
+      }
+      check(importProcreateDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "Procreate: an archive without a document gives nothing");
+      QMap<QString,QByteArray> bad=pz; bad["AAAA/0~0.chunk"]=QByteArray::fromHex("FFFFFF"); ProcreateImportStats bs;
+      importProcreateDocument(bad,&bs);
+      check(bs.badTiles==1, "Procreate: a damaged tile is counted, not fatal");
+    }
+
+    // --- Corel PHOTO-PAINT ---
+    std::printf("[interop] Corel PHOTO-PAINT\n");
+    {
+      auto le32=[](quint32 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(8*i)); return b; };
+      auto lzwBytes=[](const QByteArray& raw){     // every byte as its own 9-bit code, between clear and end
+        QByteArray out; quint32 acc=0; int nb=0;
+        auto put=[&](int code){ acc|=quint32(code)<<nb; nb+=9; while(nb>=8){ out.append(char(acc&255)); acc>>=8; nb-=8; } };
+        put(256); for(uchar c : raw) put(c); put(257); if(nb) out.append(char(acc&255)); return out; };
+      auto build=[&](int w,int h,int bpp,const QByteArray& pal,const QByteArray& tile){
+        QByteArray f("CPT7FILE"); f+=le32(bpp==8?10:1); f+=le32(pal.size()); f.append(QByteArray(0x138-f.size(),'\0'));
+        f+=pal; const quint32 off=0x140+pal.size(); f+=le32(0); f+=le32(off);       // the field that locates the record
+        f.resize(int(off));
+        f+=le32(w); f+=le32(h); f+=le32(144); f+=le32(151); f+=le32(bpp);
+        const quint32 pos=off+20+8; f+=le32(pos); f+=le32(tile.size()); f+=tile;
+        return f; };
+      // Two rows, each padded to four bytes: blue, green, red.
+      const QByteArray rgb=QByteArray::fromHex("0A141E00")+QByteArray::fromHex("28323C00");
+      QByteArray t24=QByteArray::fromHex("02000300")+lzwBytes(rgb);
+      QImage ci=importCpt(build(1,2,24,QByteArray(),t24));
+      check(ci.size()==QSize(1,2) && ci.pixel(0,0)==qRgb(0x1E,0x14,0x0A) && ci.pixel(0,1)==qRgb(0x3C,0x32,0x28), "PHOTO-PAINT: LZW tile, blue first, rows padded to four bytes");
+      QByteArray pal(768,'\0'); pal[3]=char(11); pal[4]=char(22); pal[5]=char(33);
+      const QByteArray t8=QByteArray::fromHex("02000000")+lzwBytes(QByteArray::fromHex("0001")+QByteArray(2,'\0'));
+      QImage pi=importCpt(build(2,1,8,pal,t8));
+      check(pi.size()==QSize(2,1) && pi.pixel(0,0)==qRgb(0,0,0) && pi.pixel(1,0)==qRgb(11,22,33), "PHOTO-PAINT: indexed tile through its palette");
+      // The LZW edge cases: a code naming the string it defines, and a code past the table.
+      QByteArray self; { quint32 acc=0; int nb=0; auto put=[&](int code){ acc|=quint32(code)<<nb; nb+=9; while(nb>=8){ self.append(char(acc&255)); acc>>=8; nb-=8; } };
+        put(256); put(7); put(258); put(257); if(nb) self.append(char(acc&255)); }
+      QImage sl=importCpt(build(3,1,8,pal,QByteArray::fromHex("02000000")+self+QByteArray()));
+      check(sl.isNull(), "PHOTO-PAINT: output shorter than the image is refused");
+      QImage s2=importCpt(build(1,1,24,QByteArray(),QByteArray::fromHex("02000300")+self));
+      check(s2.isNull(), "PHOTO-PAINT: rows that don't fill the stride are refused");
+      CptImportStats us;
+      const QImage un=importCpt(build(4,4,24,QByteArray(),QByteArray::fromHex("050003003F3F0000")),&us);
+      check(un.isNull() && us.unknownTiles==1, "PHOTO-PAINT: the unread compression is counted, so the message can say so");
+      check(importCpt("CPT7FILE too short").isNull(), "PHOTO-PAINT: a truncated header is refused");
+    }
+
+    // --- Pixelmator Pro ---
+    std::printf("[interop] Pixelmator Pro\n");
+    {
+      const auto unz=[](const char* b64){ return qUncompress(QByteArray::fromHex("00040000")+QByteArray::fromBase64(b64)); };
+      QMap<QString,QByteArray> px;
+      px.insert("wrap/metadata.info",unz("eNrtV81vG1UQf7P7NvEmpE1Jg0uLnY0TqwlxkEsshJAqYsduEjVRnNhtJaoobLxrdxV7d7veNB9VhAL8AZw5ASf+AiS4ceLCvaq4BIkbHOAAFw4ws17HH7HrciTKaL1v3pt5897vzZvZcW59xXB1pWg5FdVV5pjAANi8ojDGOP5k1iDRH6sTsN7E2VuHj4e8yV8w+BoEbP4TfSj2B8fH4XjQVbfLelk90J0twyxaDY4vbGSS+YyST6ZWMkpjfMpnNcUwXb2kOzFlRz9QXH3fjSlP1PKurmyXre3p4wmhPzgzA8dH3hKaVdit6Ka75U2vtnXFlsXahFPNaxkaCoyioTv+krbqkOqZccPU9P0t1d2qKTQsuAe2Xu9N34e+4M2bUGndI+Fs6Qid9+edR0f05BuAnxg+F3S+aALE0XTVONQTs272MJdODePgVV844Lfkfwm+Y/An/ALP4AdkL+h/QYNSH4wwkKWl5bRwiWNnJAA8t5Rd3MiKgyIJAyBih18WSCjIwmru7kYy99E/MvTJI0yWsSNRkobfyKAMf8Nf8Eetc0HnkgIT+Oq/ga++6xT5Q0NeDogxOIFv4DN4DGsQhwH2K/uRfckO2QcoOqXYEIe5hFBRqzsptbBTcqxdU7tP3xLKMOU7+WwAtd7/vaYdfoVDMCEUy2qpSvLEO8v3SH7FtxYd5DCaFhoJKp8dbppeb6cHOITSgm1VDdewTFJ1szXVeb8amR+utSEZLSYEU614Fk3HzQX8mmUV9xwKcDmYUM1SuWW/dZrs53I0sY3ADLOUK6itWvO+VqiPjJwBVa+FFInLoYRlF9xZ06mQhr2WXvGO5cQ3wLk8FsOPuKmtWpq3hmaWU7RJpbxbmRS53Jy1Ox/KlIDLpF/mTMKA9t5tPhLK/BT1WRVrC1bzf5zBc/gWPgcLlmAKAuxn9j37iu2xLIpaKHydvMq7HkD0dfIqbwdQP75Tr14jr/KOCK61eTVIXuXtXqVqNGXts/BrtCGxq1ujoxyiCbGXX8NXPTNdcYVHOIzFxI5+q1ZVO/oq4RbP4J70wfjf3ekrhFvsiNtXqXswNEy4xU64Fx2bhS974dUd9yXCLfTC7dV/7Dmj51zRx5M3JJj59E1efaTa+qz3Tquu+jTyBEt1PPucrRewDl+wTBcjQXci7ylPI7bqPlqwNCqyHziqbaMqjj988SQq1JGJOHrBjcSUiLdWFi3dM7Hm1rVmbTS1703ScC93HKuysEiaNH11L7mbTC8nV0rJvWQmnuxE+Uxy/exoanU9dco3hjN7TXyD3Vi/fTtydLTpPeT/AJtj8DYMNmX9uRecbHSCbpbUM6IidEGlMxF1amacIkbqmf8VihjppfL/GEWM1Cli1opFFg57qat7xIQIF++F6/juGxJMfMJ41T0o69VZcuTDWzF0aZH8W2MzyCITsfy2mEcmjkyBdDyVOhf3nlub6I3NTbo93a088Ns2I76FmhEU507FNk2oG861Go7j6NFm7f/fCX7/L4qj80jhSS8Ku176fwF9lye4"));
+      px.insert("wrap/data/RAS",unz("eNoLCHHKLMlNLHAqTUtLLYqPZ2JAACYo5gBiRqjYfyh4LDTx9/rElMsHThz5M7916lt7BgC22xkW"));
+      px.insert("wrap/data/MSK",unz("eNoLCHHKLMlNLHAqTUtLLYqPZ2JAACYkzAgV+w8Fv+8f+CDPAACwShHE"));
+      px.insert("wrap/data/HID",unz("eNoLCHHKLMlNLHAqTUtLLYqPZ2JAACYo5gBiRqjYfyhITkj4cb6hhREAz3ISEA=="));
+      PxdImportStats ps;
+      const Document pd=importPxdDocument(px,&ps);
+      check(pd.pageSize==QSizeF(20,10), "Pixelmator: the document's size becomes the page, whatever folder wraps the file");
+      check(pd.shapes.size()==3 && ps.rasterLayers==2 && ps.vectorLayers==1 && ps.groups==1 && ps.masks==1, "Pixelmator: the layers arrive, with the mask taken out of the list");
+      if(pd.shapes.size()==3){
+        const Shape& off=pd.shapes[0]; const Shape& ras=pd.shapes[1]; const Shape& grp=pd.shapes[2];
+        check(off.name==QStringLiteral("Off") && !off.visible, "Pixelmator: index 0 is the top of the stack, and a hidden layer stays hidden");
+        check(ras.name==QStringLiteral("Paint") && ras.blend==QPainter::CompositionMode_Multiply && qAbs(ras.opacity-0.5)<.01, "Pixelmator: name, blend mode and opacity");
+        check(qAbs(ras.docBounds().left()-4)<.01 && qAbs(ras.docBounds().top()-1)<.01, "Pixelmator: points scale up to pixels, and y runs up from the bottom");
+        const QImage im=ras.fill.image;
+        check(im.size()==QSize(2,2) && qRed(im.pixel(0,0))==30 && qBlue(im.pixel(0,0))==10 && qAlpha(im.pixel(1,1))==255, "Pixelmator: rows are blue, green, red, alpha");
+        check(qAlpha(im.pixel(1,0))==128*128/255 && qAlpha(im.pixel(0,1))==0, "Pixelmator: a grey mask multiplies the layer's alpha");
+        check(grp.type==ShapeType::Group && !grp.isolate && grp.children.size()==1, "Pixelmator: a pass-through group stays open");
+        if(grp.children.size()==1){
+          const Shape& box=grp.children[0];
+          check(box.fill.color==QColor(255,0,0) && box.stroke.enabled && box.stroke.color==QColor(0,0,255) && qAbs(box.stroke.width-1)<.01, "Pixelmator: a shape's fill and stroke styles");
+          const QRectF b=box.docBounds();
+          check(qAbs(b.left()-10)<1.1 && qAbs(b.width()-4)<2.1 && qAbs(b.height()-2)<2.1, "Pixelmator: a shape's outline sits in its box");
+        }
+      }
+      check(importPxdDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "Pixelmator: an archive with no database gives nothing");
+    }
 
     std::printf("\n\033[1m%d passed, %d failed\033[0m\n\n", g_pass, g_fail);
     return g_fail==0 ? 0 : 1;

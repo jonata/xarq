@@ -8,6 +8,8 @@
 namespace xara {
 // True when compiled with libcdr support.
 bool cdrVectorAvailable();
+// A compressed exchange file (.ccx/.cpx) rebuilt as plain CMX; anything else comes back as it was.
+QByteArray unpackCorelExchange(const QByteArray& data);
 // Parse a CorelDRAW document (raw .cdr/.cmx bytes) into one standard SVG string per page.
 // Returns an empty list if libcdr is unavailable, the data isn't a supported CDR, or parsing fails.
 QStringList cdrToSvgPages(const QByteArray& data);

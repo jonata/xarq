@@ -367,6 +367,14 @@ public:
     bool importXfig(const QString& path);                            // Xfig (.fig) drawing → editable vectors (native)
     bool importCgm(const QString& path);                             // CGM binary (ISO 8632) → editable vectors (native)
     bool importSvgz(const QString& path);                            // gzipped SVG (.svgz) → editable shapes (native inflate → SVG parser)
+    bool importXd(const QString& path);                              // Adobe XD → editable vectors, a page per artboard
+    bool adoptLayers(const Document& pd, const QString& path, const char* undo, const QString& note);
+    bool importProcreate(const QString& path);                       // Procreate → layers
+    bool importCptFile(const QString& path);                         // Corel PHOTO-PAINT, where its compression can be read
+    bool importPxd(const QString& path);                             // Pixelmator Pro → layers
+    bool importClip(const QString& path);                            // Clip Studio Paint → layers
+    bool importPsp(const QString& path);                             // PaintShop Pro → layers
+    bool importFxg(const QString& path);                             // Adobe FXG → editable vectors
     bool importCmx(const QString& path);                             // Corel Presentation Exchange (.cmx) → editable vectors (via libcdr CMXDocument)
     bool importGerber(const QString& path);                          // Gerber RS-274X PCB image → editable vector paths/pads (native)
     bool importExcellon(const QString& path);                        // Excellon/XNC PCB drill file → editable circles (native)

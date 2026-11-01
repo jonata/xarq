@@ -2092,6 +2092,9 @@ QImage importPsd(const QByteArray& d){
     return planesToImage(ci, W, H, planes, alpha.isEmpty() ? nullptr : &alpha);
 }
 
+Shape psdBitmapShape(const QImage& img, int x, int y, const QString& name){ return bitmapShape(img, x, y, name); }
+void psdApplyBlend(Shape& s, const QByteArray& key){ applyBlend(s, key); }
+
 Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
     Document doc;
     if(d.size() < 26 || d.left(4) != "8BPS") return doc;

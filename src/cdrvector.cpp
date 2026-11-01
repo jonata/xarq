@@ -3,6 +3,49 @@
 // resulting drawing calls into standard SVG, which we hand to XarQ's own SVG importer. This keeps all
 // libcdr/librevenge headers confined to this single translation unit.
 #include "cdrvector.h"
+#include <zlib.h>
+
+namespace xara {
+// A .ccx / .cpx is a CMX whose body is deflated: RIFF "CDRX" holding a "pack" chunk of u32 size,
+// "CPng", u16 1, u16 4, then a zlib stream of the chunks that would have followed. libcdr only reads the
+// plain form, so rebuild it. Anything else comes back untouched.
+QByteArray unpackCorelExchange(const QByteArray& d) {
+    const int n = d.size();
+    if (n < 12 || (qstrncmp(d.constData(), "RIFF", 4) != 0 && qstrncmp(d.constData(), "RIFX", 4) != 0)
+        || qstrncmp(d.constData() + 8, "CDRX", 4) != 0) return d;
+    const bool big = d[3] == 'X';
+    const uchar* p = reinterpret_cast<const uchar*>(d.constData());
+    auto u32 = [&](int o) -> quint32 {
+        return big ? (quint32(p[o]) << 24 | p[o+1] << 16 | p[o+2] << 8 | p[o+3])
+                   : (quint32(p[o+3]) << 24 | p[o+2] << 16 | p[o+1] << 8 | p[o]); };
+    QByteArray body;
+    qint64 pos = 12;
+    while (pos + 8 <= n) {
+        const quint32 len = u32(int(pos) + 4);
+        if (len > quint32(n) || pos + 8 + qint64(len) > n) break;
+        if (qstrncmp(d.constData() + pos, "pack", 4) == 0) {
+            if (len < 13 || qstrncmp(d.constData() + pos + 12, "CPng", 4) != 0) return QByteArray();
+            const quint32 want = u32(int(pos) + 8);
+            if (want == 0 || want > (1u << 30)) return QByteArray();
+            QByteArray out(int(want), Qt::Uninitialized);
+            uLongf got = want;
+            if (uncompress(reinterpret_cast<Bytef*>(out.data()), &got,
+                           reinterpret_cast<const Bytef*>(d.constData() + pos + 20), len - 12) != Z_OK) return QByteArray();
+            out.resize(int(got));
+            body += out;
+        } else {
+            body.append(d.constData() + pos, int(8 + len));
+            if (len & 1) body.append('\0');
+        }
+        pos += 8 + qint64(len) + (len & 1);
+    }
+    QByteArray r = d.left(4);
+    const quint32 sz = quint32(body.size()) + 4;
+    const char szb[4] = { char(big ? sz >> 24 : sz), char(big ? sz >> 16 : sz >> 8), char(big ? sz >> 8 : sz >> 16), char(big ? sz : sz >> 24) };
+    r.append(szb, 4); r.append("CMX1", 4); r += body;
+    return r;
+}
+}   // namespace xara
 
 #ifdef HAVE_LIBCDR
 #include <librevenge/librevenge.h>
@@ -51,8 +94,9 @@ QStringList cdrToSvgPages(const QByteArray& data) {
 
 // Corel Presentation Exchange (.cmx) — same libcdr, different document class. CMX is also a RIFF
 // container, so the same nesting-depth guard applies before we hand bytes to the parser.
-QStringList cmxToSvgPages(const QByteArray& data) {
+QStringList cmxToSvgPages(const QByteArray& packed) {
     QStringList pages;
+    const QByteArray data = unpackCorelExchange(packed);
     if (data.isEmpty() || !riffDepthOk(data)) return pages;
     librevenge::RVNGStringStream input(reinterpret_cast<const unsigned char*>(data.constData()),
                                        static_cast<unsigned>(data.size()));

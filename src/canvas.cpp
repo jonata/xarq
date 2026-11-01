@@ -1,5 +1,7 @@
 #include "canvas.h"
 #include "pdfvector.h"
+#include "fxgvector.h"
+#include "xdvector.h"
 #include "render.h"
 #include "pathedit.h"
 #include "photoops.h"
@@ -36,6 +38,7 @@
 #include <QUrl>
 #include <QFileInfo>
 #include <QDir>
+#include <QDirIterator>
 #include <QDate>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -1664,8 +1667,16 @@ bool Canvas::dropImportByExtension(const QString& p){
     if(ends(".epub")) return importEpub(p);
     if(ends(".docx")) return importDocx(p);
     if(ends(".fb2")||ends(".fb2.zip")||ends(".fbz")) return importFb2(p);   // FictionBook e-book
-    if(ends(".cdr"))  return importCdr(p);
+    if(ends(".cdr")||ends(".cdt")||ends(".cdx")||ends(".cdrx")||ends(".des"))  return importCdr(p);   // templates, compressed and Designer files
+    if(ends(".ccx")||ends(".cpx")) return importCdr(p);   // falls back on the file's own preview if it has no vectors
     if(ends(".cmx"))  return importCmx(p);
+    if(ends(".fxg"))  return importFxg(p);
+    if(ends(".xd"))   return importXd(p);
+    if(ends(".clip")) return importClip(p);
+    if(ends(".pxd"))  return importPxd(p);
+    if(ends(".cpt"))  return importCptFile(p);
+    if(ends(".procreate")) return importProcreate(p);
+    if(ends(".psp")||ends(".pspimage")||ends(".psptube")||ends(".pspframe")||ends(".pspmask")||ends(".tub")) return importPsp(p);
     if(ends(".rtf"))  return importRtfFile(p);
     if(ends(".cbz"))  return importCbz(p);
     if(ends(".cbr")||ends(".cb7")||ends(".cbt")) return importCbr(p);

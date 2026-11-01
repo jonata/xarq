@@ -720,7 +720,7 @@ static QString imageImportFilter(){
 // Every vector / page / document format Canvas::dropImportByExtension() routes to a first-party importer.
 // KEEP IN SYNC with that dispatcher (src/canvas.cpp) — the Open dialog builds its filter from this.
 static QString vectorImportPatterns(){
-    return "*.svg *.svgz *.pdf *.ai *.eps *.epsi *.ept *.ept2 *.ept3 *.epsf *.eps2 *.eps3 *.epi *.ps *.ps2 *.ps3 *.dxf *.dwg *.cdr *.cmx *.wmf *.apm "
+    return "*.svg *.svgz *.pdf *.ai *.eps *.epsi *.ept *.ept2 *.ept3 *.epsf *.eps2 *.eps3 *.epi *.ps *.ps2 *.ps3 *.dxf *.dwg *.cdr *.cdt *.cdx *.cdrx *.des *.cmx *.ccx *.cpx *.fxg *.xd *.clip *.procreate *.pxd *.cpt *.psp *.pspimage *.psptube *.pspframe *.pspmask *.tub *.wmf *.apm "
            "*.afdesign *.afphoto *.afpub *.aftemplate *.afpackage *.af *.epub *.fb2 *.fb2.zip *.fbz *.docx *.rtf *.odg *.odp *.odt *.ods *.otg *.otp *.ott *.fodg *.fodp *.fodt "
            "*.sxd *.sxi *.sxw *.std *.sti *.cbz *.cbr *.cb7 *.cbt *.apng *.gif "
            "*.wpg *.vsd *.vsdx *.vdx *.vss *.vssx *.vst *.vstx *.vsdm "
@@ -766,7 +766,7 @@ void MainWindow::buildMenus() {
         importIntoDoc(p,[this,&p]{ return p.endsWith(".gif",Qt::CaseInsensitive) ? m_canvas->importAnimatedGif(p) : m_canvas->importImage(p); }); },QKeySequence("Ctrl+Shift+I"));
     mFile->addAction("Import RTF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import RTF","","Rich Text (*.rtf)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importRtfFile(p); }); });
     mFile->addAction("Import Word (DOCX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import DOCX","","Word document (*.docx)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importDocx(p); }); });
-    mFile->addAction("Import CorelDRAW (CDR / CMX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import CDR","","CorelDRAW (*.cdr *.cmx)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
+    mFile->addAction("Import CorelDRAW (CDR / CMX)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import CDR","","CorelDRAW (*.cdr *.cdt *.cdx *.cdrx *.des *.cmx *.ccx *.cpx)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
     mFile->addAction("Import SVG…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import SVG","","SVG (*.svg)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importSvgFile(p); }); });
     mFile->addAction("Import PostScript/EPS/AI/PDF/DXF/DWG/WMF/EMF…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector","","Vector (*.ps *.eps *.epsi *.ept *.ai *.pdf *.dxf *.dwg *.wmf *.emf *.apm)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
     mFile->addAction("Import EPUB…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import EPUB","","EPUB e-book (*.epub)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importEpub(p); }); });
