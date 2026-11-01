@@ -3,7 +3,7 @@
 // dev headers, and everything degrades to an empty image if the runtime library isn't present.
 #include "qr.h"
 #include <QPainter>
-#include <dlfcn.h>
+#include "dlcompat.h"
 
 namespace xara {
 namespace {

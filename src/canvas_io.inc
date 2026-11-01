@@ -13,7 +13,7 @@
 #include <QJsonValue>
 #include <QXmlStreamReader>
 #include <QPainter>
-#include <dlfcn.h>
+#include "dlcompat.h"
 #include <zlib.h>
 #include "xar.h"
 #include "gif.h"

@@ -5,7 +5,7 @@
 #include "icc.h"
 #include <QDir>
 #include <QFileInfo>
-#include <dlfcn.h>
+#include "dlcompat.h"
 
 namespace xara {
 

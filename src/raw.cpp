@@ -4,7 +4,7 @@
 // falls back (or reports "couldn't load").
 #include "raw.h"
 #include <QFileInfo>
-#include <dlfcn.h>
+#include "dlcompat.h"
 #include <cstring>
 
 namespace xara {

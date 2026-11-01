@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=XarQ
+Comment=Vector graphics, photo and web design
+Exec=xarq %F
+Icon=xarq
+Terminal=false
+Categories=Graphics;VectorGraphics;

@@ -2511,7 +2511,7 @@ void MainWindow::buildTitleBar(){
 
     // RIGHT — mark + wordmark + version on a faint curved tab, then the window controls
     auto* brand=new QLabel("<img src=':/xarq/assets/logo/xarq-mark.svg' width='14' height='14' style='vertical-align:middle'>"
-                           "&nbsp;&nbsp;<b>XarQ</b>&nbsp; v0.9");
+                           "&nbsp;&nbsp;<b>XarQ</b>&nbsp; v" XARQ_VERSION);
     brand->setObjectName("brandTab"); brand->setTextFormat(Qt::RichText); brand->setFixedHeight(36);
     h->addWidget(brand,0,Qt::AlignRight|Qt::AlignTop);
     auto mkWin=[&](const QString& glyph,const QString& tip){

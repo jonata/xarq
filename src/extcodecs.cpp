@@ -4,7 +4,7 @@
 #include "extcodecs.h"
 #include <QFileInfo>
 #include <QFile>
-#include <dlfcn.h>
+#include "dlcompat.h"
 #include <cstring>
 #include <vector>
 

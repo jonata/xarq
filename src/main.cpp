@@ -390,6 +390,7 @@ int main(int argc, char** argv) {
     app.setApplicationName("XarQ");
     app.setApplicationDisplayName("XarQ");
     app.setOrganizationName("XarQ");
+    app.setApplicationVersion(XARQ_VERSION);
     applyTheme(app);
     app.installEventFilter(new RoundPopups(&app));   // translucent (rounded) menu + dropdown popups
     app.installEventFilter(new ShortcutGuard(&app)); // single-key tool shortcuts never steal a keystroke from a focused input

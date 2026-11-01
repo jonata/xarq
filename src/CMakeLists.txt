@@ -9,6 +9,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# The version the app shows. The release builds pass the tag's (without the leading "v").
+set(XARQ_VERSION "26.10-alpha" CACHE STRING "Version shown by the app")
+
 find_package(Qt6 REQUIRED COMPONENTS Widgets Svg PrintSupport)
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -109,12 +112,29 @@ add_executable(xarq
     selftest.cpp
     resources.qrc
 )
+# The self-test is one enormous function: GCC 13 at -O3 takes close to an hour over it, and it gains nothing.
+set_source_files_properties(selftest.cpp PROPERTIES COMPILE_OPTIONS "-O0")
 # canvas.cpp #includes canvas_input.inc / canvas_io.inc
 set_source_files_properties(canvas.cpp PROPERTIES OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/canvas_input.inc;${CMAKE_CURRENT_SOURCE_DIR}/canvas_io.inc")
 
 target_link_libraries(xarq PRIVATE Qt6::Widgets Qt6::Svg Qt6::PrintSupport ZLIB::ZLIB ${CMAKE_DL_LIBS} ${HARFBUZZ_LIBRARIES})
 target_include_directories(xarq PRIVATE ${HARFBUZZ_INCLUDE_DIRS})
+target_compile_definitions(xarq PRIVATE XARQ_VERSION="${XARQ_VERSION}")
+
+# Windows: a windowed app with its icon, and dlopen's stand-in. MinGW's default object format runs out of
+# sections on the largest sources.
+if(WIN32)
+    enable_language(RC)
+    # MSYS2's GCC 16 at -O3 makes the fractal fill differ from call to call in xar.cpp (cause not found; the same
+    # generator alone is stable). The self-test's determinism check guards this.
+    set_source_files_properties(xar.cpp PROPERTIES COMPILE_OPTIONS "-O1")
+    set_target_properties(xarq PROPERTIES WIN32_EXECUTABLE TRUE)
+    target_sources(xarq PRIVATE dlcompat.cpp xarq.rc)
+    if(MINGW)
+        target_compile_options(xarq PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wa,-mbig-obj>)
+    endif()
+endif()
 
 if(LIBCDR_FOUND)
     target_compile_definitions(xarq PRIVATE HAVE_LIBCDR)
@@ -150,6 +170,7 @@ endforeach()
 pkg_check_modules(POPPLER poppler)
 if(POPPLER_FOUND AND POPPLER_VERSION VERSION_GREATER_EQUAL "26.1" AND EXISTS "${POPPLER_INCLUDEDIR}/poppler/SplashOutputDev.h")
     set_source_files_properties(pdfvector.cpp PROPERTIES COMPILE_DEFINITIONS "HAVE_POPPLER" COMPILE_OPTIONS "-std=c++20" INCLUDE_DIRECTORIES "${POPPLER_INCLUDEDIR}/poppler")
+    target_link_directories(xarq PRIVATE ${POPPLER_LIBRARY_DIRS})
     target_link_libraries(xarq PRIVATE ${POPPLER_LIBRARIES})
 endif()
 
@@ -207,6 +228,9 @@ endif()
 if(OPENSLIDE_FOUND)
     target_link_directories(xarq PRIVATE ${OPENSLIDE_LIBRARY_DIRS})
     target_link_libraries(xarq PRIVATE ${OPENSLIDE_LIBRARIES})
+    # A file's own include path isn't filtered as a target's is, and the compiler's own directory there breaks
+    # the standard library's #include_next (OpenSlide and Graphviz give it on Windows).
+    list(REMOVE_ITEM OPENSLIDE_INCLUDE_DIRS ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
     set_source_files_properties(slide.cpp PROPERTIES
         COMPILE_DEFINITIONS "HAVE_OPENSLIDE"
         INCLUDE_DIRECTORIES "${OPENSLIDE_INCLUDE_DIRS}")
@@ -249,6 +273,9 @@ else()
     message(STATUS "Graphviz DOT import: disabled (install libgraphviz-dev to enable)")
 endif()
 if(GIS_DEFS)
+    if(GIS_INCS)
+        list(REMOVE_ITEM GIS_INCS ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
+    endif()
     set_source_files_properties(gisvector.cpp PROPERTIES
         COMPILE_DEFINITIONS "${GIS_DEFS}"
         INCLUDE_DIRECTORIES "${GIS_INCS}")
