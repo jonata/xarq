@@ -16,6 +16,7 @@
 #include <QPainter>
 #include <QRadialGradient>
 #include <QTemporaryDir>
+#include <QToolButton>
 #include <QTemporaryFile>
 #include <QFile>
 #include <QProcess>
@@ -12790,6 +12791,26 @@ if(xara::pdfVectorAvailable()){
         }
       }
       check(importPxdDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "Pixelmator: an archive with no database gives nothing");
+    }
+
+    std::printf("[save] the green wave plays when a save lands, and only then\n");
+    { xara::MainWindow sw; sw.setShowWelcome(false); sw.resize(1000,700); sw.show(); QApplication::processEvents();
+      auto* btn=sw.findChild<QToolButton*>("titleSave"); auto* wave=sw.findChild<QWidget*>("saveWave");
+      QTemporaryDir dir; const QString sub=dir.path()+"/sub"; QDir().mkpath(sub);
+      check(btn && wave && sw.canvas()->save(sub+"/wave.xar"), "save wave: the overlay exists and the document has a path");
+      if(btn && wave){
+        QDir(sub).removeRecursively();                 // the folder went away, so the next save can't land
+        emit sw.canvas()->documentChanged();
+        btn->click();
+        check(!wave->isVisible(), "save wave: a failed save plays no wave");
+        check(btn->property("dirty").toBool(), "save wave: a failed save leaves the document unsaved");
+        QDir().mkpath(sub);
+        btn->click();
+        check(wave->isVisible() && wave->geometry()==sw.rect(), "save wave: a save that lands plays over the whole window");
+        check(!btn->property("dirty").toBool(), "save wave: a save that lands clears the unsaved state");
+        sw.resize(1100,760); QApplication::processEvents();
+        check(wave->geometry()==sw.rect(), "save wave: the overlay follows a resize mid-sweep");
+      }
     }
 
     std::printf("\n\033[1m%d passed, %d failed\033[0m\n\n", g_pass, g_fail);

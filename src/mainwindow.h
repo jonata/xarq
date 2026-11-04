@@ -64,7 +64,7 @@ private:
     void buildMenus();
     QToolButton* railButton(Tool t, const QString& tip, const QString& shortcut);
 
-    void newFile(); void openFile(); bool saveFile(); bool saveFileAs(); void exportImage();
+    void newFile(); void openFile(); bool saveFile(); bool saveFileAs(); bool saveTo(const QString& p); void exportImage();
     bool importIntoDoc(const QString& p, const std::function<bool()>& imp);   // import into the current doc + add to Recent on success
     void pageSetup(); void printDocument();
     void about();

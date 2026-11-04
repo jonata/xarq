@@ -153,6 +153,7 @@ protected:
 class SaveWave : public QWidget {
 public:
     explicit SaveWave(QWidget* host): QWidget(host), m_host(host) {
+        setObjectName("saveWave"); host->installEventFilter(this);
         setAttribute(Qt::WA_TransparentForMouseEvents); setAttribute(Qt::WA_NoSystemBackground); setAttribute(Qt::WA_TranslucentBackground);
         m_anim=new QVariantAnimation(this); m_anim->setDuration(1100); m_anim->setEasingCurve(QEasingCurve::OutCubic);
         m_anim->setStartValue(0.0); m_anim->setEndValue(1.0);
@@ -166,6 +167,9 @@ public:
         setGeometry(m_host->rect()); show(); raise();
         m_anim->stop(); m_anim->start(); }
 protected:
+    bool eventFilter(QObject* o, QEvent* e) override {   // stay over the whole window if it's resized mid-sweep
+        if(o==m_host && e->type()==QEvent::Resize) setGeometry(m_host->rect());
+        return false; }
     void paintEvent(QPaintEvent*) override {
         if(m_t<=0.0 || m_t>=1.0 || m_reach<=0.0) return;
         QPainter g(this); g.setRenderHint(QPainter::Antialiasing);
@@ -788,7 +792,7 @@ void MainWindow::buildMenus() {
     mFile->addAction("Save As…",this,[this]{saveFileAs();},QKeySequence("Ctrl+Shift+S"));
     mFile->addAction("Save Compressed XAR…",this,[this]{ QString p=QFileDialog::getSaveFileName(this,"Save Compressed XAR","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog);
         if(p.isEmpty())return; if(!p.endsWith(".xar",Qt::CaseInsensitive))p+=".xar"; if(m_tabs.isEmpty()) ensureLandingTab();
-        if(m_canvas->saveCompressed(p)){ m_dirty=false; addRecentFile(p); updateTitle(); statusBar()->showMessage("Saved compressed: "+p,4000); } else statusBar()->showMessage("Compressed save failed",4000); });
+        if(m_canvas->saveCompressed(p)){ m_dirty=false; addRecentFile(p); updateTitle(); statusBar()->showMessage("Saved compressed: "+p,4000); m_playSaveWave(); } else statusBar()->showMessage("Compressed save failed",4000); });
     mFile->addSeparator();
     mFile->addAction("Page Setup…",this,[this]{pageSetup();});
     mFile->addAction("Page Background Colour…",this,[this]{ QColor c=ColorEditor::pick(this, m_canvas->doc().pageColor, m_canvas); if(c.isValid()) m_canvas->setPageColor(c); });
@@ -1535,8 +1539,11 @@ void MainWindow::buildMenus() {
 void MainWindow::newFile(){ newDocumentTab(); snapshotRecovery(); }   // File▸New opens a fresh document tab
 void MainWindow::openFile(){ QString p=QFileDialog::getOpenFileName(this,"Open",QString(),supportedOpenFilter(),nullptr,QFileDialog::DontUseNativeDialog|QFileDialog::HideNameFilterDetails); if(p.isEmpty()) return; openPath(p); }
 bool MainWindow::saveFile(){ if(m_tabs.isEmpty()) ensureLandingTab();   // Save from the empty state → materialise + reveal the (blank) document, don't act on the hidden canvas
-    QString p=m_canvas->filePath(); if(p.isEmpty()) return saveFileAs(); m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); m_playSaveWave(); return true; }
-bool MainWindow::saveFileAs(){ if(m_tabs.isEmpty()) ensureLandingTab(); QString p=QFileDialog::getSaveFileName(this,"Save As","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return false; if(!p.endsWith(".xar",Qt::CaseInsensitive)) p+=".xar"; m_canvas->save(p); m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); m_playSaveWave(); return true; }
+    QString p=m_canvas->filePath(); if(p.isEmpty()) return saveFileAs(); return saveTo(p); }
+bool MainWindow::saveFileAs(){ if(m_tabs.isEmpty()) ensureLandingTab(); QString p=QFileDialog::getSaveFileName(this,"Save As","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog); if(p.isEmpty())return false; if(!p.endsWith(".xar",Qt::CaseInsensitive)) p+=".xar"; return saveTo(p); }
+bool MainWindow::saveTo(const QString& p){   // a save that didn't land stays unsaved, and gets no wave
+    if(!m_canvas->save(p)){ statusBar()->showMessage("Could not save "+p,6000); return false; }
+    m_dirty=false; addRecentFile(p); updateTitle(); snapshotRecovery(); m_playSaveWave(); return true; }
 
 // ---- recent files + Start screen (DS4) ----
 QStringList MainWindow::recentFiles() const {
