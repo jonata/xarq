@@ -12811,6 +12811,18 @@ if(xara::pdfVectorAvailable()){
         sw.resize(1100,760); QApplication::processEvents();
         check(wave->geometry()==sw.rect(), "save wave: the overlay follows a resize mid-sweep");
       }
+      QMap<QString,QStringList> byKey;                 // two actions on one key make Qt fire neither
+      for(QAction* act : sw.findChildren<QAction*>())
+        for(const QKeySequence& k : act->shortcuts()) byKey[k.toString()]<<(act->text().isEmpty()?act->toolTip():act->text());
+      QStringList doubled;
+      for(auto it=byKey.cbegin(); it!=byKey.cend(); ++it) if(it.value().size()>1) doubled<<it.key()+" = "+it.value().join(" / ");
+      check(doubled.isEmpty(), qPrintable("shortcuts: no key is bound to two commands"+(doubled.isEmpty()?QString():": "+doubled.join("; "))));
+      check(byKey.value("Ctrl+Shift+S")==QStringList{QStringLiteral("Save As…")}, "shortcuts: Ctrl+Shift+S is Save As");
+      check(byKey.value("Ctrl+2")==QStringList{QStringLiteral("Subtract")}, "shortcuts: Ctrl+2 is Combine Shapes > Subtract");
+      check(byKey.value("Ctrl+3")==QStringList{QStringLiteral("Intersect")} && byKey.value("Ctrl+Shift+I")==QStringList{QStringLiteral("Import Image…")}, "shortcuts: Ctrl+3 is Intersect, Ctrl+Shift+I is Import Image");
+      check(byKey.value("Ctrl+Alt+P")==QStringList{QStringLiteral("CMYK Soft Proof")} && byKey.value("Ctrl+Shift+P")==QStringList{QStringLiteral("Convert to Editable Path")}, "shortcuts: Ctrl+Alt+P is Soft Proof, Ctrl+Shift+P is Convert to Editable Path");
+      check(byKey.value("Ctrl+0")==QStringList{QStringLiteral("Fit")}, "shortcuts: Ctrl+0 is View > Fit");
+      check(byKey.value("F11")==QStringList{QStringLiteral("Full Screen")} && byKey.value("Shift+F11")==QStringList{QStringLiteral("Properties / Fills")}, "shortcuts: F11 is Full Screen, Shift+F11 is Properties / Fills");
     }
 
     std::printf("\n\033[1m%d passed, %d failed\033[0m\n\n", g_pass, g_fail);

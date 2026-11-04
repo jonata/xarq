@@ -989,8 +989,8 @@ void MainWindow::buildMenus() {
     mObj->addSeparator();
     auto* mComb=mObj->addMenu("Combine Shapes");
     mComb->addAction("Add (Union)",this,[this]{m_canvas->combineSelection(0);},QKeySequence("Ctrl+Shift+A"));
-    mComb->addAction("Subtract",this,[this]{m_canvas->combineSelection(1);},QKeySequence("Ctrl+Shift+S"));
-    mComb->addAction("Intersect",this,[this]{m_canvas->combineSelection(2);},QKeySequence("Ctrl+Shift+I"));
+    mComb->addAction("Subtract",this,[this]{m_canvas->combineSelection(1);},QKeySequence("Ctrl+2"));   // Xara's key; Ctrl+Shift+S is Save As
+    mComb->addAction("Intersect",this,[this]{m_canvas->combineSelection(2);},QKeySequence("Ctrl+3"));   // Xara's key; Ctrl+Shift+I is Import Image
     mComb->addAction("Difference",this,[this]{m_canvas->combineSelection(3);});
     mComb->addAction("Slice (knife)",this,[this]{ if(m_canvas->selection().size()<2){ statusBar()->showMessage("Select the object to slice plus the knife shape(s) on top.",4000); return; }
         m_canvas->sliceSelection(); statusBar()->showMessage("Sliced — the lower object was cut into inside/outside pieces by the upper outline.",4000); });
@@ -1284,7 +1284,7 @@ void MainWindow::buildMenus() {
     mGal->addAction("Swatches",this,[this]{ revealPanelSection(2); });
     dockToggle(mGal,"pageLayerDock","Pages & Layers","F10");
     mGal->addAction("Object List",this,[this]{ revealPanelSection(1); });
-    { auto* a=mGal->addAction("Properties / Fills"); a->setShortcut(QKeySequence("F11"));
+    { auto* a=mGal->addAction("Properties / Fills"); a->setShortcut(QKeySequence("Shift+F11"));   // F11 is Full Screen
       connect(a,&QAction::triggered,this,[this]{ if(m_rightPanel){ bool v=!m_rightPanel->isVisible(); m_rightPanel->setVisible(v); positionRightPanel(); if(v && m_pokeRightPanel) m_pokeRightPanel(); } }); }
     mGal->addSeparator();
     dockToggle(mGal,"fillGalleryDock","Fill Gallery","");
@@ -1448,7 +1448,7 @@ void MainWindow::buildMenus() {
     mWin->addAction("Layers",this,[this]{ revealPanelSection(1); });
     mWin->addAction("Colour",this,[this]{ revealPanelSection(2); });
     mWin->addSeparator();
-    mWin->addAction("Fit Window",this,[this]{m_canvas->zoomFit();},QKeySequence("Ctrl+0"));
+    mWin->addAction("Fit Window",this,[this]{m_canvas->zoomFit();});   // Ctrl+0 lives on View > Fit
 
     auto* mView=m_menuBar->addMenu("&View");
     mView->addAction("Zoom In",this,[this]{m_canvas->zoomIn();},QKeySequence("Ctrl++"));
@@ -1484,7 +1484,7 @@ void MainWindow::buildMenus() {
         const bool icc=xara::Icc::instance().available();
         statusBar()->showMessage(on?(icc?("CMYK soft-proof on — ICC profile: "+QFileInfo(xara::Icc::instance().currentCmykProfile()).fileName())
                                          :"CMYK soft-proof on (approximate — no Little-CMS)"):"CMYK soft-proof off",3500); });
-    aProof->setCheckable(true); aProof->setChecked(m_canvas->softProof()); aProof->setShortcut(QKeySequence("Ctrl+Shift+P"));
+    aProof->setCheckable(true); aProof->setChecked(m_canvas->softProof()); aProof->setShortcut(QKeySequence("Ctrl+Alt+P"));
     { auto* aGamut=mView->addAction("Gamut Warning",this,[this](bool on){ m_canvas->setGamutWarn(on);
         statusBar()->showMessage(on?"Gamut warning on — out-of-CMYK-gamut areas shown grey":"Gamut warning off",3500); });
       aGamut->setCheckable(true); aGamut->setChecked(m_canvas->gamutWarn()); }
