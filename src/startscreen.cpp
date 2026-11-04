@@ -355,6 +355,7 @@ QWidget* StartScreen::buildPanel(MainWindow* mw, std::function<void()> onChosen)
 
 void StartScreen::show(MainWindow* mw){
     QDialog dlg(mw); dlg.setObjectName("startDialog"); dlg.setWindowTitle("Welcome to XarQ");
+    dlg.setProperty("xqChrome",false);   // a full page with its own layout, not a Subtitld-style dialog
     dlg.setModal(true); dlg.resize(1120,720);
     dlg.setStyleSheet(QString::fromUtf8(kStartQss));
     auto* outer=new QVBoxLayout(&dlg); outer->setContentsMargins(0,0,0,0); outer->setSpacing(0);

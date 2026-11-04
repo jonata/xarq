@@ -2031,27 +2031,20 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
     auto qualityFmt=[&]{ return curFmt=="jpg"||curFmt=="webp"; };
 
     // ---- shell ----
-    QDialog dlg(this); dlg.setObjectName("exportDlg"); dlg.setModal(true);
-    dlg.setWindowFlags(Qt::Dialog|Qt::FramelessWindowHint);
+    QDialog dlg(this); dlg.setObjectName("exportDlg"); dlg.setModal(true); dlg.setWindowTitle("Export bitmap");   // DialogChrome draws the title bar and footer
     dlg.resize(1080, 700);
     dlg.setStyleSheet(R"QSS(
-        #exportDlg { background:#1A232B; border:1px solid rgba(255,255,255,0.16); }
-        #expHeader,#expFooter { background:#0D1216; }
-        #expTitle { font-family:"Montserrat"; font-weight:700; font-size:15px; color:#F0F6FB; }
-        #expDoc,#expOutPath { font-family:"Ubuntu Mono"; font-size:11px; color:#7A93A7; }
+        #expFooter { background:transparent; }
+        #expOutPath { font-family:"Ubuntu Mono"; font-size:11px; color:#7A93A7; }
         #expOut { font-family:"Ubuntu Mono"; font-size:12px; color:#B8CEE0; }
         #expReadout { font-family:"Ubuntu Mono"; font-size:11px; color:#8EA6B9; }
-        #expClose { color:#8EA6B9; border:none; font-size:16px; font-weight:700; background:transparent; }
-        #expClose:hover { color:#F0F6FB; }
         QLabel[secHdr="true"] { color:#7A93A7; font-weight:700; font-size:11px; }
         QLabel[rowLbl="true"] { color:#8EA6B9; font-size:12px; }
-        #expRail { background:#1A232B; border-left:1px solid rgba(255,255,255,0.10); }
+        #expRail { background:transparent; border-left:1px solid rgba(255,255,255,0.10); }
         QToolButton[seg="true"] { background:#304251; border:1px solid rgba(255,255,255,0.10); color:#8EA6B9; padding:3px 9px; font-size:11px; }
         QToolButton[seg="true"]:checked { background:rgba(184,206,224,0.24); border:1px solid #B8CEE0; color:#C8DBE9; }
         QToolButton[card="true"] { background:#304251; border:1px solid rgba(255,255,255,0.10); border-radius:3px; text-align:left; padding:8px 10px; color:#B8CEE0; font-weight:700; font-size:12px; }
         QToolButton[card="true"]:checked { background:rgba(184,206,224,0.16); border:1px solid #B8CEE0; color:#C8DBE9; }
-        #expPrimary { background:#B8CEE0; color:#304251; border:none; border-radius:2px; padding:9px 20px; font-weight:700; }
-        #expPrimary:hover { background:#3B79FF; }
         #expGhost { background:transparent; color:#8EA6B9; border:1px solid rgba(255,255,255,0.10); border-radius:2px; padding:9px 16px; }
         #expGhost:hover { color:#F0F6FB; background:#212D37; }
         QLineEdit { background:#304251; border:1px solid rgba(255,255,255,0.10); border-radius:3px; color:#B8CEE0; padding:4px 7px; }
@@ -2062,17 +2055,6 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
     )QSS");
 
     auto* root=new QVBoxLayout(&dlg); root->setContentsMargins(0,0,0,0); root->setSpacing(0);
-
-    // ---- header ----
-    auto* header=new QWidget; header->setObjectName("expHeader"); header->setFixedHeight(48);
-    { auto* h=new QHBoxLayout(header); h->setContentsMargins(16,0,10,0); h->setSpacing(10);
-      auto* dot=new QLabel; dot->setFixedSize(9,9); dot->setStyleSheet("background:#B8CEE0;border-radius:2px;");
-      auto* title=new QLabel("Export bitmap"); title->setObjectName("expTitle");
-      auto* doc=new QLabel(QFileInfo(initialPath).fileName()); doc->setObjectName("expDoc");
-      auto* close=new QToolButton; close->setObjectName("expClose"); close->setText("✕"); close->setCursor(Qt::PointingHandCursor);
-      connect(close,&QToolButton::clicked,&dlg,&QDialog::reject);
-      h->addWidget(dot); h->addWidget(title); h->addSpacing(4); h->addWidget(doc); h->addStretch(); h->addWidget(close); }
-    root->addWidget(header);
 
     // ---- body ----
     auto* body=new QWidget; auto* bodyH=new QHBoxLayout(body); bodyH->setContentsMargins(0,0,0,0); bodyH->setSpacing(0);
@@ -2098,15 +2080,17 @@ bool MainWindow::bitmapExportDialog(const QString& initialPath){
     bodyH->addWidget(rail);
 
     // ---- footer ----
-    auto* footer=new QWidget; footer->setObjectName("expFooter"); footer->setFixedHeight(58);
+    auto* footer=new QWidget; footer->setObjectName("expFooter"); footer->setFixedHeight(48);
     auto* outLine=new QLabel; outLine->setObjectName("expOut");
     auto* outPathLbl=new QLabel; outPathLbl->setObjectName("expOutPath");
-    auto* cancelBtn=new QPushButton("Cancel"); cancelBtn->setObjectName("expGhost"); cancelBtn->setCursor(Qt::PointingHandCursor);
-    auto* exportBtn=new QPushButton("Export"); exportBtn->setObjectName("expPrimary"); exportBtn->setCursor(Qt::PointingHandCursor); exportBtn->setDefault(true);
-    { auto* f=new QHBoxLayout(footer); f->setContentsMargins(16,0,16,0); f->setSpacing(12);
+    auto* cancelBtn=new QPushButton("Cancel");
+    auto* exportBtn=new QPushButton("Export"); exportBtn->setDefault(true);
+    { auto* f=new QHBoxLayout(footer); f->setContentsMargins(15,0,15,0); f->setSpacing(12);
       auto* col=new QVBoxLayout; col->setSpacing(3); col->addWidget(outLine); col->addWidget(outPathLbl);
-      f->addLayout(col); f->addStretch(); f->addWidget(cancelBtn); f->addWidget(exportBtn); }
+      f->addLayout(col); f->addStretch(); }
     root->addWidget(footer);
+    { auto* bb=new QDialogButtonBox; bb->addButton(exportBtn,QDialogButtonBox::AcceptRole); bb->addButton(cancelBtn,QDialogButtonBox::RejectRole);
+      root->addWidget(bb); }   // DialogChrome puts these in the Subtitld footer
     connect(cancelBtn,&QPushButton::clicked,&dlg,&QDialog::reject);
 
     // ---- helpers to build controls ----

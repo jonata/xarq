@@ -748,9 +748,10 @@ void FindReplace::show(QWidget* parent, Canvas* canvas){
         return QRegularExpression(pat, caseCb->isChecked()?QRegularExpression::NoPatternOption:QRegularExpression::CaseInsensitiveOption); };
     auto contains=[=](const QString& hay, const QString& q){ return rx(q).match(hay).hasMatch(); };
     auto countIn =[=](const QString& hay, const QString& q){ int c=0; auto it=rx(q).globalMatch(hay); while(it.hasNext()){ it.next(); ++c; } return c; };
-    auto* row=new QHBoxLayout;
     auto* findBtn=new QPushButton("Find Next"); auto* replBtn=new QPushButton("Replace"); auto* allBtn=new QPushButton("Replace All"); auto* closeBtn=new QPushButton("Close");
-    row->addWidget(findBtn); row->addWidget(replBtn); row->addWidget(allBtn); row->addStretch(); row->addWidget(closeBtn); f->addRow(row);
+    { auto* bb=new QDialogButtonBox;   // roles only place the buttons in the footer (Close left, Find Next rightmost); each is wired below
+      bb->addButton(replBtn,QDialogButtonBox::ActionRole); bb->addButton(allBtn,QDialogButtonBox::ActionRole);
+      bb->addButton(findBtn,QDialogButtonBox::AcceptRole); bb->addButton(closeBtn,QDialogButtonBox::RejectRole); f->addRow(bb); }
 
     static int findFrom=0;
     auto findNext=[=,&dlg]{ QString q=findEd->text(); if(q.isEmpty())return; auto& sh=canvas->doc().shapes; int n=sh.size();

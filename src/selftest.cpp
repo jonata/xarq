@@ -17,6 +17,10 @@
 #include <QRadialGradient>
 #include <QTemporaryDir>
 #include <QToolButton>
+#include <QDialog>
+#include <QLabel>
+#include <QMessageBox>
+#include <QDialogButtonBox>
 #include <QTemporaryFile>
 #include <QFile>
 #include <QProcess>
@@ -12824,6 +12828,39 @@ if(xara::pdfVectorAvailable()){
       check(byKey.value("Ctrl+0")==QStringList{QStringLiteral("Fit")}, "shortcuts: Ctrl+0 is View > Fit");
       check(byKey.value("F11")==QStringList{QStringLiteral("Full Screen")} && byKey.value("Shift+F11")==QStringList{QStringLiteral("Properties / Fills")}, "shortcuts: F11 is Full Screen, Shift+F11 is Properties / Fills");
     }
+
+    std::printf("[dialogs] every dialog wears Subtitld's chrome\n");
+    { QDialog d; d.setWindowTitle("Chrome test"); auto* v=new QVBoxLayout(&d); v->addWidget(new QLineEdit);
+      auto* bb=new QDialogButtonBox(QDialogButtonBox::Ok|QDialogButtonBox::Cancel); v->addWidget(bb);
+      QObject::connect(bb,&QDialogButtonBox::accepted,&d,&QDialog::accept); QObject::connect(bb,&QDialogButtonBox::rejected,&d,&QDialog::reject);
+      d.show(); QApplication::processEvents();
+      auto* bottom=d.findChild<QWidget*>("dialogBottom");
+      QPushButton* okP=nullptr; QPushButton* cancelP=nullptr;
+      if(bottom) for(QPushButton* p : bottom->findChildren<QPushButton*>()){ if(p->text()=="OK") okP=p; if(p->text()=="Cancel") cancelP=p; }
+      check(d.findChild<QWidget*>("dialogFrame") && d.windowFlags().testFlag(Qt::FramelessWindowHint), "dialogs: a dialog gets the frameless gradient frame");
+      auto* tl=d.findChild<QLabel*>("dialogTitleLabel");
+      check(tl && tl->text()=="Chrome test", "dialogs: the window title is drawn in the dialog");
+      d.setWindowTitle("Renamed"); QApplication::processEvents();
+      check(tl && tl->text()=="Renamed", "dialogs: the drawn title follows the window title");
+      check(okP && cancelP && okP->property("footer").toString()=="tab" && cancelP->property("footer").toString()=="left", "dialogs: OK sits on the footer tab, Cancel on the left");
+      check(okP && okP->isDefault(), "dialogs: the affirmative footer button is the default (Enter)");
+      bb->button(QDialogButtonBox::Ok)->setEnabled(false); QApplication::processEvents();
+      check(okP && !okP->isEnabled(), "dialogs: the footer button follows its original's enabled state");
+      bb->button(QDialogButtonBox::Ok)->setEnabled(true); QApplication::processEvents();
+      if(okP) okP->click();
+      check(d.result()==QDialog::Accepted && !d.isVisible(), "dialogs: clicking the footer OK accepts the dialog");
+      d.show(); QApplication::processEvents(); if(cancelP) cancelP->click();
+      check(d.result()==QDialog::Rejected, "dialogs: clicking the footer Cancel rejects the dialog");
+      d.show(); QApplication::processEvents(); if(auto* x=d.findChild<QToolButton*>("dialogClose")) x->click();
+      check(d.result()==QDialog::Rejected && !d.isVisible(), "dialogs: the notch's close button rejects the dialog"); }
+    { QMessageBox mb(QMessageBox::Question,"Ask","Proceed?",QMessageBox::Yes|QMessageBox::No);
+      mb.show(); QApplication::processEvents();
+      QPushButton* yesP=nullptr; if(auto* b=mb.findChild<QWidget*>("dialogBottom")) for(QPushButton* p : b->findChildren<QPushButton*>()) if(p->text()=="Yes") yesP=p;
+      check(yesP && yesP->property("footer").toString()=="tab", "dialogs: a message box's Yes is on the footer tab");
+      if(yesP) yesP->click();
+      check(mb.clickedButton()==mb.button(QMessageBox::Yes), "dialogs: a message box reports the button clicked in the footer"); }
+    { QDialog plain; plain.setProperty("xqChrome",false); new QVBoxLayout(&plain); plain.show(); QApplication::processEvents();
+      check(!plain.findChild<QWidget*>("dialogFrame"), "dialogs: xqChrome=false keeps a dialog as built"); }
 
     std::printf("\n\033[1m%d passed, %d failed\033[0m\n\n", g_pass, g_fail);
     return g_fail==0 ? 0 : 1;

@@ -61,6 +61,7 @@ find_library(LIBREDWG_LIBRARY NAMES redwg HINTS $ENV{HOME}/.local/lib /usr/local
 
 add_executable(xarq
     main.cpp
+    dialogchrome.cpp
     mainwindow.cpp
     canvas.cpp
     model.cpp

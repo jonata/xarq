@@ -19,6 +19,11 @@
 #include <QStandardPaths>
 #include <QIcon>
 #include <QDialog>
+#include <QPainter>
+#include <QAction>
+#include <memory>
+#include <QScreen>
+#include "dialogchrome.h"
 #include <QProcessEnvironment>
 #include <QMenu>
 #include <QEvent>
@@ -269,6 +274,28 @@ static void applyTheme(QApplication& app) {
 
         QDialog { background:#1A232B; }
         QDialog QLabel { color:#B8CEE0; }
+
+        /* Dialog chrome, after Subtitld's SimpleDialog (DialogChrome, dialogchrome.cpp): one gradient top to bottom
+           with 4px corners, the title on it, the close button in a slanted notch, Cancel as text on the left of the
+           footer and the main button on a sky tab at its right. */
+        QDialog[xqChromed="true"] { background:transparent; }
+        QWidget#dialogFrame { background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1E2833, stop:1 #F23A4D5D); border:1px solid #1A232B; border-radius:4px; }
+        QWidget#dialogTitle, QWidget#dialogContent, QWidget#dialogBottom { background:transparent; }
+        QWidget#dialogFrame .QWidget, QWidget#dialogFrame .QFrame, QWidget#dialogFrame QStackedWidget { background:transparent; }   /* plain containers let the gradient through */
+        QDialog[xqChromed="true"] QSizeGrip { image:none; background:transparent; width:12px; height:12px; }
+        QLabel#dialogTitleLabel { background:transparent; padding-left:15px; qproperty-indent:0; font-size:11px; font-weight:700; text-transform:uppercase; color:#F0F6FB; }
+        QWidget#dialogTitleNotch { border-image:url(:/xarq/assets/chrome/dialog-notch.svg) 0 4 1 36 stretch stretch; border-width:0 4px 1px 36px; background:transparent; }
+        QWidget#dialogTitleNotch[hover="true"] { border-image:url(:/xarq/assets/chrome/dialog-notch-hover.svg) 0 4 1 36 stretch stretch; }
+        QToolButton#dialogClose { background:transparent; border:none; padding:0; }
+        QWidget#dialogBottomLeft { border-image:url(:/xarq/assets/chrome/dialog-bottom.svg) 0 32 1 5 stretch stretch; border-width:0 0 1px 5px; background:transparent; }
+        QWidget#dialogBottomRight { border-image:url(:/xarq/assets/chrome/dialog-bottom-right.svg) 5 5 5 24 stretch stretch; border-width:5px 5px 5px 24px; background:transparent; }
+        QWidget#dialogBottom QPushButton { padding:8px 12px; font-size:11px; font-weight:700; text-transform:uppercase; border:none; border-radius:0; background:transparent; min-height:15px; }
+        QWidget#dialogBottom QPushButton[footer="left"] { color:#B8CEE0; padding-left:15px; border-top-right-radius:4px; border-bottom-left-radius:4px; }
+        QWidget#dialogBottom QPushButton[footer="left"]:hover { background:#26B8CEE0; }
+        QWidget#dialogBottom QPushButton[footer="left"]:disabled { color:#566F84; }
+        QWidget#dialogBottom QPushButton[footer="tab"] { color:#1E2B36; }
+        QWidget#dialogBottom QPushButton[footer="tab"]:hover { color:#0D1319; background:transparent; }
+        QWidget#dialogBottom QPushButton[footer="tab"]:disabled { color:#7A93A7; }
         QLabel#printPreview { background:#07090B; border:none; border-radius:2px; }
         QDialog#printDialog QGroupBox { min-width:300px; }
 
@@ -392,6 +419,7 @@ int main(int argc, char** argv) {
     app.setOrganizationName("XarQ");
     app.setApplicationVersion(XARQ_VERSION);
     applyTheme(app);
+    app.installEventFilter(new xara::DialogChrome(&app));   // Subtitld's dialog chrome on every dialog
     app.installEventFilter(new RoundPopups(&app));   // translucent (rounded) menu + dropdown popups
     app.installEventFilter(new ShortcutGuard(&app)); // single-key tool shortcuts never steal a keystroke from a focused input
 
@@ -636,6 +664,33 @@ int main(int argc, char** argv) {
 
     if (!shotPath.isEmpty()) {
         QTimer::singleShot(350,[&]{ w.grab().save(shotPath); app.quit(); });
+    }
+    if (!qEnvironmentVariableIsEmpty("XARA_SHOTDIALOGS")) {   // screenshot dialogs: XARA_SHOTACTIONS="Menu item|Menu item…"
+        // Each named menu action is triggered in turn; once its dialog is up, the dialog alone, the whole screen
+        // and the window with the dialog over it are saved to XARA_SHOTDIALOGS as NN-dialog.png, NN-screen.png
+        // and NN-window.png, and the dialog is cancelled. XARA_SHOTDELAY (ms) leaves time to set a scene up first.
+        const QString dir=qEnvironmentVariable("XARA_SHOTDIALOGS");
+        const QStringList names=qEnvironmentVariable("XARA_SHOTACTIONS").split('|',Qt::SkipEmptyParts);
+        auto norm=[](QString t){ return t.remove('&').remove(QChar(0x2026)).remove("...").trimmed().toLower(); };
+        auto step=std::make_shared<std::function<void(int)>>();
+        *step=[&,dir,names,norm,step](int i){
+            if(i>=names.size()){ app.quit(); return; }
+            QAction* hit=nullptr;
+            for(QAction* a : w.findChildren<QAction*>()) if(norm(a->text())==norm(names[i])){ hit=a; break; }
+            if(!hit){ fprintf(stderr,"SHOTDIALOGS: no action '%s'\n",qPrintable(names[i])); (*step)(i+1); return; }
+            QTimer::singleShot(900,[&,dir,i,step]{
+                QWidget* d=QApplication::activeModalWidget();
+                if(!d) for(QWidget* t : QApplication::topLevelWidgets()) if(qobject_cast<QDialog*>(t) && t->isVisible()) d=t;
+                const QString n=QString("%1/%2-").arg(dir).arg(i,2,10,QChar('0'));
+                if(d){ d->grab().save(n+"dialog.png"); if(QScreen* sc=d->screen()) sc->grabWindow(0).save(n+"screen.png");
+                       // NN-window.png: the main window with the dialog painted over it, alpha and all, as a
+                       // compositor would show it (Xvfb has none, so the screen grab has black corners).
+                       { QPixmap comp=w.grab(); QPainter g(&comp); g.drawPixmap(d->mapToGlobal(QPoint(0,0))-w.mapToGlobal(QPoint(0,0)),d->grab()); g.end(); comp.save(n+"window.png"); }
+                       if(auto* dd=qobject_cast<QDialog*>(d)) dd->reject(); else d->close(); }
+                else fprintf(stderr,"SHOTDIALOGS: no dialog for #%d\n",i);
+                QTimer::singleShot(300,[step,i]{ (*step)(i+1); }); });
+            hit->trigger(); };
+        QTimer::singleShot(qEnvironmentVariableIsSet("XARA_SHOTDELAY")? qEnvironmentVariableIntValue("XARA_SHOTDELAY") : 1500,[step]{ (*step)(0); });   // time to set a scene up first
     }
     if (!qEnvironmentVariableIsEmpty("XARA_SHOTSTART")) {   // screenshot the welcome/start screen
         const QString sp=qEnvironmentVariable("XARA_SHOTSTART"); w.setShowWelcome(false);

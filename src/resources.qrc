@@ -20,6 +20,12 @@
     <file>assets/chrome/check-on-hover.svg</file>
     <file>assets/chrome/check-on.svg</file>
     <file>assets/chrome/combo-arrow.svg</file>
+    <file>assets/chrome/dialog-bottom-right.svg</file>
+    <file>assets/chrome/dialog-bottom.svg</file>
+    <file>assets/chrome/dialog-close-hover.svg</file>
+    <file>assets/chrome/dialog-close.svg</file>
+    <file>assets/chrome/dialog-notch-hover.svg</file>
+    <file>assets/chrome/dialog-notch.svg</file>
     <file>assets/chrome/export-hover.svg</file>
     <file>assets/chrome/export-normal.svg</file>
     <file>assets/chrome/export-pressed.svg</file>
