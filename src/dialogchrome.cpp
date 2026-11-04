@@ -14,6 +14,7 @@
 #include <QStyle>
 #include <QToolButton>
 #include <QVBoxLayout>
+#include <QWindow>
 #include <QPointer>
 #include <utility>
 
@@ -43,6 +44,9 @@ protected:
         if(o==m_title || o==m_label){
             auto* me=static_cast<QMouseEvent*>(e);
             if(t==QEvent::MouseButtonPress && me->button()==Qt::LeftButton){
+#ifdef Q_OS_HAIKU   // Haiku sends no mouse moves here while the button is down, so the window server moves the dialog
+                if(m_dlg->windowHandle() && m_dlg->windowHandle()->startSystemMove()) return true;
+#endif
                 m_grab=me->globalPosition().toPoint()-m_dlg->frameGeometry().topLeft(); m_dragging=true; return true; }
             if(t==QEvent::MouseMove && m_dragging && (me->buttons()&Qt::LeftButton)){ m_dlg->move(me->globalPosition().toPoint()-m_grab); return true; }
             if(t==QEvent::MouseButtonRelease && m_dragging){ m_dragging=false; return true; }
