@@ -73,7 +73,8 @@ struct Icc::Impl {
 static QStringList scanCmykProfiles(){
     QStringList out;
     const QStringList dirs = { "/usr/share/color/icc", "/usr/share/color/icc/colord",
-                               "/usr/local/share/color/icc", QDir::homePath()+"/.local/share/icc" };
+                               "/usr/local/share/color/icc", QDir::homePath()+"/.local/share/icc",
+                               "/boot/system/data/color/icc", "/boot/home/config/non-packaged/data/color/icc" };
     for(const QString& dp : dirs){ QDir dir(dp); if(!dir.exists()) continue;
         for(const QFileInfo& fi : dir.entryInfoList({"*.icc","*.icm","*.ICC","*.ICM"}, QDir::Files)){
             QFile f(fi.absoluteFilePath()); if(!f.open(QIODevice::ReadOnly)) continue;

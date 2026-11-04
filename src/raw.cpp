@@ -26,6 +26,7 @@ struct Loader {
         lib = dlopen("libraw.so.23", RTLD_NOW|RTLD_LOCAL);
         if(!lib) lib = dlopen("libraw.so", RTLD_NOW|RTLD_LOCAL);
         if(!lib) lib = dlopen("libraw_r.so.23", RTLD_NOW|RTLD_LOCAL);
+        if(!lib) lib = dlopen("libraw.so.20", RTLD_NOW|RTLD_LOCAL);
         if(!lib) return;
         init      = (void*(*)(unsigned int))     dlsym(lib, "libraw_init");
         open_file = (int(*)(void*,const char*))  dlsym(lib, "libraw_open_file");

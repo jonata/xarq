@@ -260,7 +260,9 @@ if(GRAPHVIZ_FOUND)
     # the system's plugin registry, so link them directly. They live in graphviz's own plugin directory.
     find_library(GV_DOT_LAYOUT gvplugin_dot_layout PATHS ${GRAPHVIZ_LIBRARY_DIRS} PATH_SUFFIXES graphviz NO_DEFAULT_PATH)
     find_library(GV_CORE       gvplugin_core       PATHS ${GRAPHVIZ_LIBRARY_DIRS} PATH_SUFFIXES graphviz NO_DEFAULT_PATH)
-    if(GV_DOT_LAYOUT AND GV_CORE)
+    if(HAIKU)
+        # gisvector.cpp uses the system plugin registry there, so nothing to link.
+    elseif(GV_DOT_LAYOUT AND GV_CORE)
         target_link_libraries(xarq PRIVATE ${GV_DOT_LAYOUT} ${GV_CORE})
         get_filename_component(GV_PLUGIN_DIR ${GV_CORE} DIRECTORY)
         set_property(TARGET xarq APPEND PROPERTY BUILD_RPATH ${GV_PLUGIN_DIR})
@@ -294,4 +296,16 @@ if(LIBREDWG_INCLUDE_DIR AND LIBREDWG_LIBRARY)
     message(STATUS "AutoCAD DWG import (LibreDWG): ENABLED (${LIBREDWG_LIBRARY})")
 else()
     message(STATUS "AutoCAD DWG import (LibreDWG): disabled (build libredwg + place under ~/.local or /usr/local)")
+endif()
+
+# Haiku keeps an application's signature, version and vector icon as resources inside the executable.
+if(HAIKU)
+    set(XARQ_RDEF "${CMAKE_CURRENT_SOURCE_DIR}/haiku/XarQ.rdef")
+    set(XARQ_RSRC "${CMAKE_CURRENT_BINARY_DIR}/XarQ.rsrc")
+    add_custom_command(OUTPUT "${XARQ_RSRC}" COMMAND rc -o "${XARQ_RSRC}" "${XARQ_RDEF}" DEPENDS "${XARQ_RDEF}" VERBATIM)
+    add_custom_target(xarq_resources DEPENDS "${XARQ_RSRC}")
+    add_dependencies(xarq xarq_resources)
+    add_custom_command(TARGET xarq POST_BUILD
+        COMMAND xres -o "$<TARGET_FILE:xarq>" "${XARQ_RSRC}"
+        COMMAND mimeset -f "$<TARGET_FILE:xarq>" VERBATIM)
 endif()

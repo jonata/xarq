@@ -232,10 +232,12 @@ QString ogrToSvg(const QString&){ return {}; }
 #include <string>
 #include <type_traits>
 
+#ifndef __HAIKU__
 extern "C" {
 extern gvplugin_library_t gvplugin_dot_layout_LTX_library;
 extern gvplugin_library_t gvplugin_core_LTX_library;
 }
+#endif
 
 // Deduces gvRenderData's 5th parameter type (unsigned* before graphviz 12, size_t* after).
 template <class R, class A0, class A1, class A2, class A3, class A4>
@@ -268,12 +270,16 @@ QString dotToSvg(const QByteArray& data)
     // the graphviz package but keeps its libraries leaves no registry, and then there is no layout
     // engine and no SVG renderer — DOT import silently produced nothing. Preloading is graphviz's own
     // embedding pattern and makes this independent of whatever the system has registered.
+#ifdef __HAIKU__
+    GVC_t* gvc = gvContext();   // Haiku's package ships the registry, and its plugins live outside the library path
+#else
     static const lt_symlist_t kBuiltins[] = {
         { "gvplugin_dot_layout_LTX_library", &gvplugin_dot_layout_LTX_library },
         { "gvplugin_core_LTX_library",       &gvplugin_core_LTX_library },
         { nullptr, nullptr }
     };
     GVC_t* gvc = gvContextPlugins(kBuiltins, 0);
+#endif
     if (!gvc)
         return QString();
 

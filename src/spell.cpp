@@ -41,7 +41,8 @@ Speller::Speller() {
         }
         if (!m_words.isEmpty()) return;
     }
-    const QStringList dics = { "/usr/share/hunspell/en_US.dic", "/usr/share/myspell/en_US.dic" };
+    const QStringList dics = { "/usr/share/hunspell/en_US.dic", "/usr/share/myspell/en_US.dic",
+                               "/boot/system/data/hunspell/en_US.dic" };
     for (const QString& p : dics) {
         QFile f(p); if (!f.exists() || !f.open(QIODevice::ReadOnly|QIODevice::Text)) continue;
         QTextStream in(&f); bool first=true;

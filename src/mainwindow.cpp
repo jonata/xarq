@@ -209,8 +209,10 @@ protected:
 } // namespace
 
 MainWindow::MainWindow() {
+#ifndef Q_OS_HAIKU   // Haiku keeps its yellow tab: window stacking and tiling are driven from it
     setWindowFlag(Qt::FramelessWindowHint, true);   // custom "App title bar design" chrome replaces the OS frame
     qApp->installEventFilter(new EdgeResizer(this));  // border-drag resize via the window manager (frameless windows have no native grips)
+#endif
     m_canvas = new Canvas(this);
     { QWidget* central=nullptr; setupTabBar(central); setCentralWidget(central); }
 
@@ -2512,6 +2514,9 @@ void MainWindow::buildTitleBar(){
     m_maxBtn  =mkWin("win-max","Maximize");    connect(m_maxBtn,&QToolButton::clicked,this,[this]{ if(isMaximized()) showNormal(); else showMaximized(); updateMaxButtonIcon(); });
     m_closeBtn=mkWin("win-close","Close");     connect(m_closeBtn,&QToolButton::clicked,this,[this]{ close(); });
     h->addWidget(m_minBtn,0,Qt::AlignTop); h->addWidget(m_maxBtn,0,Qt::AlignTop); h->addWidget(m_closeBtn,0,Qt::AlignTop);
+#ifdef Q_OS_HAIKU
+    m_minBtn->hide(); m_maxBtn->hide(); m_closeBtn->hide();   // the native window tab provides these
+#endif
 
     setMenuWidget(bar);
     updateMaxButtonIcon();

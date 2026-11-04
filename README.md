@@ -39,6 +39,31 @@ Some features load their libraries on demand via `dlopen`, and are simply
 unavailable if the library is missing: **lcms2** (ICC colour management) and
 **libraw** (camera-RAW import).
 
+### Haiku
+
+XarQ builds and runs natively on [Haiku](https://www.haiku-os.org) (x86_64, using HaikuPorts' Qt 6):
+
+```sh
+pkgman install cmake ninja qt6_base_devel qt6_svg_devel qt6_tools_devel qt6_imageformats \
+    harfbuzz_devel zlib_devel zstd_devel expat_devel libwpd_devel liblangtag_devel \
+    libcdr_devel librevenge_devel libwpg_devel libvisio_devel libfreehand_devel libmspub_devel \
+    libpagemaker_devel libzmf_devel libqxp_devel libstaroffice_devel libetonyek_devel libmwaw_devel \
+    gdal_devel graphviz_devel libwmf_devel dejavu
+cd src
+cmake -S . -B build -G Ninja
+ninja -C build
+haiku/make-hpkg.sh build     # optional: makes an installable xarq-*.hpkg
+```
+
+- The window keeps Haiku's native tab, so stacking and tiling work; the title bar still drags it.
+- Menus name shortcuts the Qt way. Press **Command** where they say Ctrl: that is the **Alt** key on a PC
+  keyboard, unless the Keymap preferences have swapped them.
+- PDF import needs poppler 26.1 or newer, and HaikuPorts currently stops at 25.12. JPEG XR, DICOM, OpenSlide,
+  LibreDWG and Mobipocket have no HaikuPorts package yet, and JPEG XL needs a newer libjxl than 0.6. These formats
+  are simply not offered.
+- `src/haiku/xarq-26.10~alpha.recipe` is the HaikuPorts recipe; set its commit and checksum when publishing.
+  `src/haiku/make_rdef.py` regenerates the app signature, version and vector icon in `src/haiku/XarQ.rdef`.
+
 ### Command line
 
 ```sh
@@ -63,6 +88,7 @@ src/                 the XarQ application (Qt6 Widgets, C++17, CMake)
   *.cpp / *.h        model, render, canvas, tools, XAR I/O, importers/exporters
   canvas_*.inc       canvas input + I/O, #included by canvas.cpp
   assets/            bundled fonts and logo/icon SVGs (see assets/fonts/NOTICE.md)
+  haiku/             Haiku resources, packaging script and HaikuPorts recipe
   CMakeLists.txt     build definition
 .github/workflows/   continuous integration (build + selftest)
 ```

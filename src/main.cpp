@@ -29,6 +29,9 @@
 #include <QEvent>
 #include <QKeyEvent>
 #include <QVariant>
+#include <QFileOpenEvent>
+#include <QScreen>
+#include <functional>
 #include "mainwindow.h"
 #include "splash.h"
 #include "canvas.h"
@@ -412,16 +415,43 @@ static QStringList loadUserApplicationFonts(){
     return added;
 }
 
+// A request from the desktop to open a file: Tracker on Haiku, Finder on macOS.
+class FileOpenRouter : public QObject {
+public:
+    explicit FileOpenRouter(std::function<void(const QString&)> open, QObject* parent): QObject(parent), m_open(std::move(open)) {}
+protected:
+    bool eventFilter(QObject* o, QEvent* e) override {
+        if(e->type()!=QEvent::FileOpen) return QObject::eventFilter(o,e);
+        m_open(static_cast<QFileOpenEvent*>(e)->file());
+        return true;
+    }
+    std::function<void(const QString&)> m_open;
+};
+
 int main(int argc, char** argv) {
+#ifdef Q_OS_HAIKU
+    // Qt's raster fills hand spans to a thread pool and wait on a QSemaphore held on the stack. Without futexes
+    // that semaphore is a mutex, and Haiku's pthread_mutex_unlock can still touch it after the waiter has woken
+    // and freed it, which corrupts the heap at random. Filling on one thread is slower but safe.
+    qputenv("QT_NO_GUI_THREADPOOL", "1");
+#endif
     QApplication app(argc, argv);
     app.setApplicationName("XarQ");
+#ifndef Q_OS_HAIKU   // Qt would append it to every title, and Haiku shows titles in the window tab
     app.setApplicationDisplayName("XarQ");
+#endif
     app.setOrganizationName("XarQ");
     app.setApplicationVersion(XARQ_VERSION);
     applyTheme(app);
     app.installEventFilter(new xara::DialogChrome(&app));   // Subtitld's dialog chrome on every dialog
     app.installEventFilter(new RoundPopups(&app));   // translucent (rounded) menu + dropdown popups
     app.installEventFilter(new ShortcutGuard(&app)); // single-key tool shortcuts never steal a keystroke from a focused input
+
+    // Files named on the command line or sent by the desktop wait here until the window is up.
+    QStringList pendingFiles;
+    xara::MainWindow* readyWindow=nullptr;
+    app.installEventFilter(new FileOpenRouter([&](const QString& p){
+        if(readyWindow) readyWindow->openPath(p); else pendingFiles<<p; }, &app));
 
     QString shotPath, exportPath, openPath, savePath, shotNodePath;
     for (int i=1;i<argc;++i){ QString a(argv[i]);
@@ -601,7 +631,8 @@ int main(int argc, char** argv) {
             fprintf(stderr,"dragbench %s: shapes=%d (dragging shape #%d)\n", qPrintable(p), n, si);
             runDrag("MOVE",  c->toView(db.center()),   QPointF(6,4));   // press on the shape body → move
             runDrag("SCALE", c->toView(db.topLeft()),  QPointF(6,4));   // press on the TL corner handle → scale
-            return 0; } }
+            return 0; }
+        else if(!a.startsWith('-')) pendingFiles<<a; }
 
     // Is this a genuine interactive launch, or any headless / scripted / screenshot mode?
     // (A capture CLI flag, any XARA_* test/screenshot env var, or the offscreen platform ⇒ not interactive.)
@@ -645,12 +676,26 @@ int main(int argc, char** argv) {
     }
     w.resize(1500,950);
     if (interactive) {
+        if(QScreen* screen=QApplication::primaryScreen()){
+            QRect room=screen->availableGeometry();
+#ifdef Q_OS_HAIKU
+            room.adjust(5,29,-5,-5);   // Qt places the content, so leave the yellow tab and window border on screen
+#endif
+            w.resize(w.size().boundedTo(room.size()));
+#ifdef Q_OS_HAIKU
+            w.move(room.topLeft());
+#endif
+        }
         // The main window stays hidden behind the splash and is revealed only when the splash fades — so it
         // never appears "together with" the workspace and can't linger over it.
-        QObject::connect(splash,&xara::LaunchSplash::finished,&w,[&w]{
-            w.show(); w.raise(); w.activateWindow(); w.runStartupSequence(); });
+        QObject::connect(splash,&xara::LaunchSplash::finished,&w,[&]{
+            w.show(); w.raise(); w.activateWindow(); w.runStartupSequence();
+            readyWindow=&w;
+            for(const QString& p : std::as_const(pendingFiles)) w.openPath(p);
+            pendingFiles.clear(); });
     } else {
         w.show();
+        readyWindow=&w;
     }
 
     if (!qEnvironmentVariableIsEmpty("XARA_WININFO")) {

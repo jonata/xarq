@@ -14,12 +14,13 @@ Hyphenator::Hyphenator() {
         "/usr/share/hyphen/hyph_en_US.dic", "/usr/share/hyphen/hyph_en_GB.dic", "/usr/share/hyphen/hyph_en.dic",
         "/usr/share/hyphen/hyph_pt_PT.dic", "/usr/share/hyphen/hyph_pt_BR.dic",
         "/usr/share/myspell/hyph_en_US.dic",
+        "/boot/system/data/hyphen/hyph_en_US.dic", "/boot/system/data/hyphen/hyph_pt_BR.dic",
     };
     for (const QString& p : prefs) if (load(p)) return;
     // fallback: scan the hyphen directory for any hyph_*.dic
-    QFileInfo dir("/usr/share/hyphen");
-    if (dir.isDir()) { for (const QString& name : QDir("/usr/share/hyphen").entryList({"hyph_*.dic"}, QDir::Files))
-        if (load("/usr/share/hyphen/"+name)) return; }
+    for (const QString& d : {QStringLiteral("/usr/share/hyphen"), QStringLiteral("/boot/system/data/hyphen")})
+        for (const QString& name : QDir(d).entryList({"hyph_*.dic"}, QDir::Files))
+            if (load(d+"/"+name)) return;
 }
 
 bool Hyphenator::load(const QString& path) {
