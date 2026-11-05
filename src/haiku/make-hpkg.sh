@@ -56,7 +56,6 @@ provides		{
 }
 requires		{
 	haiku
-	qt6_svg
 	qt6_imageformats
 	lib:liblcms2
 	lib:libraw
@@ -65,8 +64,6 @@ requires		{
 	lib:libdjvulibre
 	lib:libjbig2dec
 	dejavu
-	graphviz
-	hunspell
 	hyphen
 	myspell
 EOF
