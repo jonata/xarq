@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <QFontDatabase>
 #include <QRegularExpression>
+#include <climits>
 
 namespace xara {
 
@@ -460,9 +461,9 @@ void InfoBar::rebuild(){
         auto* wc=new QComboBox; wc->setFixedWidth(120); wc->setToolTip("Font weight / style");
         auto stylesFor=[](const QString& fam)->QStringList{ QStringList st=QFontDatabase::styles(fam); if(st.isEmpty()) st<<QStringLiteral("Regular"); return st; };
         auto matchStyle=[](const QStringList& st,const QString& fam,int wt,bool it)->int{   // index of the face closest to (weight,italic)
-            int best=0; long bestScore=1L<<60;
+            int best=0, bestScore=INT_MAX;   // not 1L<<60: long is 32-bit on Windows and 32-bit Haiku
             for(int i=0;i<st.size();++i){ QFont pf=QFontDatabase::font(fam,st[i],12);
-                long sc=qAbs((long)pf.weight()-wt)+(pf.italic()!=it?100000L:0); if(sc<bestScore){ bestScore=sc; best=i; } }
+                int sc=qAbs(int(pf.weight())-wt)+(pf.italic()!=it?100000:0); if(sc<bestScore){ bestScore=sc; best=i; } }
             return best; };
         auto fillWeights=[wc,stylesFor,matchStyle](const QFont& font){ QSignalBlocker b(wc); wc->clear();
             const QStringList st=stylesFor(font.family()); wc->addItems(st);
