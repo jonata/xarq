@@ -13,7 +13,7 @@ LICENSE="GNU GPL v2
 REVISION="1"
 # Set both of these to the published commit being packaged.
 srcGitRev="0000000000000000000000000000000000000000"
-SOURCE_URI="$HOMEPAGE/archive/$srcGitRev.tar.gz"
+SOURCE_URI="https://github.com/jonata/xarq/archive/$srcGitRev.tar.gz"
 CHECKSUM_SHA256="0000000000000000000000000000000000000000000000000000000000000000"
 SOURCE_FILENAME="xarq-$portVersion-$srcGitRev.tar.gz"
 SOURCE_DIR="xarq-$srcGitRev"
@@ -26,19 +26,20 @@ PROVIDES="
 	"
 REQUIRES="
 	haiku
-	dejavu
+	# Loaded with dlopen() for optional formats, so nothing links them, and
+	# lib: entries for them fail the strict policy as unused.
 	djvu
-	graphviz
-	hunspell
-	hyphen
 	jbig2dec
 	lcms
 	libraw
-	myspell
 	openjpeg
 	qrencode
+	# Files rather than libraries: the default text font, the hyphenation and
+	# spelling dictionaries, and Qt's image format plugins.
+	dejavu
+	hyphen
+	myspell
 	qt6_imageformats
-	qt6_svg
 	lib:libcdr_0.1
 	lib:libcdt
 	lib:libcgraph
