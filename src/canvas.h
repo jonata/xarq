@@ -372,6 +372,7 @@ public:
     bool importProcreate(const QString& path);                       // Procreate → layers
     bool importXcf(const QString& path);                             // GIMP, with its layers and groups
     bool importCptFile(const QString& path);                         // Corel PHOTO-PAINT, with its objects
+    bool importPdn(const QString& path);                             // Paint.NET, with its layers
     bool importPxd(const QString& path);                             // Pixelmator Pro → layers
     bool importClip(const QString& path);                            // Clip Studio Paint → layers
     bool importPsp(const QString& path);                             // PaintShop Pro → layers

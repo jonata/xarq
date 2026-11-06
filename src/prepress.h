@@ -86,6 +86,11 @@ Document importKraDocument(const QMap<QString,QByteArray>& zip, KraImportStats* 
 struct OraImportStats { int layers = 0, groups = 0, unknownModes = 0, missing = 0; };
 Document importOraDocument(const QMap<QString,QByteArray>& zip, OraImportStats* stats = nullptr);
 
+// Paint.NET → a Document: its layers with name, opacity, visibility and blend mode. Layers that can't be
+// read are counted; with none readable, the file's thumbnail stands in.
+struct PdnImportStats { int layers = 0, hidden = 0, empty = 0, unknownModes = 0, missing = 0, badChunks = 0; bool thumbnailOnly = false; };
+Document importPdnDocument(const QByteArray& data, PdnImportStats* stats = nullptr);
+
 // Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
 // Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
 struct CptImportStats { int objects = 0, hidden = 0, savedMasks = 0, unknownTiles = 0, unknownDepth = 0; bool thumbnailOnly = false; };

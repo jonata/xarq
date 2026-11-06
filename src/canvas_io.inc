@@ -980,6 +980,19 @@ bool Canvas::importCptFile(const QString& path){
     emit statusMessage("No readable image found in the PHOTO-PAINT file.");
     return false;
 }
+bool Canvas::importPdn(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    PdnImportStats st;
+    const Document pd=importPdnDocument(data,&st);
+    QStringList notes;
+    if(st.thumbnailOnly) notes<<QStringLiteral("only the file's thumbnail could be read");
+    else if(st.missing) notes<<QStringLiteral("%1 layer(s) couldn't be read").arg(st.missing);
+    if(st.badChunks) notes<<QStringLiteral("%1 damaged block(s) of pixels left blank").arg(st.badChunks);
+    if(st.unknownModes) notes<<QStringLiteral("%1 unknown blend mode(s) drawn as Normal").arg(st.unknownModes);
+    if(adoptLayers(pd,path,"Import Paint.NET",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the Paint.NET file.");
+    return false;
+}
 bool Canvas::importPxd(const QString& path){
     QMap<QString,QByteArray> files;
     const QFileInfo info(path);

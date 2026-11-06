@@ -726,7 +726,7 @@ static QString imageImportFilter(){
 // Every vector / page / document format Canvas::dropImportByExtension() routes to a first-party importer.
 // KEEP IN SYNC with that dispatcher (src/canvas.cpp) — the Open dialog builds its filter from this.
 static QString vectorImportPatterns(){
-    return "*.svg *.svgz *.pdf *.ai *.eps *.epsi *.ept *.ept2 *.ept3 *.epsf *.eps2 *.eps3 *.epi *.ps *.ps2 *.ps3 *.dxf *.dwg *.cdr *.cdt *.cdx *.cdrx *.des *.cmx *.ccx *.cpx *.fxg *.xd *.clip *.procreate *.pxd *.cpt *.xcf *.xcf.gz *.xcfgz *.xcf.bz2 *.psp *.pspimage *.psptube *.pspframe *.pspmask *.tub *.wmf *.apm "
+    return "*.svg *.svgz *.pdf *.ai *.eps *.epsi *.ept *.ept2 *.ept3 *.epsf *.eps2 *.eps3 *.epi *.ps *.ps2 *.ps3 *.dxf *.dwg *.cdr *.cdt *.cdx *.cdrx *.des *.cmx *.ccx *.cpx *.fxg *.xd *.clip *.procreate *.pxd *.cpt *.pdn *.xcf *.xcf.gz *.xcfgz *.xcf.bz2 *.psp *.pspimage *.psptube *.pspframe *.pspmask *.tub *.wmf *.apm "
            "*.afdesign *.afphoto *.afpub *.aftemplate *.afpackage *.af *.epub *.fb2 *.fb2.zip *.fbz *.docx *.rtf *.odg *.odp *.odt *.ods *.otg *.otp *.ott *.fodg *.fodp *.fodt "
            "*.sxd *.sxi *.sxw *.std *.sti *.cbz *.cbr *.cb7 *.cbt *.apng *.gif "
            "*.wpg *.vsd *.vsdx *.vdx *.vss *.vssx *.vst *.vstx *.vsdm "

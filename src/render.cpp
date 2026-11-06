@@ -554,7 +554,7 @@ static QPainter::CompositionMode xaraBlend(int type) {
     default: return QPainter::CompositionMode_SourceOver; // Mix(1) / HSL (handled per-pixel) / unsupported
     }
 }
-static inline bool isHslBlend(int type) { return type==16 || type==28 || type==31 || (type>=40 && type<=53); }  // Saturation / Luminosity / Hue / Colour + imported modes Qt has no composition for
+static inline bool isHslBlend(int type) { return type==16 || type==28 || type==31 || (type>=40 && type<=54); }  // Saturation / Luminosity / Hue / Colour + imported modes Qt has no composition for
 
 static void paintFeathered(QPainter& g, const Shape& s);
 static void paintBlurred(QPainter& g, const Shape& s);
@@ -1248,6 +1248,10 @@ static void hslBlend(int type, double& br,double& bg,double& bb, double sr,doubl
             default: return s<=0.0?1.0:qMin(1.0,b/s);
             } };
         br=f(br,sr); bg=f(bg,sg); bb=f(bb,sb); return;
+    }
+    if(type==54){                  // Xor of the 8-bit channel values (imported from Paint.NET)
+        auto x=[](double b,double s){ return double((int(b*255.0+0.5)^int(s*255.0+0.5))&255)/255.0; };
+        br=x(br,sr); bg=x(bg,sg); bb=x(bb,sb); return;
     }
     if(type>=41 && type<=44){      // Average, Negation, Reflect, Glow (separable; imported from Affinity)
         auto f=[type](double b,double s){

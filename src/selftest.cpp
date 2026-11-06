@@ -12875,6 +12875,102 @@ if(xara::pdfVectorAvailable()){
       check(importKraDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "Krita: an archive without maindoc.xml gives nothing");
     }
 
+    // --- Paint.NET ---
+    std::printf("[interop] Paint.NET\n");
+    {
+      // The object graph as .NET's BinaryFormatter writes it (MS-NRBF), then each layer's pixels in chunks.
+      auto le=[](qint64 v,int n){ QByteArray b(n,'\0'); for(int i=0;i<n;++i) b[i]=char(v>>(8*i)); return b; };
+      auto be32=[](quint32 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(24-8*i)); return b; };
+      auto lps=[](const QByteArray& s){ QByteArray b; quint32 n=quint32(s.size()); do { uchar c=n&0x7f; n>>=7; if(n) c|=0x80; b.append(char(c)); } while(n); return b+s; };
+      auto gz=[](const QByteArray& raw){ QByteArray out; z_stream z; std::memset(&z,0,sizeof z);
+        deflateInit2(&z,Z_DEFAULT_COMPRESSION,Z_DEFLATED,15+16,8,Z_DEFAULT_STRATEGY);
+        z.next_in=reinterpret_cast<Bytef*>(const_cast<char*>(raw.data())); z.avail_in=uInt(raw.size());
+        char buf[4096]; int r; do { z.next_out=reinterpret_cast<Bytef*>(buf); z.avail_out=sizeof buf; r=deflate(&z,Z_FINISH); out.append(buf,int(sizeof buf-z.avail_out)); } while(r!=Z_STREAM_END);
+        deflateEnd(&z); return out; };
+      struct M { QByteArray name; int bt; QByteArray extra; };
+      auto P=[](int t){ return QByteArray(1,char(t)); };
+      auto C=[&](const QByteArray& n){ return lps(n)+le(2,4); };
+      auto cls=[&](qint32 oid,const QByteArray& name,const QVector<M>& ms){
+        QByteArray b("\x05",1); b+=le(oid,4)+lps(name)+le(ms.size(),4);
+        for(const M& m:ms) b+=lps(m.name);
+        for(const M& m:ms) b.append(char(m.bt));
+        for(const M& m:ms) b+=m.extra;
+        return b+le(2,4); };
+      auto withId=[&](qint32 oid,qint32 meta){ return QByteArray("\x01",1)+le(oid,4)+le(meta,4); };
+      auto ref=[&](qint32 id){ return QByteArray("\x09",1)+le(id,4); };
+      // A layer at `oid`: the first one carries the class layouts, later ones point back at them. mode<0 leaves
+      // out the blend mode member, as Paint.NET 3 does, so the blend op's class name says it.
+      auto layer=[&](qint32 oid,bool first,const QByteArray& name,bool vis,int opacity,int mode,const QByteArray& op,qint32 surf){
+        QByteArray b=first ? cls(oid,"PaintDotNet.BitmapLayer",{{"properties",4,C("PaintDotNet.BitmapLayer+BitmapLayerProperties")},{"surface",4,C("PaintDotNet.Surface")},{"Layer+properties",4,C("PaintDotNet.Layer+LayerProperties")}}) : withId(oid,10);
+        b+=first ? cls(oid+1,"PaintDotNet.BitmapLayer+BitmapLayerProperties",{{"blendOp",4,C("PaintDotNet.UserBlendOps+"+op)}}) : withId(oid+1,11);
+        b+=cls(oid+2,"PaintDotNet.UserBlendOps+"+op,{});
+        b+=ref(surf);
+        if(mode>=0){
+          b+=first ? cls(oid+3,"PaintDotNet.Layer+LayerProperties",{{"name",1,{}},{"visible",0,P(1)},{"opacity",0,P(2)},{"blendMode",4,C("PaintDotNet.LayerBlendMode")}}) : withId(oid+3,13);
+          b+=QByteArray("\x06",1)+le(oid+4,4)+lps(name)+P(vis)+P(opacity);
+          b+=first ? cls(oid+5,"PaintDotNet.LayerBlendMode",{{"value__",0,P(8)}}) : withId(oid+5,15);
+          b+=le(mode,4);
+        } else {
+          b+=cls(oid+3,"PaintDotNet.Layer+LayerProperties",{{"name",1,{}},{"visible",0,P(1)},{"opacity",0,P(2)}});
+          b+=QByteArray("\x06",1)+le(oid+4,4)+lps(name)+P(vis)+P(opacity);
+        }
+        return b; };
+      auto surface=[&](qint32 oid,bool first){
+        QByteArray b=first ? cls(oid,"PaintDotNet.Surface",{{"width",0,P(8)},{"height",0,P(8)},{"stride",0,P(8)},{"scan0",4,C("PaintDotNet.MemoryBlock")}}) : withId(oid,100);
+        b+=le(4,4)+le(3,4)+le(16,4);
+        b+=first ? cls(oid+1,"PaintDotNet.MemoryBlock",{{"length64",0,P(9)},{"hasParent",0,P(1)},{"deferred",0,P(1)}}) : withId(oid+1,101);
+        return b+le(48,8)+P(0)+P(1); };
+      QByteArray g=QByteArray("\x00",1)+le(1,4)+le(-1,4)+le(1,4)+le(0,4)+QByteArray("\x0c",1)+le(2,4)+lps("PaintDotNet.Data");
+      g+=cls(1,"PaintDotNet.Document",{{"layers",4,C("PaintDotNet.LayerList")},{"width",0,P(8)},{"height",0,P(8)}})+ref(3)+le(4,4)+le(3,4);
+      g+=cls(3,"PaintDotNet.LayerList",{{"ArrayList+_items",5,{}},{"ArrayList+_size",0,P(8)}})+ref(4)+le(4,4);
+      g+=QByteArray("\x10",1)+le(4,4)+le(6,4)+ref(10)+ref(20)+ref(30)+ref(40)+QByteArray("\x0d\x02",2);   // padded with two nulls
+      g+=layer(10,true,"Background",true,255,0,"NormalBlendOp",100)+layer(20,false,"Ink",true,128,1,"NormalBlendOp",102)
+        +layer(30,false,"Hidden",false,255,-1,"XorBlendOp",104)+layer(40,false,"Blank",true,255,0,"NormalBlendOp",106);
+      g+=surface(100,true)+surface(102,false)+surface(104,false)+surface(106,false)+QByteArray("\x0b",1);
+      auto bgra=[](QRgb c){ QByteArray b(4,'\0'); b[0]=char(qBlue(c)); b[1]=char(qGreen(c)); b[2]=char(qRed(c)); b[3]=char(qAlpha(c)); return b; };
+      QByteArray red, ink, green, blank(48,'\0');
+      for(int i=0;i<12;++i){ red+=bgra(qRgb(255,0,0)); green+=bgra(qRgb(0,255,0)); ink+=bgra(i==5||i==6 ? qRgb(0,0,255) : qRgba(0,0,0,0)); }
+      QByteArray px=QByteArray("\x01",1)+be32(32)+be32(1)+be32(16)+red.mid(32)+be32(0)+be32(32)+red.left(32);   // raw, two chunks out of order
+      const QByteArray inkGz=gz(ink);
+      px+=QByteArray("\x00",1)+be32(4096)+be32(0)+be32(inkGz.size())+inkGz;                                     // gzip, one chunk
+      px+=QByteArray("\x01",1)+be32(4096)+be32(0)+be32(48)+green;
+      px+=QByteArray("\x01",1)+be32(4096)+be32(0)+be32(48)+blank;
+      QImage th(2,2,QImage::Format_ARGB32); th.fill(qRgb(255,255,0)); QByteArray thPng; { QBuffer bf(&thPng); bf.open(QIODevice::WriteOnly); th.save(&bf,"PNG"); }
+      const QByteArray xml="<pdnImage width=\"4\" height=\"3\" layers=\"4\" savedWithVersion=\"5.1\"><custom><thumb png=\""+thPng.toBase64()+"\" /></custom></pdnImage>";
+      const QByteArray head="PDN3"+le(xml.size(),3)+xml;
+      const QByteArray file=head+QByteArray("\x00\x01",2)+g+px;
+
+      PdnImportStats ps;
+      const Document pd=importPdnDocument(file,&ps);
+      check(pd.pageSize==QSizeF(4,3) && pd.shapes.size()==3 && ps.layers==3 && ps.empty==1 && ps.hidden==1 && ps.missing==0 && !ps.thumbnailOnly,
+            "Paint.NET: layers bottom first; an empty one is left out, a hidden one counted");
+      if(pd.shapes.size()==3){
+        const Shape& b=pd.shapes[0]; const Shape& k=pd.shapes[1]; const Shape& h=pd.shapes[2];
+        check(b.name==QStringLiteral("Background") && b.fill.image.pixel(0,0)==qRgb(255,0,0) && b.fill.image.pixel(3,2)==qRgb(255,0,0) && b.opacity==1.0,
+              "Paint.NET: raw pixel chunks, stored out of order, land in place");
+        check(k.name==QStringLiteral("Ink") && k.fill.image.size()==QSize(2,1) && k.docBounds().topLeft()==QPointF(1,1) && k.fill.image.pixel(0,0)==qRgb(0,0,255)
+              && k.blend==QPainter::CompositionMode_Multiply && qAbs(k.opacity-128/255.0)<1e-9, "Paint.NET: a gzip chunk, cropped to what's painted, with blend mode and opacity");
+        check(!h.visible && h.transp.type==54, "Paint.NET: a Paint.NET 3 blend op names the mode (Xor), and visibility");
+      }
+      PdnImportStats pz; const Document zd=importPdnDocument(head+gz(g+px),&pz);
+      check(zd.shapes.size()==3 && pz.layers==3, "Paint.NET: a body gzip-compressed as a whole is unpacked");
+      PdnImportStats p2; const Document d2=importPdnDocument(gz(g+px),&p2);
+      check(d2.shapes.size()==3 && d2.pageSize==QSizeF(4,3), "Paint.NET 2: a gzip-compressed file with no header");
+      PdnImportStats pt; const Document td=importPdnDocument(file.left(file.size()-20),&pt);
+      check(td.shapes.size()==3 && pt.badChunks>=1, "Paint.NET: a file cut short keeps the layers it has");
+      PdnImportStats pg; const Document gd=importPdnDocument(head+QByteArray("\x00\x01\x05\xff\xff\xff\x7f",7),&pg);
+      check(pg.thumbnailOnly && gd.shapes.size()==1 && gd.shapes[0].fill.image.pixel(0,0)==qRgb(255,255,0), "Paint.NET: with a damaged graph, the header's thumbnail stands in");
+      check(importPdnDocument(QByteArray("PDN3\x05")).shapes.isEmpty() && importPdnDocument(QByteArray("not a pdn")).shapes.isEmpty(), "Paint.NET: a short or foreign file gives nothing");
+      QByteArray deep=QByteArray("\x00",1)+le(1,4)+le(-1,4)+le(1,4)+le(0,4);
+      for(int i=0;i<400;++i) deep+=cls(10+i,"Nest",{{"child",2,{}}});
+      check(importPdnDocument(head+QByteArray("\x00\x01",2)+deep).shapes.size()<=1, "Paint.NET: deeply nested records stop safely");
+
+      QImage bd(2,2,QImage::Format_ARGB32_Premultiplied); bd.fill(qRgb(0x0f,0xf0,0x55));
+      Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,2,2); s.fill.type=FillType::Solid; s.fill.color=QColor(0xff,0x0f,0x55); s.stroke.enabled=false; s.transp.type=54;
+      { QPainter p(&bd); paintShape(p,s); }
+      check(bd.pixel(1,1)==qRgb(0xf0,0xff,0x00), "Blend modes: Xor of the channel values");
+    }
+
     // --- Corel PHOTO-PAINT ---
     std::printf("[interop] Corel PHOTO-PAINT\n");
     {

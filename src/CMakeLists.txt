@@ -88,6 +88,7 @@ add_executable(xarq
     fxgvector.cpp
     pxdimport.cpp
     cptimport.cpp
+    pdnimport.cpp
     xcfimport.cpp
     kraimport.cpp
     oraimport.cpp
