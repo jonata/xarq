@@ -327,7 +327,8 @@ Document importXcfDocument(const QByteArray& raw, XcfImportStats* st){
         if(nd.mode.isEmpty()){ nd.mode = "norm"; if(st) ++st->unknownModes; }
         if(mode == 1 && st) ++st->dissolve;
         { const QByteArray pb = lpr.value(30); for(int i = 0; i + 4 <= pb.size() && i < 256; i += 4) nd.path.push_back(be32(pb, i)); }
-        const int ox = int(qint32(be32(lpr.value(15), 0))), oy = int(qint32(be32(lpr.value(15), 4)));
+        const int ox = qBound(-10000000, int(qint32(be32(lpr.value(15), 0))), 10000000);
+        const int oy = qBound(-10000000, int(qint32(be32(lpr.value(15), 4))), 10000000);
         const bool applyMask = propU32(lpr, 11, 1) != 0 && mp > 0;
         if(w <= 0 || h <= 0 || qint64(w) * h > kMaxPixels || type < 0 || type > 5) continue;
         if(nd.group){
