@@ -98,6 +98,12 @@ Document importPdnDocument(const QByteArray& data, PdnImportStats* stats = nullp
 struct MdpImportStats { int layers = 0, groups = 0, hidden = 0, empty = 0, clipped = 0, masks = 0, unknownModes = 0, unknownTypes = 0, badTiles = 0; bool thumbnailOnly = false; };
 Document importMdpDocument(const QByteArray& data, MdpImportStats* stats = nullptr);
 
+// PaintTool SAI (.sai, version 1) → a Document: raster layers and folders with name, opacity, visibility,
+// blend mode and clipping. Linework and other layer kinds are counted; with none readable, the thumbnail.
+struct SaiImportStats { int layers = 0, groups = 0, hidden = 0, empty = 0, clipped = 0, otherLayers = 0, unknownModes = 0, missing = 0, badTiles = 0; bool thumbnailOnly = false; };
+Document importSaiDocument(const QByteArray& data, SaiImportStats* stats = nullptr);
+QByteArray saiEncryptPages(QVector<QByteArray> pages);   // for the self-test
+
 // Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
 // Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
 struct CptImportStats { int objects = 0, hidden = 0, savedMasks = 0, unknownTiles = 0, unknownDepth = 0; bool thumbnailOnly = false; };

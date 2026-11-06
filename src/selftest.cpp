@@ -13061,6 +13061,73 @@ if(xara::pdfVectorAvailable()){
             "MediBang: cut-short files and other .mdp files give nothing, safely");
     }
 
+    // --- PaintTool SAI ---
+    std::printf("[interop] PaintTool SAI\n");
+    {
+      auto le=[](quint32 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(8*i)); return b; };
+      // A file-system entry: flags, name, type (0x10 folder, 0x80 file), first page, size.
+      auto entry=[&](const QByteArray& name,int type,quint32 page,quint32 size){
+        QByteArray e=le(1)+name.leftJustified(32,'\0',true)+QByteArray(2,'\0'); e.append(char(type)); e.append('\0'); return e+le(page)+le(size)+QByteArray(16,'\0'); };
+      // A layer: header (type, id, bounds, opacity %, visible, clipping, blend tag stored back to front), tags, pixels.
+      auto layer=[&](quint32 type,quint32 id,int x,int y,int w,int h,int opacity,bool visible,bool clip,const QByteArray& blend,const QByteArray& name,quint32 parent,const QByteArray& pixels){
+        QByteArray b=le(type)+le(id)+le(quint32(x))+le(quint32(y))+le(w)+le(h)+le(0);
+        b.append(char(opacity)); b.append(char(visible)); b.append('\0'); b.append(char(clip)); b.append('\0');
+        b+=QByteArray(1,blend[3])+blend[2]+blend[1]+blend[0];
+        b+="eman"+le(256)+name.leftJustified(256,'\0',true);
+        if(parent) b+="difp"+le(4)+le(parent);
+        return b+le(0)+pixels; };
+      // A tile's eight streams: B, G, R, A as PackBits, then four empty ones.
+      auto fill=[](int v){ QByteArray s; for(int i=0;i<8;++i){ s.append(char(0x81)); s.append(char(v)); } return s; };   // 8 runs of 128
+      auto stream=[&](const QByteArray& s){ QByteArray b; b.append(char(s.size()&255)); b.append(char(s.size()>>8)); return b+s; };
+      auto tile=[&](const QByteArray& b,const QByteArray& g,const QByteArray& r,const QByteArray& a){ return stream(b)+stream(g)+stream(r)+stream(a)+stream({})+stream({})+stream({})+stream({}); };
+      QByteArray gLit=QByteArray("\x01\x05\x06",3); for(int i=0;i<7;++i){ gLit.append(char(0x81)); gLit.append('\0'); } gLit.append(char(0x83)); gLit.append('\0');   // 5, 6, then 1022 zeros
+      const QByteArray sjis=QByteArray::fromHex("838C83438384815B31");   // "レイヤー1" in Shift-JIS
+      QVector<QByteArray> pg(16);
+      pg[0]=QByteArray(4096,'\0');
+      auto link=[&](int from,int to){ for(int i=0;i<4;++i) pg[0][from*8+4+i]=char(quint32(to)>>(8*i)); };
+      pg[2]=entry("canvas",0x80,3,16)+entry("laytbl",0x80,4,4+8*8)+entry("layers",0x10,5,0)+entry("thumbnail",0x80,6,12+16);
+      pg[3]=le(16)+le(64)+le(32)+le(0);
+      pg[4]=le(8); for(quint32 id : {0x10u,0x11u,0x12u,0x13u,0x14u,0x15u,0x16u,0x17u}) pg[4]+=le(id)+le(0);
+      pg[5]=entry("00000010",0x80,7,600)+entry("00000011",0x80,8,5000)+entry("00000012",0x80,10,1000)+entry("00000013",0x80,11,600)+entry("00000014",0x80,12,1000)+entry("00000015",0x80,13,600)+entry("00000016",0x80,14,1000)+entry("00000017",0x80,15,1000);
+      pg[6]=le(2)+le(2)+QByteArray("23MB")+QByteArray::fromHex("00FF00FF00FF00FF00FF00FF00FF00FF");
+      pg[7]=layer(8,0x10,0,0,64,32,100,true,false,"pass","Set",0,{});
+      pg[8]=layer(3,0x11,0,0,64,32,100,true,false,"norm",sjis,0x10,QByteArray("\x01\x00",2)+tile(QByteArray("\x80",1)+fill(0),gLit,fill(255),fill(255)));
+      link(8,9); pg[9]=QByteArray(4096,'\0');
+      pg[10]=layer(3,0x12,16,0,32,32,100,true,true,"norm","Clip",0x10,QByteArray("\x01",1)+tile(fill(0),fill(255),fill(0),fill(255)));
+      pg[11]=layer(5,0x13,0,0,32,32,100,true,false,"norm","Ink",0,{});
+      pg[12]=layer(3,0x14,32,0,32,32,50,false,false,"mul ","Shade",0,QByteArray("\x01",1)+tile(fill(0),fill(0),fill(64),fill(128)));
+      pg[13]=layer(3,0x15,0,0,32,32,100,true,false,"norm","Empty",0,QByteArray("\x00",1));
+      pg[14]=layer(3,0x16,0,0,32,32,100,true,true,"norm","Gone",0,QByteArray("\x01",1)+tile(fill(9),fill(9),fill(9),fill(255)));
+      pg[15]=layer(3,0x17,32,0,32,32,40,true,false,"add ","Glow",0,QByteArray("\x01",1)+tile(fill(255),fill(255),fill(255),fill(255)));
+      const QByteArray file=saiEncryptPages(pg);
+      SaiImportStats ss;
+      const Document sd=importSaiDocument(file,&ss);
+      check(sd.pageSize==QSizeF(64,32) && sd.shapes.size()==3 && ss.layers==4 && ss.groups==1 && ss.otherLayers==1 && ss.hidden==1 && ss.clipped==2 && ss.badTiles==0 && ss.missing==0,
+            "SAI: decrypted pages, the file system, layers bottom first with a folder before its members; what clips to an empty layer shows nothing");
+      if(sd.shapes.size()==3){
+        const Shape& set=sd.shapes[0]; const Shape& shade=sd.shapes[1]; const Shape& glow=sd.shapes[2];
+        check(set.type==ShapeType::Group && !set.isolate && set.opacity==1.0 && set.children.size()==2, "SAI: a pass-through folder with its members");
+        if(set.children.size()==2){
+          const Shape& a=set.children[0]; const Shape& c=set.children[1];
+          check(a.fill.image.size()==QSize(32,32) && a.docBounds().topLeft()==QPointF(0,0) && a.fill.image.pixel(0,0)==qRgb(255,5,0) && a.fill.image.pixel(1,0)==qRgb(255,6,0) && a.fill.image.pixel(5,5)==qRgb(255,0,0),
+                "SAI: PackBits runs, literals and no-ops in a tile read over two chained pages");
+          check(a.name==QString::fromUtf8("レイヤー1") || !QStringDecoder("Shift_JIS").isValid(), "SAI: a Shift-JIS layer name");
+          check(c.fill.image.size()==QSize(16,32) && c.docBounds().topLeft()==QPointF(16,0) && c.fill.image.pixel(0,0)==qRgb(0,255,0), "SAI: a clipping layer keeps only what lies over its base");
+        }
+        check(!shade.visible && shade.blend==QPainter::CompositionMode_Multiply && qAbs(shade.opacity-0.5)<1e-9 && shade.fill.image.pixel(0,0)==qRgba(128,0,0,128),
+              "SAI: blend tag, opacity in percent, hidden; premultiplied colour made straight");
+        check(glow.blend==QPainter::CompositionMode_Plus && glow.opacity==1.0 && qAlpha(glow.fill.image.pixel(0,0))==102, "SAI: an Add layer adds itself faded by its opacity");
+      }
+      QByteArray bad=file; bad[12*4096+100]=char(bad[12*4096+100]^1);
+      SaiImportStats bs; const Document bd=importSaiDocument(bad,&bs);
+      check(bd.shapes.size()==2 && bs.missing==1, "SAI: a page whose checksum fails loses only its layer");
+      QVector<QByteArray> only=pg; only[4]=le(1)+le(0x13)+le(0); only[2]=entry("canvas",0x80,3,16)+entry("laytbl",0x80,4,12)+entry("layers",0x10,5,0)+entry("thumbnail",0x80,6,28);
+      SaiImportStats ts; const Document td=importSaiDocument(saiEncryptPages(only),&ts);
+      check(ts.thumbnailOnly && td.shapes.size()==1 && td.shapes[0].fill.image.pixel(1,1)==qRgb(0,255,0), "SAI: with only linework, the thumbnail stands in");
+      for(int cut=4096; cut<file.size(); cut+=1531) importSaiDocument(file.left(cut));
+      check(importSaiDocument(QByteArray(3*4096,'\x5a')).shapes.isEmpty() && importSaiDocument("SAI").shapes.isEmpty(), "SAI: cut-short and foreign files give nothing, safely");
+    }
+
     // --- Corel PHOTO-PAINT ---
     std::printf("[interop] Corel PHOTO-PAINT\n");
     {

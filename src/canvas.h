@@ -374,6 +374,7 @@ public:
     bool importCptFile(const QString& path);                         // Corel PHOTO-PAINT, with its objects
     bool importPdn(const QString& path);                             // Paint.NET, with its layers
     bool importMdp(const QString& path);                             // MediBang Paint / FireAlpaca, with its layers
+    bool importSai(const QString& path);                             // PaintTool SAI, with its layers
     bool importPxd(const QString& path);                             // Pixelmator Pro → layers
     bool importClip(const QString& path);                            // Clip Studio Paint → layers
     bool importPsp(const QString& path);                             // PaintShop Pro → layers

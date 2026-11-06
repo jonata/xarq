@@ -1008,6 +1008,19 @@ bool Canvas::importMdp(const QString& path){
     emit statusMessage("No readable layers found in the MediBang Paint file.");
     return false;
 }
+bool Canvas::importSai(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    SaiImportStats st;
+    const Document pd=importSaiDocument(data,&st);
+    QStringList notes;
+    if(st.thumbnailOnly) notes<<QStringLiteral("only the file's thumbnail could be read");
+    else if(st.missing||st.badTiles) notes<<QStringLiteral("%1 damaged part(s) left out").arg(st.missing+st.badTiles);
+    if(st.otherLayers) notes<<QStringLiteral("%1 linework or other layer(s) XarQ doesn't read").arg(st.otherLayers);
+    if(st.unknownModes) notes<<QStringLiteral("%1 blend mode(s) with no match drawn as Normal").arg(st.unknownModes);
+    if(adoptLayers(pd,path,"Import PaintTool SAI",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the SAI file.");
+    return false;
+}
 bool Canvas::importPxd(const QString& path){
     QMap<QString,QByteArray> files;
     const QFileInfo info(path);
