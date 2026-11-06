@@ -70,10 +70,10 @@ QImage clipPreview(const QByteArray& data);
 struct ProcreateImportStats { int layers = 0, groups = 0, masks = 0, clipped = 0, badTiles = 0; };
 Document importProcreateDocument(const QMap<QString,QByteArray>& zip, ProcreateImportStats* stats = nullptr);
 
-// Corel PHOTO-PAINT: the picture, for the compression the format's files have been seen to use in a form that
-// can be read. `unknownTiles` counts tiles in its other, undeciphered compression.
-struct CptImportStats { int unknownTiles = 0; };
-QImage importCpt(const QByteArray& data, CptImportStats* stats = nullptr);
+// Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
+// Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
+struct CptImportStats { int objects = 0, hidden = 0, savedMasks = 0, unknownTiles = 0, unknownDepth = 0; bool thumbnailOnly = false; };
+Document importCptDocument(const QByteArray& data, CptImportStats* stats = nullptr);
 
 // Pixelmator Pro → a Document: raster, shape and text layers, groups, blends, masks, shadows and blur. `files`
 // is the unpacked file or folder, by relative path.

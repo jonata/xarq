@@ -12736,33 +12736,71 @@ if(xara::pdfVectorAvailable()){
         QByteArray out; quint32 acc=0; int nb=0;
         auto put=[&](int code){ acc|=quint32(code)<<nb; nb+=9; while(nb>=8){ out.append(char(acc&255)); acc>>=8; nb-=8; } };
         put(256); for(uchar c : raw) put(c); put(257); if(nb) out.append(char(acc&255)); return out; };
-      auto build=[&](int w,int h,int bpp,const QByteArray& pal,const QByteArray& tile){
-        QByteArray f("CPT7FILE"); f+=le32(bpp==8?10:1); f+=le32(pal.size()); f.append(QByteArray(0x138-f.size(),'\0'));
-        f+=pal; const quint32 off=0x140+pal.size(); f+=le32(0); f+=le32(off);       // the field that locates the record
-        f.resize(int(off));
-        f+=le32(w); f+=le32(h); f+=le32(144); f+=le32(151); f+=le32(bpp);
-        const quint32 pos=off+20+8; f+=le32(pos); f+=le32(tile.size()); f+=tile;
+      // An object: its record, a header of `fields` (bounds, visibility, opacity, name), then one tile.
+      struct CObj { int w,h,bpp,kind; QByteArray fields, tile; };
+      auto build=[&](const QByteArray& pal,const QVector<CObj>& objs){
+        QByteArray f("CPT7FILE"); f+=le32(1); f+=le32(pal.size()); f.append(QByteArray(0x28-f.size(),'\0'));
+        f+=le32(objs.size()); f.append(QByteArray(0x13c-f.size(),'\0')); f+=pal;
+        const int tableAt=f.size(); f.append(QByteArray(objs.size()*8,'\0'));
+        for(int i=0;i<objs.size();++i){
+          const CObj& o=objs[i]; const quint32 at=f.size(); f.replace(tableAt+i*8,4,le32(at));
+          const quint32 hs=quint32(qMax(8,int(o.fields.size())+8));
+          QByteArray r=le32(o.w)+le32(o.h)+le32(o.w)+le32(o.h)+le32(o.bpp)+le32(0)+le32(o.kind)+le32(0)+le32(hs);
+          r.append(QByteArray(0x3c-r.size(),'\0')); r+=le32(hs); r+=le32(o.kind); r+=o.fields; r.append(QByteArray(int(0x3c+hs)-r.size(),'\0'));
+          r+=le32(at+r.size()+8); r+=le32(o.tile.size()); r+=o.tile; f+=r;
+        }
         return f; };
-      // Two rows, each padded to four bytes: blue, green, red.
+      auto fields=[&](int left,int top,int right,int bottom,int visible,int opacity,const QByteArray& name){
+        QByteArray x=le32(left)+le32(top)+le32(right)+le32(bottom)+le32(1)+le32(1)+le32(visible)+le32(0)+le32(opacity)+le32(0);
+        x+=name; x.append(QByteArray(32-name.size(),'\0')); return x; };
+      auto flat=[&](const QByteArray& colour){ QByteArray t=QByteArray::fromHex("0400000000000000000000")+QByteArray(1,'\0')+colour; t.append(QByteArray(4-colour.size(),'\0')); return t; };
+      // Stored rows run upward, each padded to four bytes, blue first.
       const QByteArray rgb=QByteArray::fromHex("0A141E00")+QByteArray::fromHex("28323C00");
-      QByteArray t24=QByteArray::fromHex("02000300")+lzwBytes(rgb);
-      QImage ci=importCpt(build(1,2,24,QByteArray(),t24));
-      check(ci.size()==QSize(1,2) && ci.pixel(0,0)==qRgb(0x1E,0x14,0x0A) && ci.pixel(0,1)==qRgb(0x3C,0x32,0x28), "PHOTO-PAINT: LZW tile, blue first, rows padded to four bytes");
-      QByteArray pal(768,'\0'); pal[3]=char(11); pal[4]=char(22); pal[5]=char(33);
+      Document cd=importCptDocument(build(QByteArray(),{{1,2,24,1,QByteArray(),QByteArray::fromHex("02000000")+lzwBytes(rgb)}}));
+      QImage ci=cd.shapes.isEmpty()? QImage() : cd.shapes[0].fill.image;
+      check(cd.pageSize==QSizeF(1,2) && ci.size()==QSize(1,2) && ci.pixel(0,1)==qRgb(0x1E,0x14,0x0A) && ci.pixel(0,0)==qRgb(0x3C,0x32,0x28), "PHOTO-PAINT: LZW tile, blue first, rows padded to four bytes and running upward");
+      QByteArray pal(768,'\0'); pal[3]=char(33); pal[4]=char(22); pal[5]=char(11);
       const QByteArray t8=QByteArray::fromHex("02000000")+lzwBytes(QByteArray::fromHex("0001")+QByteArray(2,'\0'));
-      QImage pi=importCpt(build(2,1,8,pal,t8));
-      check(pi.size()==QSize(2,1) && pi.pixel(0,0)==qRgb(0,0,0) && pi.pixel(1,0)==qRgb(11,22,33), "PHOTO-PAINT: indexed tile through its palette");
-      // The LZW edge cases: a code naming the string it defines, and a code past the table.
+      Document pd=importCptDocument(build(pal,{{2,1,8,1,QByteArray(),t8}}));
+      QImage pi=pd.shapes.isEmpty()? QImage() : pd.shapes[0].fill.image;
+      check(pi.size()==QSize(2,1) && pi.pixel(0,0)==qRgb(0,0,0) && pi.pixel(1,0)==qRgb(11,22,33), "PHOTO-PAINT: indexed tile through its palette, stored blue first");
+      // Compression 5 with filter 3: runs of fixed-width signed samples, each a difference from the sample above
+      // (in the first row, from the one to its left).
+      QByteArray t5=QByteArray::fromHex("05000300");
+      { quint32 acc=0; int nb=0; auto put=[&](int v,int bits){ acc|=quint32(v&((1<<bits)-1))<<nb; nb+=bits; while(nb>=8){ t5.append(char(acc&255)); acc>>=8; nb-=8; } };
+        put(0xE5,8); for(int v : {10,20,30,2,2,3}) put(v,8);     // six samples, eight bits each
+        put(0x01,8);                                              // two zeros: the row's padding
+        put(0x62,8); for(int v : {5,0,0}) put(v,4);               // three four-bit samples
+        put(0x42,8); for(int v : {-3,1,0}) put(v,3);              // three three-bit samples, one negative
+        put(0x01,8); if(nb) t5.append(char(acc&255)); }
+      Document fd=importCptDocument(build(QByteArray(),{{2,2,24,1,QByteArray(),t5}}));
+      QImage fi=fd.shapes.isEmpty()? QImage() : fd.shapes[0].fill.image;
+      check(fi.size()==QSize(2,2) && fi.pixel(0,1)==qRgb(30,20,10) && fi.pixel(1,1)==qRgb(33,22,12) && fi.pixel(0,0)==qRgb(30,20,15) && fi.pixel(1,0)==qRgb(33,23,9),
+            "PHOTO-PAINT: run-coded tile, sign-extended samples undone through the filter");
+      // An object on the background: placed from its bounds (y counting up), with its mask, opacity and visibility.
+      Document od=importCptDocument(build(QByteArray(),{
+          {4,4,24,1,QByteArray(),flat(QByteArray::fromHex("FFFFFF"))},
+          {2,1,24,8,fields(1,2,2,2,0,60,"Obj"),flat(QByteArray::fromHex("0000FF"))},
+          {2,1,8,4,QByteArray(),QByteArray::fromHex("80FF0000")}}));     // a tile no smaller than its pixels is stored as is
+      check(od.shapes.size()==2 && od.shapes[0].fill.image.pixel(3,3)==qRgb(255,255,255), "PHOTO-PAINT: a flat background tile");
+      if(od.shapes.size()==2){
+        const Shape& o=od.shapes[1]; const QImage oi=o.fill.image;
+        check(o.name==QStringLiteral("Obj") && qAbs(o.opacity-0.6)<.001 && !o.visible, "PHOTO-PAINT: an object's name, opacity and visibility");
+        check(oi.size()==QSize(2,1) && oi.pixel(0,0)==qRgba(255,0,0,0x80) && qAlpha(oi.pixel(1,0))==0xFF && o.docBounds().topLeft()==QPointF(1,1), "PHOTO-PAINT: an object's mask and place");
+      }
+      CptImportStats us;
+      const Document ud=importCptDocument(build(QByteArray(),{{4,4,24,1,QByteArray(),QByteArray::fromHex("0700030000000000")}}),&us);
+      check(ud.shapes.size()==1 && us.unknownTiles==1, "PHOTO-PAINT: an unknown compression is counted, the rest still imports");
+      // The LZW edge cases: a code naming the string it defines, and output short of the tile.
       QByteArray self; { quint32 acc=0; int nb=0; auto put=[&](int code){ acc|=quint32(code)<<nb; nb+=9; while(nb>=8){ self.append(char(acc&255)); acc>>=8; nb-=8; } };
         put(256); put(7); put(258); put(257); if(nb) self.append(char(acc&255)); }
-      QImage sl=importCpt(build(3,1,8,pal,QByteArray::fromHex("02000000")+self+QByteArray()));
-      check(sl.isNull(), "PHOTO-PAINT: output shorter than the image is refused");
-      QImage s2=importCpt(build(1,1,24,QByteArray(),QByteArray::fromHex("02000300")+self));
-      check(s2.isNull(), "PHOTO-PAINT: rows that don't fill the stride are refused");
-      CptImportStats us;
-      const QImage un=importCpt(build(4,4,24,QByteArray(),QByteArray::fromHex("050003003F3F0000")),&us);
-      check(un.isNull() && us.unknownTiles==1, "PHOTO-PAINT: the unread compression is counted, so the message can say so");
-      check(importCpt("CPT7FILE too short").isNull(), "PHOTO-PAINT: a truncated header is refused");
+      CptImportStats ss;
+      importCptDocument(build(QByteArray(),{{3,1,24,1,QByteArray(),QByteArray::fromHex("02000000")+self}}),&ss);
+      check(ss.unknownTiles==1, "PHOTO-PAINT: an LZW tile that runs short is refused");
+      CptImportStats ts;
+      const Document td=importCptDocument(build(QByteArray(),{{1,1,24,16,QByteArray(),flat(QByteArray::fromHex("102030"))}}),&ts);
+      check(td.shapes.size()==1 && ts.thumbnailOnly && td.shapes[0].fill.image.pixel(0,0)==qRgb(0x30,0x20,0x10), "PHOTO-PAINT: with nothing else readable, the thumbnail stands in");
+      check(importCptDocument("CPT7FILE too short").shapes.isEmpty(), "PHOTO-PAINT: a truncated header is refused");
     }
 
     // --- Pixelmator Pro ---

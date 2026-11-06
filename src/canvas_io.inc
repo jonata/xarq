@@ -958,14 +958,13 @@ bool Canvas::importProcreate(const QString& path){
 bool Canvas::importCptFile(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
     CptImportStats st;
-    const QImage img=importCpt(data,&st);
-    if(!img.isNull()){
-        Document one; one.pageSize=img.size(); one.shapes.push_back(psdBitmapShape(img,0,0,QFileInfo(path).fileName()));
-        if(adoptLayers(one,path,"Import PHOTO-PAINT",QString())) return true;
-    }
-    emit statusMessage(st.unknownTiles
-        ? QStringLiteral("This PHOTO-PAINT file uses a compression XarQ can't read yet (%1 tiles). Save it as TIFF or PSD from PHOTO-PAINT.").arg(st.unknownTiles)
-        : QStringLiteral("No readable image found in the PHOTO-PAINT file."));
+    const Document pd=importCptDocument(data,&st);
+    QStringList notes;
+    if(st.thumbnailOnly) notes<<QStringLiteral("only the file's thumbnail could be read");
+    if(st.unknownTiles) notes<<QStringLiteral("%1 tile(s) couldn't be read").arg(st.unknownTiles);
+    if(st.unknownDepth) notes<<QStringLiteral("%1 object(s) in a colour depth XarQ doesn't read").arg(st.unknownDepth);
+    if(adoptLayers(pd,path,"Import PHOTO-PAINT",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable image found in the PHOTO-PAINT file.");
     return false;
 }
 bool Canvas::importPxd(const QString& path){
