@@ -12,6 +12,9 @@
 #include <functional>
 #include <cstring>
 #include <zlib.h>
+#ifdef HAVE_BZIP2
+#include <bzlib.h>
+#endif
 
 namespace xara {
 namespace {
@@ -265,13 +268,53 @@ QByteArray gunzip(const QByteArray& in){
     return out;
 }
 
+#ifdef HAVE_BZIP2
+// bzip2, including files of several streams one after another.
+QByteArray bunzip(const QByteArray& in){
+    QByteArray out; const qint64 cap = qint64(1) << 31;
+    qint64 at = 0;
+    while(at < in.size() && in.mid(at, 3) == "BZh"){
+        bz_stream z; std::memset(&z, 0, sizeof z);
+        if(BZ2_bzDecompressInit(&z, 0, 0) != BZ_OK) return QByteArray();
+        z.next_in = const_cast<char*>(in.constData() + at); z.avail_in = uint(qMin<qint64>(in.size() - at, 0x7fffffff));
+        char buf[1 << 16]; int rc;
+        do {
+            z.next_out = buf; z.avail_out = sizeof buf;
+            rc = BZ2_bzDecompress(&z);
+            if(rc != BZ_OK && rc != BZ_STREAM_END){ BZ2_bzDecompressEnd(&z); return QByteArray(); }
+            out.append(buf, int(sizeof buf - z.avail_out));
+            if(out.size() > cap - qint64(sizeof buf)){ BZ2_bzDecompressEnd(&z); return QByteArray(); }
+            if(rc == BZ_OK && z.avail_in == 0 && z.avail_out != 0){ BZ2_bzDecompressEnd(&z); return QByteArray(); }   // cut short
+        } while(rc != BZ_STREAM_END);
+        at = in.size() - z.avail_in;
+        BZ2_bzDecompressEnd(&z);
+    }
+    return out;
+}
+#endif
+
 } // namespace
+
+bool xcfBzip2Supported(){
+#ifdef HAVE_BZIP2
+    return true;
+#else
+    return false;
+#endif
+}
 
 Document importXcfDocument(const QByteArray& raw, XcfImportStats* st){
     Document doc;
     QByteArray data = raw;
     if(raw.size() > 2 && uchar(raw[0]) == 0x1f && uchar(raw[1]) == 0x8b) data = gunzip(raw);
-    else if(raw.startsWith("BZh")){ if(st) st->bzip2 = true; return doc; }
+    else if(raw.startsWith("BZh")){
+#ifdef HAVE_BZIP2
+        data = bunzip(raw);
+#else
+        if(st) st->bzip2 = true;
+        return doc;
+#endif
+    }
     if(data.size() < 30 || !data.startsWith("gimp xcf ")) return doc;
     Xcf x; x.r = { reinterpret_cast<const uchar*>(data.constData()), data.size() };
     const Rd& r = x.r;

@@ -75,6 +75,9 @@
 #include "fxgvector.h"
 #include "sqlitemini.h"
 #include "xdvector.h"
+#ifdef HAVE_BZIP2
+#include <bzlib.h>
+#endif
 
 using namespace xara;
 
@@ -12793,8 +12796,16 @@ if(xara::pdfVectorAvailable()){
         for(int i=0;i<4;++i) gz.append(char(crc>>(8*i))); for(int i=0;i<4;++i) gz.append(char(quint32(lf.size())>>(8*i)));
         const Document gd=importXcfDocument(gz);
         check(gd.shapes.size()==1 && gd.shapes[0].fill.image.pixel(0,0)==qRgb(188,0,255), "XCF: a gzip-compressed file is unpacked"); }
+#ifdef HAVE_BZIP2
+      { QByteArray bz(lf.size()*2+600,'\0'); unsigned int bl=uint(bz.size());
+        BZ2_bzBuffToBuffCompress(bz.data(),&bl,const_cast<char*>(lf.constData()),uint(lf.size()),9,0,0); bz.truncate(int(bl));
+        const Document bd=importXcfDocument(bz+bz);   // two streams one after another, as some tools write
+        check(xcfBzip2Supported() && bd.shapes.size()==1 && bd.shapes[0].fill.image.pixel(0,0)==qRgb(188,0,255), "XCF: a bzip2-compressed file is unpacked");
+        XcfImportStats cs; check(importXcfDocument(bz.left(bz.size()/2),&cs).shapes.isEmpty() && !cs.bzip2, "XCF: a cut-short bzip2 file gives nothing"); }
+#else
       XcfImportStats bz; importXcfDocument("BZh91AY&SY",&bz);
-      check(bz.bzip2, "XCF: a bzip2-compressed file is recognised, so the message can say so");
+      check(!xcfBzip2Supported() && bz.bzip2, "XCF: without bzip2, a bzip2-compressed file is recognised, so the message can say so");
+#endif
       check(importXcfDocument(file(11,150,1,4,3,0,ls,rle).left(40)).shapes.isEmpty(), "XCF: a truncated file gives nothing");
     }
 

@@ -73,9 +73,11 @@ struct ProcreateImportStats { int layers = 0, groups = 0, masks = 0, clipped = 0
 Document importProcreateDocument(const QMap<QString,QByteArray>& zip, ProcreateImportStats* stats = nullptr);
 
 // GIMP's XCF → a Document: its layers and groups with blend mode, opacity, visibility and masks; high bit
-// depths and linear-light images come in as 8-bit sRGB. gzip-compressed files are unpacked; bzip2 ones aren't.
+// depths and linear-light images come in as 8-bit sRGB. gzip-compressed files are unpacked, and bzip2 ones
+// when built with bzip2 (stats->bzip2 says one was refused).
 struct XcfImportStats { int layers = 0, groups = 0, masks = 0, unknownModes = 0, dissolve = 0, badTiles = 0; bool linear = false, bzip2 = false; };
 Document importXcfDocument(const QByteArray& data, XcfImportStats* stats = nullptr);
+bool xcfBzip2Supported();
 
 // Krita → a Document: paint layers (with transparency masks), groups and vector layers, with blend, opacity
 // and visibility. `zip` is the unpacked file. Filter masks and clone, file, fill and adjustment layers are counted.

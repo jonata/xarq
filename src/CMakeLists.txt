@@ -46,6 +46,9 @@ pkg_check_modules(LIBJXR libjxr)
 # tiles with zstd. Without it those files decline to the embedded preview; v9/v10 files are unaffected.
 pkg_check_modules(LIBZSTD libzstd)
 
+# Optional: bzip2, for GIMP's .xcf.bz2. Without it those files are refused with a message.
+find_package(BZip2 QUIET)
+
 # Optional: DICOM medical images via GDCM (find_package, no .pc) and WMF metafiles via libwmf.
 find_package(GDCM QUIET)
 pkg_check_modules(LIBWMF libwmf)
@@ -178,6 +181,14 @@ if(POPPLER_FOUND AND POPPLER_VERSION VERSION_GREATER_EQUAL "26.1" AND EXISTS "${
     set_source_files_properties(pdfvector.cpp PROPERTIES COMPILE_DEFINITIONS "HAVE_POPPLER" COMPILE_OPTIONS "-std=c++20" INCLUDE_DIRECTORIES "${POPPLER_INCLUDEDIR}/poppler")
     target_link_directories(xarq PRIVATE ${POPPLER_LIBRARY_DIRS})
     target_link_libraries(xarq PRIVATE ${POPPLER_LIBRARIES})
+endif()
+
+if(BZIP2_FOUND)
+    target_link_libraries(xarq PRIVATE BZip2::BZip2)
+    set_property(SOURCE xcfimport.cpp selftest.cpp APPEND PROPERTY COMPILE_DEFINITIONS HAVE_BZIP2)
+    message(STATUS "GIMP .xcf.bz2 import: ENABLED")
+else()
+    message(STATUS "GIMP .xcf.bz2 import: DISABLED (install the bzip2 development files to enable it)")
 endif()
 
 # Zstandard for the Affinity reader. Scope HAVE_ZSTD + its includes to affvector.cpp only.
