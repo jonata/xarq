@@ -82,6 +82,10 @@ Document importXcfDocument(const QByteArray& data, XcfImportStats* stats = nullp
 struct KraImportStats { int layers = 0, groups = 0, vectorLayers = 0, masks = 0, filters = 0, otherLayers = 0, unknownModes = 0, badTiles = 0, unsupportedColour = 0; };
 Document importKraDocument(const QMap<QString,QByteArray>& zip, KraImportStats* stats = nullptr);
 
+// OpenRaster → a Document: its layers and nested stacks with opacity, visibility, blend and isolation.
+struct OraImportStats { int layers = 0, groups = 0, unknownModes = 0, missing = 0; };
+Document importOraDocument(const QMap<QString,QByteArray>& zip, OraImportStats* stats = nullptr);
+
 // Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
 // Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
 struct CptImportStats { int objects = 0, hidden = 0, savedMasks = 0, unknownTiles = 0, unknownDepth = 0; bool thumbnailOnly = false; };

@@ -12798,6 +12798,34 @@ if(xara::pdfVectorAvailable()){
       check(importXcfDocument(file(11,150,1,4,3,0,ls,rle).left(40)).shapes.isEmpty(), "XCF: a truncated file gives nothing");
     }
 
+    // --- OpenRaster ---
+    std::printf("[interop] OpenRaster\n");
+    {
+      auto png=[](int w,int h,QRgb c){ QImage i(w,h,QImage::Format_ARGB32); i.fill(c); QByteArray b; QBuffer bf(&b); bf.open(QIODevice::WriteOnly); i.save(&bf,"PNG"); return b; };
+      QMap<QString,QByteArray> oz;
+      oz["stack.xml"]=R"(<?xml version="1.0"?><image w="4" h="3" version="0.0.5"><stack name="root">
+ <layer name="Top" src="data/a.png" x="1" y="2" opacity="0.5" composite-op="svg:multiply"/>
+ <stack name="Grp" visibility="hidden" isolation="isolate">
+  <layer name="Cut" src="data/b.png" composite-op="svg:dst-out"/>
+  <layer name="Odd" src="data/b.png" composite-op="mypaint:no-such-op" x="inf"/>
+ </stack>
+ <layer name="Gone" src="data/missing.png"/>
+ <layer name="Bottom" src="data/c.png"/>
+</stack></image>)";
+      oz["data/a.png"]=png(2,1,qRgb(255,0,0)); oz["data/b.png"]=png(1,1,qRgb(0,0,255)); oz["data/c.png"]=png(4,3,qRgb(200,200,200));
+      OraImportStats os;
+      const Document od=importOraDocument(oz,&os);
+      check(od.pageSize==QSizeF(4,3) && od.shapes.size()==3 && os.layers==4 && os.groups==1 && os.missing==1 && os.unknownModes==1, "OpenRaster: layers and a nested stack, topmost first, stack bottom up; a missing image is counted");
+      if(od.shapes.size()==3){
+        const Shape& b=od.shapes[0]; const Shape& g=od.shapes[1]; const Shape& t=od.shapes[2];
+        check(b.name==QStringLiteral("Bottom") && b.fill.image.pixel(3,2)==qRgb(200,200,200), "OpenRaster: a layer's PNG");
+        check(g.type==ShapeType::Group && !g.visible && g.isolate && g.children.size()==2 && g.children[1].blend==QPainter::CompositionMode_DestinationOut
+              && g.children[0].docBounds().topLeft()==QPointF(0,0), "OpenRaster: a hidden isolated stack, an erasing composite-op, a bad offset ignored");
+        check(t.blend==QPainter::CompositionMode_Multiply && qAbs(t.opacity-0.5)<1e-9 && t.docBounds().topLeft()==QPointF(1,2), "OpenRaster: blend, opacity and place");
+      }
+      check(importOraDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "OpenRaster: an archive without stack.xml gives nothing");
+    }
+
     // --- Krita ---
     std::printf("[interop] Krita\n");
     {

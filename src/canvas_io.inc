@@ -2362,9 +2362,8 @@ static QTransform xqOdfTransform(const QString& str){
 }
 
 // --- OpenRaster (.ora) / Krita (.kra): app-native layered raster in a ZIP container ----------------
-// Both wrap layers + a flattened "mergedimage.png" in a ZIP. OpenRaster describes its stack in a standard
-// stack.xml (layer PNGs under data/), which we reverse-engineer into one editable photo object per layer;
-// Krita's layers are read by importKraDocument (kraimport.cpp). mergedimage is the fallback.
+// Both wrap layers + a flattened "mergedimage.png" in a ZIP: importOraDocument (oraimport.cpp) reads
+// OpenRaster's stack.xml and importKraDocument (kraimport.cpp) Krita's tiles. mergedimage is the fallback.
 static QByteArray xqZipFind(const QMap<QString,QByteArray>& zip, const QString& name){
     for(auto it=zip.begin(); it!=zip.end(); ++it){
         const QString k=it.key();
@@ -2388,63 +2387,17 @@ bool Canvas::importOra(const QString& path){
     const QByteArray data=f.readAll(); f.close();
     const QMap<QString,QByteArray> zip=readZipEntries(data);
     if(zip.isEmpty()){ emit statusMessage("Not a readable OpenRaster (.ora) archive."); return false; }
-    // Parse stack.xml → layers (listed top-first in the file). Nested groups are flattened.
-    struct OraLayer { QString src, name; double x=0, y=0, opacity=1.0; };
-    QVector<OraLayer> layers; double cw=0, ch=0;
-    { const QByteArray sx=xqZipFind(zip,"stack.xml"); QXmlStreamReader r(sx);
-      while(!r.atEnd()){ r.readNext(); if(!r.isStartElement()) continue;
-          const QXmlStreamAttributes a=r.attributes();
-          if(r.name()==QLatin1String("image")){ cw=a.value(QLatin1String("w")).toDouble(); ch=a.value(QLatin1String("h")).toDouble(); }
-          else if(r.name()==QLatin1String("layer")){
-              OraLayer l; l.src=a.value(QLatin1String("src")).toString(); l.name=a.value(QLatin1String("name")).toString();
-              l.x=a.value(QLatin1String("x")).toDouble(); l.y=a.value(QLatin1String("y")).toDouble();
-              if(a.hasAttribute("opacity")) l.opacity=a.value(QLatin1String("opacity")).toDouble();
-              if(!l.src.isEmpty() && layers.size()<4096) layers.push_back(l); } } }   // cap layer COUNT (pixel budget below caps total decode)
-    // Resolve a layer's bytes: exact src first, then basename (so "data/sub/x.png" isn't shadowed by "data/x.png").
-    auto findLayer=[&](const QString& src)->QByteArray{ QByteArray b=xqZipFind(zip,src); if(b.isEmpty()) b=xqZipFind(zip,QFileInfo(src).fileName()); return b; };
-    // PNG dimensions straight from the IHDR (ORA layers are PNG) — header-only, so the size-derivation pass
-    // can't be turned into a decode bomb.
-    auto pngSize=[](const QByteArray& b)->QSize{
-        if(b.size()<24 || quint8(b[0])!=0x89 || b[1]!='P' || b[2]!='N' || b[3]!='G') return {};
-        auto be=[&](int o){ return (quint32(quint8(b[o]))<<24)|(quint32(quint8(b[o+1]))<<16)|(quint32(quint8(b[o+2]))<<8)|quint8(b[o+3]); };
-        const quint32 w=be(16), h=be(20);
-        return (w==0||h==0||w>65535||h>65535) ? QSize() : QSize(int(w),int(h)); };
-    // Sanitise the declared canvas size — a hostile stack.xml can inject inf/NaN/≤0 (Qt's toDouble parses "inf"/"nan").
-    if(!qIsFinite(cw) || cw<=0) cw=0;
-    if(!qIsFinite(ch) || ch<=0) ch=0;
-    QVector<Shape> shapes;
-    if(!layers.isEmpty()){
-        // If the canvas size is missing, derive it from the union of ALL layer extents (header-only reads).
-        if(cw<=0 || ch<=0){ double uw=0, uh=0;
-            for(const OraLayer& l : layers){ const QSize sz=pngSize(findLayer(l.src)); if(!sz.isValid()) continue;
-                const double lx=qIsFinite(l.x)?l.x:0, ly=qIsFinite(l.y)?l.y:0;
-                uw=qMax(uw, lx+sz.width()); uh=qMax(uh, ly+sz.height()); }
-            if(cw<=0) cw=uw; if(ch<=0) ch=uh; }
-        if(!qIsFinite(cw) || cw<=0) cw=1;
-        if(!qIsFinite(ch) || ch<=0) ch=1;
-        const double sc=qMin(1.0, qMin(m_doc.pageSize.width()*0.9/cw, m_doc.pageSize.height()*0.9/ch));
-        const double ox=(m_doc.pageSize.width()-cw*sc)/2, oy=(m_doc.pageSize.height()-ch*sc)/2;
-        const qint64 kPixBudget=256LL*1024*1024; qint64 accPix=0;   // cumulative decode budget (many-huge-layers OOM guard)
-        for(int i=layers.size()-1; i>=0; --i){ const OraLayer& l=layers[i];   // add bottom-first for correct z-order
-            QImage im; const QByteArray lb=findLayer(l.src);
-            if(lb.isEmpty() || !im.loadFromData(lb) || im.isNull()) continue;
-            accPix += (qint64)im.width()*im.height(); if(accPix > kPixBudget) break;
-            const double lw=im.width(), lh=im.height();
-            const double lx=qIsFinite(l.x)?l.x:0, ly=qIsFinite(l.y)?l.y:0;   // never let inf/NaN reach the transform
-            Shape s; s.type=ShapeType::Rect; s.rect=QRectF(0,0,lw,lh); s.name=l.name.isEmpty()?QStringLiteral("Layer"):l.name;
-            s.fill.type=FillType::Bitmap; s.fill.image=im; s.fill.origImage=im; s.fill.tiled=false;
-            s.fill.p0=QPointF(0,lh); s.fill.p1=QPointF(lw,lh); s.fill.p2=QPointF(0,0); s.stroke.enabled=false;
-            s.opacity=qBound(0.0, qIsFinite(l.opacity)?l.opacity:1.0, 1.0);
-            s.transform=QTransform::fromTranslate(lx,ly)*QTransform::fromScale(sc,sc)*QTransform::fromTranslate(ox,oy);
-            shapes.push_back(s); }
-    }
-    if(!shapes.isEmpty()){ addShapes(shapes,"Import OpenRaster"); zoomFit();
-        emit statusMessage(QStringLiteral("Imported OpenRaster — %1 editable layers.").arg(shapes.size())); return true; }
+    OraImportStats st;
+    const Document pd=importOraDocument(zip,&st);
+    QStringList notes;
+    if(st.missing) notes<<QStringLiteral("%1 layer image(s) missing or unreadable").arg(st.missing);
+    if(st.unknownModes) notes<<QStringLiteral("%1 blend mode(s) with no match drawn as Normal").arg(st.unknownModes);
+    if(adoptLayers(pd,path,"Import OpenRaster",notes.join(QStringLiteral(", ")))) return true;
     // Fallback: the flattened composite.
     QImage merged; const QByteArray mb=xqZipFind(zip,"mergedimage.png");
     if(!mb.isEmpty() && merged.loadFromData(mb)){
-        placeZipComposite(merged, QFileInfo(path).fileName(), QStringLiteral("Import OpenRaster"));
-        emit statusMessage(QStringLiteral("Imported OpenRaster composite %1×%2.").arg(merged.width()).arg(merged.height())); return true; }
+        Document one; one.pageSize=merged.size(); one.shapes.push_back(psdBitmapShape(merged,0,0,QFileInfo(path).fileName()+QStringLiteral(" (flattened)")));
+        return adoptLayers(one,path,"Import OpenRaster",QStringLiteral("only the flattened image could be read")); }
     emit statusMessage("No importable content found in the .ora."); return false;
 }
 bool Canvas::importKra(const QString& path){

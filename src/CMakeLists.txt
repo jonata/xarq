@@ -90,6 +90,7 @@ add_executable(xarq
     cptimport.cpp
     xcfimport.cpp
     kraimport.cpp
+    oraimport.cpp
     procreateimport.cpp
     sqlitemini.cpp
     clipimport.cpp
