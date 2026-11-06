@@ -12798,6 +12798,55 @@ if(xara::pdfVectorAvailable()){
       check(importXcfDocument(file(11,150,1,4,3,0,ls,rle).left(40)).shapes.isEmpty(), "XCF: a truncated file gives nothing");
     }
 
+    // --- Krita ---
+    std::printf("[interop] Krita\n");
+    {
+      // Tile files: a text header, then "x,y,LZF,size" and a flag (1 LZF, 0 stored) before each tile, whose
+      // pixels are stored a byte-plane at a time (blue, green, red, alpha for 8-bit RGBA).
+      auto tiles=[](int tw,int th,int ps,const QVector<QPair<QByteArray,QByteArray>>& t){
+        QByteArray f="VERSION 2\nTILEWIDTH "+QByteArray::number(tw)+"\nTILEHEIGHT "+QByteArray::number(th)+"\nPIXELSIZE "+QByteArray::number(ps)+"\nDATA "+QByteArray::number(t.size())+"\n";
+        for(const auto& e : t) f+=e.first+","+QByteArray::number(e.second.size())+"\n"+e.second;
+        return f; };
+      QMap<QString,QByteArray> kz;
+      kz["maindoc.xml"]=R"(<?xml version="1.0" encoding="UTF-8"?><DOC xmlns="http://www.calligra.org/DTD/krita" syntaxVersion="2">
+<IMAGE name="img" width="4" height="3" colorspacename="RGBA" profile="sRGB built-in"><layers>
+ <layer nodetype="paintlayer" name="Top" filename="layer1" colorspacename="RGBA" compositeop="multiply" opacity="128" x="1" y="1" visible="1" uuid="{t}">
+  <masks><mask nodetype="transparencymask" name="m" filename="mask1" x="0" y="0" visible="1"/></masks></layer>
+ <layer nodetype="grouplayer" name="Grp" filename="layer2" passthrough="0" compositeop="normal" opacity="255" x="0" y="0" visible="1" uuid="{g}"><layers>
+  <layer nodetype="clonelayer" name="Copy" filename="layer4" clonefromuuid="{k}" compositeop="normal" opacity="255" x="2" y="0" visible="1" uuid="{c}"/>
+  <layer nodetype="paintlayer" name="Kid" filename="layer3" colorspacename="RGBA" compositeop="normal" opacity="255" x="0" y="0" visible="0" uuid="{k}"/>
+ </layers></layer>
+ <layer nodetype="shapelayer" name="Vec" filename="layer5" compositeop="normal" opacity="255" x="0" y="0" visible="1" uuid="{v}"/>
+ <layer nodetype="paintlayer" name="Bottom" filename="layer6" colorspacename="RGBA" compositeop="normal" opacity="255" x="0" y="0" visible="1" uuid="{b}"/>
+</layers></IMAGE></DOC>)";
+      // Two pixels, red then green: five literals, then three bytes copied from two back.
+      kz["img/layers/layer1"]=tiles(2,1,4,{{"0,0,LZF",QByteArray::fromHex("01""040000""00FFFF""2002")}});
+      kz["img/layers/mask1.pixelselection"]=tiles(2,1,1,{{"1,1,LZF",QByteArray::fromHex("0080FF")}});
+      kz["img/layers/layer3"]=tiles(1,1,4,{{"0,0,LZF",QByteArray::fromHex("00102030FF")}});
+      kz["img/layers/layer5.shapelayer/content.svg"]=R"(<svg xmlns="http://www.w3.org/2000/svg" width="4pt" height="3pt" viewBox="0 0 4 3"><rect x="1" y="1" width="2" height="1" fill="none" stroke="#000" stroke-width="1"/></svg>)";
+      kz["img/layers/layer6"]=tiles(64,64,4,{});
+      kz["img/layers/layer6.defaultpixel"]=QByteArray::fromHex("C8C8C8FF");
+      KraImportStats ks;
+      const Document kd=importKraDocument(kz,&ks);
+      check(kd.pageSize==QSizeF(4,3) && kd.shapes.size()==4 && ks.layers==3 && ks.groups==1 && ks.vectorLayers==1 && ks.masks==1, "Krita: paint, group and vector layers, listed topmost first, stack bottom up");
+      if(kd.shapes.size()==4){
+        const Shape& b=kd.shapes[0]; const Shape& v=kd.shapes[1]; const Shape& g=kd.shapes[2]; const Shape& t=kd.shapes[3];
+        check(b.name==QStringLiteral("Bottom") && b.fill.image.size()==QSize(4,3) && b.fill.image.pixel(3,2)==qRgb(200,200,200), "Krita: a default pixel that shows fills the canvas");
+        check(v.type==ShapeType::Group && qAbs(v.transform.m11()-0.75)<1e-6 && v.children.size()==1 && qAbs(v.children[0].stroke.width-4.0/3)<1e-3, "Krita: a vector layer's SVG, from points to pixels, line widths included");
+        check(g.type==ShapeType::Group && g.isolate && g.children.size()==2 && g.children[0].name==QStringLiteral("Kid") && !g.children[0].visible
+              && g.children[0].fill.image.pixel(0,0)==qRgb(0x30,0x20,0x10), "Krita: a group, a hidden stored tile, blue first");
+        if(g.children.size()==2) check(g.children[1].name==QStringLiteral("Copy") && g.children[1].visible && g.children[1].docBounds().topLeft()==QPointF(2,0), "Krita: a clone layer shows its source, moved by its own offset");
+        check(t.blend==QPainter::CompositionMode_Multiply && qAbs(t.opacity-128/255.0)<.002 && t.docBounds().topLeft()==QPointF(1,1)
+              && t.fill.image.pixel(0,0)==qRgba(255,0,0,0x80) && qAlpha(t.fill.image.pixel(1,0))==255, "Krita: an LZF tile, its transparency mask, offset, blend and opacity");
+      }
+      QMap<QString,QByteArray> bz=kz; bz["img/layers/layer1"]=tiles(2,1,4,{{"0,0,LZF",QByteArray::fromHex("01FF")}}); KraImportStats bs;
+      importKraDocument(bz,&bs);
+      check(bs.badTiles==1, "Krita: a damaged tile is counted, not fatal");
+      QMap<QString,QByteArray> hz=kz; hz["maindoc.xml"].replace("sRGB built-in","Rec. 2020 - SMPTE ST 2084 PQ EOTF"); KraImportStats hs;
+      check(importKraDocument(hz,&hs).shapes.isEmpty() && hs.unsupportedColour==1, "Krita: a high dynamic range profile is left to the flattened image");
+      check(importKraDocument(QMap<QString,QByteArray>()).shapes.isEmpty(), "Krita: an archive without maindoc.xml gives nothing");
+    }
+
     // --- Corel PHOTO-PAINT ---
     std::printf("[interop] Corel PHOTO-PAINT\n");
     {

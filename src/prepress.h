@@ -77,6 +77,11 @@ Document importProcreateDocument(const QMap<QString,QByteArray>& zip, ProcreateI
 struct XcfImportStats { int layers = 0, groups = 0, masks = 0, unknownModes = 0, dissolve = 0, badTiles = 0; bool linear = false, bzip2 = false; };
 Document importXcfDocument(const QByteArray& data, XcfImportStats* stats = nullptr);
 
+// Krita → a Document: paint layers (with transparency masks), groups and vector layers, with blend, opacity
+// and visibility. `zip` is the unpacked file. Filter masks and clone, file, fill and adjustment layers are counted.
+struct KraImportStats { int layers = 0, groups = 0, vectorLayers = 0, masks = 0, filters = 0, otherLayers = 0, unknownModes = 0, badTiles = 0, unsupportedColour = 0; };
+Document importKraDocument(const QMap<QString,QByteArray>& zip, KraImportStats* stats = nullptr);
+
 // Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
 // Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
 struct CptImportStats { int objects = 0, hidden = 0, savedMasks = 0, unknownTiles = 0, unknownDepth = 0; bool thumbnailOnly = false; };

@@ -1705,7 +1705,7 @@ bool Canvas::dropImportByExtension(const QString& p){
     if(ends(".afdesign")||ends(".afphoto")||ends(".afpub")||ends(".aftemplate")||ends(".afpackage")||ends(".af"))
         return importAffinity(p);   // one container covers every Affinity file type
     if(ends(".ora"))  return importOra(p);
-    if(ends(".kra"))  return importKra(p);
+    if(ends(".kra")||ends(".krz")) return importKra(p);
     if(ends(".wmf")||ends(".apm")) return importWmfFile(p);   // .apm = Aldus Placeable Metafile (libwmf/native both detect the 0x9AC6CDD7 header)
     if(ends(".geojson")) return importGeoJson(p);
     if(ends(".kml")||ends(".kmz")) return importKml(p);

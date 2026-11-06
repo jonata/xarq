@@ -733,7 +733,7 @@ static QString vectorImportPatterns(){
            "*.fh *.fh4 *.fh5 *.fh6 *.fh7 *.fh8 *.fh9 *.fh10 *.fh11 *.fhd *.ft8 *.ft9 *.ft10 *.ft11 "
            "*.pub *.pmd *.pm6 *.pm5 *.pm4 *.p65 *.t65 *.zmf *.qxp *.qxd *.qxb *.qxt "
            "*.sda *.sdd *.key *.pages *.numbers *.cwk *.drw *.dgn *.tab *.mif *.gpkg *.gml *.s57 *.000 *.gv *.dot "
-           "*.tgs *.topojson *.vml *.xps *.oxps *.sla *.scd *.ora *.kra "
+           "*.tgs *.topojson *.vml *.xps *.oxps *.sla *.scd *.ora *.kra *.krz "
            "*.geojson *.kml *.kmz *.json *.plt *.hpgl *.hgl *.shp *.gpx *.fig *.cgm "
            "*.gbr *.ger *.gtl *.gbl *.gts *.gbs *.gto *.gbo *.gko *.gm1 *.gpt *.pho "
            "*.drl *.xnc *.drd *.tap *.exc *.nc *.lottie *.sketch";
@@ -789,7 +789,7 @@ void MainWindow::buildMenus() {
     mFile->addAction("Import GIS / Graph (DGN / MapInfo / GeoPackage / GML / DOT)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import GIS or Graph","","GIS & graph formats (*.dgn *.tab *.mif *.gpkg *.gml *.s57 *.000 *.gv *.dot)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
     mFile->addAction("Import Affinity (Designer / Photo / Publisher)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Affinity Document","","Serif Affinity (*.afdesign *.afphoto *.afpub *.aftemplate *.afpackage *.af)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->importAffinity(p); }); });
     mFile->addAction("Import Vector (XPS / Scribus / VML / TopoJSON / Sticker)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Vector","","More vector formats (*.xps *.oxps *.sla *.scd *.vml *.topojson *.tgs)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return m_canvas->dropImportByExtension(p); }); });
-    mFile->addAction("Import Layered Image (OpenRaster / Krita)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Layered Image","","Layered raster (*.ora *.kra)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return p.endsWith(".kra",Qt::CaseInsensitive) ? m_canvas->importKra(p) : m_canvas->importOra(p); }); });
+    mFile->addAction("Import Layered Image (OpenRaster / Krita)…",this,[this]{ QString p=QFileDialog::getOpenFileName(this,"Import Layered Image","","Layered raster (*.ora *.kra *.krz)",nullptr,QFileDialog::DontUseNativeDialog); importIntoDoc(p,[this,&p]{ return (p.endsWith(".kra",Qt::CaseInsensitive)||p.endsWith(".krz",Qt::CaseInsensitive)) ? m_canvas->importKra(p) : m_canvas->importOra(p); }); });
     mFile->addAction("Save",this,[this]{saveFile();},QKeySequence("Ctrl+S"));
     mFile->addAction("Save As…",this,[this]{saveFileAs();},QKeySequence("Ctrl+Shift+S"));
     mFile->addAction("Save Compressed XAR…",this,[this]{ QString p=QFileDialog::getSaveFileName(this,"Save Compressed XAR","drawing.xar","Xara (*.xar)",nullptr,QFileDialog::DontUseNativeDialog);

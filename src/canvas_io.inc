@@ -2364,7 +2364,7 @@ static QTransform xqOdfTransform(const QString& str){
 // --- OpenRaster (.ora) / Krita (.kra): app-native layered raster in a ZIP container ----------------
 // Both wrap layers + a flattened "mergedimage.png" in a ZIP. OpenRaster describes its stack in a standard
 // stack.xml (layer PNGs under data/), which we reverse-engineer into one editable photo object per layer;
-// Krita's per-layer data is tiled binary, so we import its flattened composite. mergedimage is the fallback.
+// Krita's layers are read by importKraDocument (kraimport.cpp). mergedimage is the fallback.
 static QByteArray xqZipFind(const QMap<QString,QByteArray>& zip, const QString& name){
     for(auto it=zip.begin(); it!=zip.end(); ++it){
         const QString k=it.key();
@@ -2452,11 +2452,22 @@ bool Canvas::importKra(const QString& path){
     const QByteArray data=f.readAll(); f.close();
     const QMap<QString,QByteArray> zip=readZipEntries(data);
     if(zip.isEmpty()){ emit statusMessage("Not a readable Krita (.kra) archive."); return false; }
+    KraImportStats st;
+    const Document pd=importKraDocument(zip,&st);
+    QStringList notes;
+    if(st.filters) notes<<QStringLiteral("%1 filter mask(s) not applied").arg(st.filters);
+    if(st.otherLayers) notes<<QStringLiteral("%1 clone, file, fill or adjustment layer(s) not read").arg(st.otherLayers);
+    if(st.unsupportedColour) notes<<QStringLiteral("%1 layer(s) in a colour space XarQ doesn't read").arg(st.unsupportedColour);
+    if(st.unknownModes) notes<<QStringLiteral("%1 blend mode(s) with no match drawn as Normal").arg(st.unknownModes);
+    if(st.badTiles) notes<<QStringLiteral("%1 damaged tile(s) left blank").arg(st.badTiles);
+    if(!st.otherLayers && !st.unsupportedColour && adoptLayers(pd,path,"Import Krita",notes.join(QStringLiteral(", ")))) return true;
+    // Layers XarQ can't rebuild would change the picture, so then the flattened image it saved is used instead.
     QImage merged; QByteArray mb=xqZipFind(zip,"mergedimage.png"); if(mb.isEmpty()) mb=xqZipFind(zip,"preview.png");
-    if(mb.isEmpty() || !merged.loadFromData(mb)){ emit statusMessage("No importable image found in the .kra."); return false; }
-    placeZipComposite(merged, QFileInfo(path).fileName()+QStringLiteral(" (flattened)"), QStringLiteral("Import Krita"));
-    emit statusMessage(QStringLiteral("Imported Krita composite %1×%2 (layers flattened).").arg(merged.width()).arg(merged.height()));
-    return true;
+    if(mb.isEmpty() || !merged.loadFromData(mb)){
+        if(adoptLayers(pd,path,"Import Krita",notes.join(QStringLiteral(", ")))) return true;
+        emit statusMessage("No importable image found in the .kra."); return false; }
+    Document one; one.pageSize=merged.size(); one.shapes.push_back(psdBitmapShape(merged,0,0,QFileInfo(path).fileName()+QStringLiteral(" (flattened)")));
+    return adoptLayers(one,path,"Import Krita",QStringLiteral("layers flattened: ")+notes.join(QStringLiteral(", ")));
 }
 // Flatten an ODF content.xml's BODY text (text:p / text:h paragraphs, tabs, line-breaks) into a string.
 // The `inBody` gate keeps out <office:automatic-styles>/<office:meta> text; used as the fallback for a
