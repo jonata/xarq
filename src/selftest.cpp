@@ -12728,6 +12728,76 @@ if(xara::pdfVectorAvailable()){
       check(bs.badTiles==1, "Procreate: a damaged tile is counted, not fatal");
     }
 
+    // --- GIMP XCF ---
+    std::printf("[interop] GIMP XCF\n");
+    {
+      auto be=[](quint32 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(24-8*i)); return b; };
+      auto prop=[&](quint32 t,const QByteArray& pl){ return be(t)+be(pl.size())+pl; };
+      auto str=[&](const QByteArray& t){ return be(t.size()+1)+t+QByteArray(1,'\0'); };
+      // A file grows front to back; 64-bit pointers (version 11+) are patched in once their target is written.
+      struct W { QByteArray f; int psz=8;
+        int ptrSlot(){ const int at=f.size(); f.append(QByteArray(psz,'\0')); return at; }
+        void patch(int at,qint64 v){ for(int i=0;i<psz;++i) f[at+i]=char(v>>(8*(psz-1-i))); } };
+      // A hierarchy with one level and one tile; `tile` is that tile's encoded bytes.
+      auto hier=[&](W& w,int pw,int ph,int bpp,const QByteArray& tile){
+        const int at=w.f.size(); w.f+=be(pw)+be(ph)+be(bpp); const int lv=w.ptrSlot(); w.ptrSlot();
+        w.patch(lv,w.f.size()); w.f+=be(pw)+be(ph); const int tp=w.ptrSlot(); w.ptrSlot();
+        w.patch(tp,w.f.size()); w.f+=tile; return at; };
+      auto rle=[](const QByteArray& px,int bpp){            // each byte-plane as literal runs
+        QByteArray o; const int n=px.size()/bpp;
+        for(int k=0;k<bpp;++k) for(int j=0;j<n;j+=127){ const int len=qMin(127,n-j); o.append(char(256-len)); for(int i=0;i<len;++i) o.append(px[(j+i)*bpp+k]); }
+        return o; };
+      struct L { QByteArray name; int w,h,type; QByteArray props; QByteArray px; int bpp; QByteArray maskPx; };
+      auto file=[&](int ver,int prec,int comp,int cw,int ch,int base,const QVector<L>& ls,std::function<QByteArray(const QByteArray&,int)> enc){
+        W w; w.psz=ver>=11?8:4;
+        w.f="gimp xcf "+QByteArray(ver==0?"file":QByteArray("v")+QByteArray::number(ver).rightJustified(3,'0'))+QByteArray(1,'\0');
+        w.f+=be(cw)+be(ch)+be(base); if(ver>=4) w.f+=be(prec);
+        w.f+=prop(17,QByteArray(1,char(comp)))+prop(0,QByteArray());
+        QVector<int> lptr; for(int i=0;i<ls.size();++i) lptr<<w.ptrSlot(); w.ptrSlot(); w.ptrSlot();
+        for(int i=0;i<ls.size();++i){
+          const L& l=ls[i]; w.patch(lptr[i],w.f.size());
+          w.f+=be(l.w)+be(l.h)+be(l.type)+str(l.name)+l.props+prop(0,QByteArray());
+          const int hs=w.ptrSlot(), ms=w.ptrSlot();
+          if(!l.px.isEmpty()) w.patch(hs,hier(w,l.w,l.h,l.bpp,enc(l.px,l.bpp)));
+          if(!l.maskPx.isEmpty()){ w.patch(ms,w.f.size()); w.f+=be(l.w)+be(l.h)+str("mask")+prop(0,QByteArray()); const int mh=w.ptrSlot(); w.patch(mh,hier(w,l.w,l.h,l.maskPx.size()/(l.w*l.h),enc(l.maskPx,l.maskPx.size()/(l.w*l.h)))); }
+        }
+        return w.f; };
+      // Topmost first: a multiply layer at (1,1), a group holding a hidden masked layer, and a bottom layer whose
+      // multiply GIMP ignores because nothing lies under it.
+      const QByteArray topPx=QByteArray::fromHex("FF0000FF""00FF0080");
+      const QVector<L> ls={
+        {"Top",2,1,1,prop(15,be(1)+be(1))+prop(7,be(30))+prop(6,be(128))+prop(30,be(0)),topPx,4,QByteArray()},
+        {"Grp",4,3,1,prop(29,QByteArray())+prop(7,be(61))+prop(30,be(1)),QByteArray(),4,QByteArray()},
+        {"Kid",1,1,0,prop(8,be(0))+prop(30,be(1)+be(0)),QByteArray::fromHex("102030"),3,QByteArray::fromHex("40")},
+        {"Bottom",4,3,2,prop(7,be(3))+prop(30,be(2)),QByteArray(12,char(200)),1,QByteArray()}};
+      XcfImportStats xs;
+      const Document xd=importXcfDocument(file(11,150,1,4,3,0,ls,rle),&xs);
+      check(xd.pageSize==QSizeF(4,3) && xd.shapes.size()==3 && xs.layers==3 && xs.groups==1 && xs.masks==1, "XCF: layers and a group, listed topmost first, stack bottom up");
+      if(xd.shapes.size()==3){
+        const Shape& b=xd.shapes[0]; const Shape& g=xd.shapes[1]; const Shape& t=xd.shapes[2];
+        check(b.name==QStringLiteral("Bottom") && b.blend==QPainter::CompositionMode_SourceOver && b.fill.image.pixel(3,2)==qRgb(200,200,200), "XCF: grey layer, bottom layer drawn Normal whatever its mode");
+        check(g.type==ShapeType::Group && g.children.size()==1 && g.children[0].name==QStringLiteral("Kid") && !g.children[0].visible && !g.isolate, "XCF: a pass-through group holds its member by item path; hidden stays hidden");
+        if(g.children.size()==1) check(g.children[0].fill.image.pixel(0,0)==qRgba(0x10,0x20,0x30,0x40), "XCF: RLE tile and layer mask");
+        check(t.name==QStringLiteral("Top") && t.blend==QPainter::CompositionMode_Multiply && qAbs(t.opacity-128/255.0)<.002 && t.docBounds().topLeft()==QPointF(1,1)
+              && t.fill.image.pixel(1,0)==qRgba(0,255,0,0x80), "XCF: mode, opacity, offsets and alpha");
+      }
+      // 16-bit linear, zlib tiles: linear 0.5 comes out as sRGB 188.
+      const QVector<L> lin={{"Lin",1,1,0,QByteArray(),QByteArray::fromHex("8000""0000""FFFF"),6,QByteArray()}};
+      const QByteArray lf=file(12,200,2,1,1,0,lin,[](const QByteArray& px,int){ return qCompress(px,9).mid(4); });
+      XcfImportStats ls2;
+      const Document ld=importXcfDocument(lf,&ls2);
+      check(ld.shapes.size()==1 && ls2.linear && ld.shapes[0].fill.image.pixel(0,0)==qRgb(188,0,255), "XCF: 16-bit linear light, zlib tiles, as 8-bit sRGB");
+      // The same file gzip-compressed, as .xcf.gz.
+      { const QByteArray z=qCompress(lf,9); QByteArray gz=QByteArray::fromHex("1F8B0800000000000003")+z.mid(6,z.size()-10);
+        quint32 crc=0xFFFFFFFFu; for(uchar c : lf){ crc^=c; for(int k=0;k<8;++k) crc=(crc>>1)^(0xEDB88320u&(0u-(crc&1u))); } crc=~crc;
+        for(int i=0;i<4;++i) gz.append(char(crc>>(8*i))); for(int i=0;i<4;++i) gz.append(char(quint32(lf.size())>>(8*i)));
+        const Document gd=importXcfDocument(gz);
+        check(gd.shapes.size()==1 && gd.shapes[0].fill.image.pixel(0,0)==qRgb(188,0,255), "XCF: a gzip-compressed file is unpacked"); }
+      XcfImportStats bz; importXcfDocument("BZh91AY&SY",&bz);
+      check(bz.bzip2, "XCF: a bzip2-compressed file is recognised, so the message can say so");
+      check(importXcfDocument(file(11,150,1,4,3,0,ls,rle).left(40)).shapes.isEmpty(), "XCF: a truncated file gives nothing");
+    }
+
     // --- Corel PHOTO-PAINT ---
     std::printf("[interop] Corel PHOTO-PAINT\n");
     {

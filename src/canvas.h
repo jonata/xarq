@@ -370,6 +370,7 @@ public:
     bool importXd(const QString& path);                              // Adobe XD → editable vectors, a page per artboard
     bool adoptLayers(const Document& pd, const QString& path, const char* undo, const QString& note);
     bool importProcreate(const QString& path);                       // Procreate → layers
+    bool importXcf(const QString& path);                             // GIMP, with its layers and groups
     bool importCptFile(const QString& path);                         // Corel PHOTO-PAINT, with its objects
     bool importPxd(const QString& path);                             // Pixelmator Pro → layers
     bool importClip(const QString& path);                            // Clip Studio Paint → layers

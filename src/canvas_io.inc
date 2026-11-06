@@ -955,6 +955,19 @@ bool Canvas::importProcreate(const QString& path){
     }
     emit statusMessage("No readable layers found in the Procreate file."); return false;
 }
+bool Canvas::importXcf(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    XcfImportStats st;
+    const Document pd=importXcfDocument(data,&st);
+    if(st.bzip2){ emit statusMessage("This GIMP file is bzip2-compressed, which XarQ can't unpack. Save it from GIMP as .xcf or .xcf.gz."); return false; }
+    QStringList notes;
+    if(st.unknownModes) notes<<QStringLiteral("%1 layer mode(s) with no match drawn as Normal").arg(st.unknownModes);
+    if(st.dissolve) notes<<QStringLiteral("%1 Dissolve layer(s) drawn as Normal").arg(st.dissolve);
+    if(st.badTiles) notes<<QStringLiteral("%1 tile(s) couldn't be read").arg(st.badTiles);
+    if(adoptLayers(pd,path,"Import GIMP",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the GIMP file.");
+    return false;
+}
 bool Canvas::importCptFile(const QString& path){
     QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
     CptImportStats st;

@@ -2094,6 +2094,7 @@ QImage importPsd(const QByteArray& d){
 
 Shape psdBitmapShape(const QImage& img, int x, int y, const QString& name){ return bitmapShape(img, x, y, name); }
 void psdApplyBlend(Shape& s, const QByteArray& key){ applyBlend(s, key); }
+void psdDocMask(Shape& s, const QImage& gray, const QRect& area){ setDocMask(s, gray, area); }
 
 Document importPsdDocument(const QByteArray& d, PsdImportStats* stats){
     Document doc;

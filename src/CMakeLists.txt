@@ -88,6 +88,7 @@ add_executable(xarq
     fxgvector.cpp
     pxdimport.cpp
     cptimport.cpp
+    xcfimport.cpp
     procreateimport.cpp
     sqlitemini.cpp
     clipimport.cpp

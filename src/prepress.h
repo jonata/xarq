@@ -52,6 +52,8 @@ Document importPsdDocument(const QByteArray& data, PsdImportStats* stats = nullp
 // The PSD route's bitmap layer and blend keys ("mul ", "scrn", "hue "…), for the other layered formats.
 Shape psdBitmapShape(const QImage& img, int x, int y, const QString& name);
 void psdApplyBlend(Shape& s, const QByteArray& key);
+// A greyscale mask over `area` of the document, as the object's transparency (luminance = opacity).
+void psdDocMask(Shape& s, const QImage& gray, const QRect& area);
 
 // PaintShop Pro → a Document: raster layers keep their blend, opacity and mask; vector layers' polylines
 // stay editable. What the format has but this doesn't read is counted, so the importer can say so.
@@ -69,6 +71,11 @@ QImage clipPreview(const QByteArray& data);
 // Procreate → a Document: its layers and groups, with blend, opacity, masks and clipping. `zip` is the unpacked file.
 struct ProcreateImportStats { int layers = 0, groups = 0, masks = 0, clipped = 0, badTiles = 0; };
 Document importProcreateDocument(const QMap<QString,QByteArray>& zip, ProcreateImportStats* stats = nullptr);
+
+// GIMP's XCF → a Document: its layers and groups with blend mode, opacity, visibility and masks; high bit
+// depths and linear-light images come in as 8-bit sRGB. gzip-compressed files are unpacked; bzip2 ones aren't.
+struct XcfImportStats { int layers = 0, groups = 0, masks = 0, unknownModes = 0, dissolve = 0, badTiles = 0; bool linear = false, bzip2 = false; };
+Document importXcfDocument(const QByteArray& data, XcfImportStats* stats = nullptr);
 
 // Corel PHOTO-PAINT → a Document: the background, then each object with its mask, opacity and visibility.
 // Tiles that can't be read are counted; with nothing else readable, the file's thumbnail stands in.
