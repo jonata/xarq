@@ -1676,6 +1676,7 @@ bool Canvas::dropImportByExtension(const QString& p){
     if(ends(".pxd"))  return importPxd(p);
     if(ends(".cpt"))  return importCptFile(p);
     if(ends(".pdn"))  return importPdn(p);
+    if(ends(".mdp"))  return importMdp(p);
     if(ends(".xcf")||ends(".xcf.gz")||ends(".xcfgz")||ends(".xcf.bz2")||ends(".xcfbz2")) return importXcf(p);
     if(ends(".procreate")) return importProcreate(p);
     if(ends(".psp")||ends(".pspimage")||ends(".psptube")||ends(".pspframe")||ends(".pspmask")||ends(".tub")) return importPsp(p);

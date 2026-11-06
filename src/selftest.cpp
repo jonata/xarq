@@ -12971,6 +12971,83 @@ if(xara::pdfVectorAvailable()){
       check(bd.pixel(1,1)==qRgb(0xf0,0xff,0x00), "Blend modes: Xor of the channel values");
     }
 
+    // --- MediBang Paint / FireAlpaca ---
+    std::printf("[interop] MediBang Paint\n");
+    {
+      auto le=[](quint32 v){ QByteArray b(4,'\0'); for(int i=0;i<4;++i) b[i]=char(v>>(8*i)); return b; };
+      auto zl=[](const QByteArray& raw){ return qCompress(raw,9).mid(4); };
+      auto pac=[&](const QByteArray& name,const QByteArray& data,quint32 type,quint32 outSize){
+        QByteArray h="PAC "+le(132+data.size())+le(type)+le(data.size())+le(outSize)+QByteArray(48,'\0')+name.leftJustified(64,'\0',true);
+        return h+data; };
+      // A layer's block: tiles of `dim` pixels, each with its place and compression.
+      struct T { int col,row,comp; QByteArray data; };
+      auto tiles=[&](int dim,const QVector<T>& ts){
+        QByteArray b=le(ts.size()); if(ts.isEmpty()) return b;
+        b+=le(dim);
+        for(const T& t:ts){ b+=le(t.col)+le(t.row)+le(t.comp)+le(t.data.size())+t.data; while(b.size()%4) b.append('\0'); }
+        return b; };
+      auto px=[](QRgb c,int n){ QByteArray b; for(int i=0;i<n;++i){ b.append(char(qBlue(c))); b.append(char(qGreen(c))); b.append(char(qRed(c))); b.append(char(qAlpha(c))); } return b; };
+      const QByteArray green=px(qRgb(0,255,0),1);
+      // One pixel then a back-reference repeating it: Snappy (copy with a 2-byte offset) and FastLZ (a long match).
+      const QByteArray snap=QByteArray("\x40\x0c",2)+px(qRgb(0,0,255),1)+QByteArray("\xee\x04\x00",3);
+      const QByteArray flz=QByteArray("\x03",1)+green+QByteArray("\xe0\x33\x03",3);
+      QByteArray ink(16,'\0'); ink[0]=ink[1]=ink[2]=ink[3]=char(255);
+      const QByteArray xml=R"(<?xml version="1.0" encoding="UTF-8" ?>
+<Mdiapp width="8" height="6" dpi="72" checkerBG="true">
+ <Thumb width="2" height="2" bin="thumb" />
+ <Layers active="1">
+  <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" clipping="false" masking="false" id="1" parentId="-1" name="Base" binType="2" bin="b1" type="32bpp" />
+  <Layer ofsx="2" ofsy="2" width="4" height="4" mode="normal" alpha="255" visible="true" clipping="true" masking="false" id="2" parentId="-1" name="Clip" binType="2" bin="b2" type="32bpp" />
+  <Layer ofsx="1" ofsy="1" width="4" height="4" mode="multiply" alpha="128" visible="true" clipping="false" id="4" parentId="3" name="Ink" binType="2" bin="b4" color="FF00FF00" type="8bpp" />
+  <Layer ofsx="3" ofsy="3" width="4" height="4" mode="normal" alpha="255" visible="false" clipping="false" id="5" parentId="3" name="Dots" binType="2" bin="b5" color="FF0000FF" type="1bpp" />
+  <Layer ofsx="0" ofsy="0" width="8" height="6" mode="normal" alpha="200" visible="true" id="3" parentId="-1" name="Folder" binType="2" bin="b3" type="folder" />
+  <Layer ofsx="4" ofsy="0" width="4" height="4" mode="no-such-mode" alpha="255" visible="true" id="6" parentId="-1" name="Fast" binType="2" bin="b6" type="32bpp" />
+  <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" id="7" parentId="-1" name="Words" binType="2" bin="b7" type="text" />
+  <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" id="8" parentId="99" name="Blank" binType="2" bin="b8" type="32bpp" />
+  <Layer ofsx="0" ofsy="4" width="4" height="4" mode="normal" alpha="255" visible="true" masking="true" id="9" parentId="-1" name="Masked" binType="2" bin="b9" type="32bpp" />
+ </Layers>
+</Mdiapp>)";
+      QByteArray bin=pac("thumb",zl(px(qRgb(255,0,255),4)),1,16);
+      bin+=pac("b1",tiles(4,{{0,0,0,zl(px(qRgb(255,0,0),16))}}),0,0);
+      bin+=pac("b2",tiles(4,{{0,0,1,snap}}),0,0);
+      bin+=pac("b3",tiles(4,{}),0,0);
+      bin+=pac("b4",tiles(4,{{0,0,0,zl(ink)}}),0,0);
+      bin+=pac("b5",tiles(4,{{0,0,0,zl(QByteArray("\x80\x00",2))}}),0,0);
+      bin+=pac("b6",tiles(4,{{0,0,2,flz}}),0,0);
+      bin+=pac("b7",tiles(4,{}),0,0);
+      bin+=pac("b8",tiles(4,{}),0,0);
+      bin+=pac("b9",tiles(4,{{0,0,0,zl(px(qRgb(9,9,9),16))}}),0,0);
+      const QByteArray file="mdipack "+le(0)+le(xml.size())+le(bin.size())+xml+bin;
+
+      MdpImportStats ms;
+      const Document md=importMdpDocument(file,&ms);
+      check(md.pageSize==QSizeF(8,6) && md.shapes.size()==5 && ms.layers==6 && ms.groups==1 && ms.hidden==1 && ms.unknownModes==1 && ms.unknownTypes==1 && ms.masks==1 && ms.badTiles==0,
+            "MediBang: layers bottom first, a folder after its members; unknown kinds and modes counted");
+      if(md.shapes.size()==5){
+        const Shape& base=md.shapes[0]; const Shape& clip=md.shapes[1]; const Shape& fold=md.shapes[2]; const Shape& fast=md.shapes[3];
+        check(base.name==QStringLiteral("Base") && base.fill.image.size()==QSize(4,4) && base.fill.image.pixel(3,3)==qRgb(255,0,0), "MediBang: a zlib tile in BGRA");
+        check(clip.fill.image.size()==QSize(2,2) && clip.docBounds().topLeft()==QPointF(2,2) && clip.fill.image.pixel(1,1)==qRgb(0,0,255) && ms.clipped==1,
+              "MediBang: a Snappy tile, clipped to the layer below");
+        check(fold.type==ShapeType::Group && fold.children.size()==2 && qAbs(fold.opacity-200/255.0)<1e-9 && fold.isolate, "MediBang: a folder with its members and opacity");
+        if(fold.children.size()==2){
+          const Shape& ik=fold.children[0]; const Shape& dt=fold.children[1];
+          check(ik.fill.image.size()==QSize(4,1) && ik.docBounds().topLeft()==QPointF(1,1) && ik.fill.image.pixel(2,0)==qRgb(0,255,0)
+                && ik.blend==QPainter::CompositionMode_Multiply && qAbs(ik.opacity-128/255.0)<1e-9, "MediBang: an 8-bit layer is its colour's coverage, with blend and opacity");
+          check(!dt.visible && dt.fill.image.size()==QSize(1,1) && dt.docBounds().topLeft()==QPointF(3,3) && dt.fill.image.pixel(0,0)==qRgb(0,0,255),
+                "MediBang: a 1-bit layer, most significant bit first, hidden");
+        }
+        check(fast.fill.image.size()==QSize(4,4) && fast.docBounds().topLeft()==QPointF(4,0) && fast.fill.image.pixel(3,3)==qRgb(0,255,0), "MediBang: a FastLZ tile");
+      }
+      // A tile that won't unpack leaves nothing to show, so the thumbnail stands in.
+      QByteArray badBin=pac("thumb",zl(px(qRgb(255,0,255),4)),1,16)+pac("b1",tiles(4,{{0,0,0,QByteArray("not zlib data")}}),0,0);
+      const QByteArray badXml=R"(<Mdiapp width="8" height="6"><Thumb width="2" height="2" bin="thumb" /><Layers><Layer width="4" height="4" id="1" parentId="-1" name="L" bin="b1" type="32bpp" /></Layers></Mdiapp>)";
+      MdpImportStats bs; const Document bd=importMdpDocument("mdipack "+le(0)+le(badXml.size())+le(badBin.size())+badXml+badBin,&bs);
+      check(bs.thumbnailOnly && bs.badTiles==1 && bd.shapes.size()==1 && bd.shapes[0].fill.image.pixel(1,1)==qRgb(255,0,255), "MediBang: with no readable layer, the thumbnail stands in");
+      for(int cut=20; cut<file.size(); cut+=7) importMdpDocument(file.left(cut));
+      check(importMdpDocument("mdipack ").shapes.isEmpty() && importMdpDocument("; GROMACS run parameters\nintegrator = md\n").shapes.isEmpty(),
+            "MediBang: cut-short files and other .mdp files give nothing, safely");
+    }
+
     // --- Corel PHOTO-PAINT ---
     std::printf("[interop] Corel PHOTO-PAINT\n");
     {

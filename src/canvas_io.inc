@@ -993,6 +993,21 @@ bool Canvas::importPdn(const QString& path){
     emit statusMessage("No readable layers found in the Paint.NET file.");
     return false;
 }
+bool Canvas::importMdp(const QString& path){
+    QFile f(path); if(!f.open(QIODevice::ReadOnly)) return false; const QByteArray data=f.readAll(); f.close();
+    if(!data.startsWith("mdipack")){ emit statusMessage("This .mdp file isn't a MediBang Paint or FireAlpaca picture."); return false; }
+    MdpImportStats st;
+    const Document pd=importMdpDocument(data,&st);
+    QStringList notes;
+    if(st.thumbnailOnly) notes<<QStringLiteral("only the file's thumbnail could be read");
+    else if(st.badTiles) notes<<QStringLiteral("%1 tile(s) couldn't be read").arg(st.badTiles);
+    if(st.unknownTypes) notes<<QStringLiteral("%1 layer(s) of a kind XarQ doesn't read").arg(st.unknownTypes);
+    if(st.unknownModes) notes<<QStringLiteral("%1 blend mode(s) with no match drawn as Normal").arg(st.unknownModes);
+    if(st.masks) notes<<QStringLiteral("%1 layer mask setting(s) not applied").arg(st.masks);
+    if(adoptLayers(pd,path,"Import MediBang Paint",notes.join(QStringLiteral(", ")))) return true;
+    emit statusMessage("No readable layers found in the MediBang Paint file.");
+    return false;
+}
 bool Canvas::importPxd(const QString& path){
     QMap<QString,QByteArray> files;
     const QFileInfo info(path);
