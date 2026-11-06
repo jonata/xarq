@@ -13015,6 +13015,7 @@ if(xara::pdfVectorAvailable()){
   <Layer ofsx="4" ofsy="0" width="4" height="4" mode="no-such-mode" alpha="255" visible="true" id="6" parentId="-1" name="Fast" binType="2" bin="b6" type="32bpp" />
   <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" id="7" parentId="-1" name="Words" binType="2" bin="b7" type="text" />
   <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" id="8" parentId="99" name="Blank" binType="2" bin="b8" type="32bpp" />
+  <Layer ofsx="0" ofsy="0" width="4" height="4" mode="normal" alpha="255" visible="true" clipping="true" id="10" parentId="-1" name="Gone" binType="2" bin="b10" type="32bpp" />
   <Layer ofsx="0" ofsy="4" width="4" height="4" mode="normal" alpha="255" visible="true" masking="true" id="9" parentId="-1" name="Masked" binType="2" bin="b9" type="32bpp" />
  </Layers>
 </Mdiapp>)";
@@ -13028,16 +13029,17 @@ if(xara::pdfVectorAvailable()){
       bin+=pac("b7",tiles(4,{}),0,0);
       bin+=pac("b8",tiles(4,{}),0,0);
       bin+=pac("b9",tiles(4,{{0,0,0,zl(px(qRgb(9,9,9),16))}}),0,0);
+      bin+=pac("b10",tiles(4,{{0,0,0,zl(px(qRgb(7,7,7),16))}}),0,0);
       const QByteArray file="mdipack "+le(0)+le(xml.size())+le(bin.size())+xml+bin;
 
       MdpImportStats ms;
       const Document md=importMdpDocument(file,&ms);
       check(md.pageSize==QSizeF(8,6) && md.shapes.size()==5 && ms.layers==6 && ms.groups==1 && ms.hidden==1 && ms.unknownModes==1 && ms.unknownTypes==1 && ms.masks==1 && ms.badTiles==0,
-            "MediBang: layers bottom first, a folder after its members; unknown kinds and modes counted");
+            "MediBang: layers bottom first, a folder after its members; unknown kinds and modes counted; what clips to an empty layer shows nothing");
       if(md.shapes.size()==5){
         const Shape& base=md.shapes[0]; const Shape& clip=md.shapes[1]; const Shape& fold=md.shapes[2]; const Shape& fast=md.shapes[3];
         check(base.name==QStringLiteral("Base") && base.fill.image.size()==QSize(4,4) && base.fill.image.pixel(3,3)==qRgb(255,0,0), "MediBang: a zlib tile in BGRA");
-        check(clip.fill.image.size()==QSize(2,2) && clip.docBounds().topLeft()==QPointF(2,2) && clip.fill.image.pixel(1,1)==qRgb(0,0,255) && ms.clipped==1,
+        check(clip.fill.image.size()==QSize(2,2) && clip.docBounds().topLeft()==QPointF(2,2) && clip.fill.image.pixel(1,1)==qRgb(0,0,255) && ms.clipped==2,
               "MediBang: a Snappy tile, clipped to the layer below");
         check(fold.type==ShapeType::Group && fold.children.size()==2 && qAbs(fold.opacity-200/255.0)<1e-9 && fold.isolate, "MediBang: a folder with its members and opacity");
         if(fold.children.size()==2){

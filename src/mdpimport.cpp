@@ -263,7 +263,10 @@ Document importMdpDocument(const QByteArray& f, MdpImportStats* st){
                 haveBase = false;
             } else {
                 QImage img;
-                if(!pixels(L, img)) continue;
+                if(!pixels(L, img)){
+                    if(!L.clipping){ base = QImage(); haveBase = true; }   // what clips to an empty layer shows nothing
+                    continue;
+                }
                 if(L.clipping && haveBase){ clipAlpha(img, L.x, L.y, base, bx, by); if(st) ++st->clipped; }
                 else if(!L.clipping){ base = img; bx = L.x; by = L.y; haveBase = true; }
                 // Only what's painted becomes the object.
