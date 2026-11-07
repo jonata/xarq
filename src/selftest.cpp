@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QFontDatabase>
 #include <QBuffer>
+#include <QStringDecoder>
 #include <QFileInfo>
 #include <QPainter>
 #include <QRadialGradient>
